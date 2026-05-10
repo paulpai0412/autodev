@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.mypy_cache/
+.venv/
+venv/
+
+.opencode/runtime/*.json
+!.opencode/runtime/.gitkeep
