@@ -1,0 +1,1073 @@
+schema_version: "1.0"
+name: autonomous-development-workflow
+kind: opencode_policy_runbook
+status: draft
+owner: repo-agents
+
+purpose: >
+  Define a gated, self-cycling OpenCode development workflow for this repo.
+  This is a project-owned policy/runbook YAML. OpenCode does not execute this
+  file directly; agents use it as the operating contract and future runners may
+  translate it into OpenCode skills, commands, permissions, and shell gates.
+
+priority_bridge:
+  applies_when:
+    - user_invokes_autonomous_development_workflow
+    - main_agent_is_orchestrating_ready_for_agent_issue
+  rule: >
+    Repo autonomous workflow role isolation is the controlling task contract.
+    Generic agent requirements to personally run diagnostics, tests, builds,
+    manual QA, browser QA, SQL execution validation, or review gates must be
+    satisfied by fresh worker/verifier artifacts rather than direct main-agent
+    execution.
+  conflict_policy: >
+    If platform or generic agent instructions appear to require direct
+    main-agent QA, the main agent must stop and report a policy conflict instead
+    of running issue or phase QA itself.
+  main_agent_contract_validation_only:
+    allowed:
+      - validate_worker_result_schema
+      - validate_evidence_packet_schema
+      - validate_test_case_catalog_shape
+      - validate_failure_registry_shape
+      - validate_refactor_candidate_audit_shape
+      - confirm_required_refs_exist
+      - compare_acceptance_criteria_ids_to_evidence_refs
+      - confirm_proof_of_separation_fields_are_present
+      - update_handoff_or_tracker_metadata_from_verified_refs
+    forbidden:
+      - run_pytest_or_test_commands
+      - run_py_compile_or_build_commands_for_issue_code
+      - run_lsp_diagnostics_on_issue_code
+      - run_manual_driver_or_surface_qa
+      - run_browser_or_playwright_qa
+      - run_sql_execution_validation
+      - run_review_work_as_main_agent_qa
+
+scope:
+  repository: paulpai0412/wferp
+  issue_tracker: github
+  tracker_commands_reference: docs/agents/issue-tracker.md
+  domain_context:
+    - AGENTS.md
+    - CONTEXT.md
+    - docs/agents/domain.md
+    - docs/agents/triage-labels.md
+  default_language:
+    user_replies: traditional_chinese
+    repo_docs_issues_prds_comments: english_unless_target_requires_other_language
+
+automation_boundaries:
+  allowed_without_human_approval:
+    - read_repo_context
+    - create_or_update_local_docs
+    - run_non_destructive_setup_checks
+    - install_python_dependencies_from_repo_docs
+    - start_and_seed_local_test_db
+    - implement_ready_for_agent_issue
+    - delegate_tests_diagnostics_e2e_and_review_gates_to_worker_or_verifier
+    - commit_after_all_required_gates_pass
+    - push_branch_to_remote
+    - create_pull_request
+  requires_human_approval:
+    - install_or_update_external_skills_not_already_approved
+    - merge_pull_request_after_review
+    - close_issue_after_merged_pull_request
+    - run_non_test_database_execution
+    - destructive_git_or_shell_operations
+    - install_hooks_plugins_or_scripts_from_third_party_sources
+  forbidden:
+    - force_push_to_main_or_master
+    - bypass_review_or_test_gates
+    - weaken_or_delete_failing_tests_to_pass
+    - commit_secrets_or_credentials
+    - execute_write_sql_or_arbitrary_multi_statement_sql
+    - main_agent_direct_issue_or_phase_qa
+
+skills:
+  built_in_or_current:
+    requirement_clarification:
+      - grill-me
+      - grill-with-docs
+      - zoom-out
+    planning_and_issue_flow:
+      - to-prd
+      - to-issues
+      - triage
+    implementation:
+      - tdd
+      - karpathy-guidelines
+      - diagnose
+    frontend_and_browser:
+      - playwright
+      - web-design-engineer
+      - frontend-ui-ux
+    review_and_quality:
+      - review-work
+      - ai-slop-remover
+      - improve-codebase-architecture
+    git_and_release:
+      - git-master
+    docs_and_handoff:
+      - grill-with-docs
+      - write-a-skill
+      - handoff
+  external_installed_minimal_ecc:
+    source_repo: affaan-m/everything-claude-code
+    license: MIT
+    install_policy: copied_pure_skill_markdown_only
+    installed_paths:
+      - /home/timmypai/.config/opencode/skills/e2e-testing/SKILL.md
+      - /home/timmypai/.config/opencode/skills/browser-qa/SKILL.md
+      - /home/timmypai/.config/opencode/skills/canary-watch/SKILL.md
+    active_session_note: >
+      Current OpenCode sessions may not hot-load newly copied skills. Restart
+      OpenCode before relying on skill(name="e2e-testing"), skill(name="browser-qa"),
+      or skill(name="canary-watch"). Until then, treat the files as referenced
+      policy content rather than callable skills.
+    excluded_by_policy:
+      - npm_plugin_ecc_universal
+      - hooks_runtime
+      - scripts
+      - full_opencode_config_overlay
+      - broad_rules_install
+
+global_gates:
+  spec_gate:
+    required: true
+    pass_when:
+      - problem_statement_is_clear
+      - public_interface_or_surface_is_named
+      - acceptance_criteria_are_observable
+      - out_of_scope_is_explicit
+      - unresolved_questions_are_moved_to_needs_info
+  traceability_gate:
+    required: true
+    pass_when:
+      - every_acceptance_criterion_maps_to_evidence
+      - evidence_includes_tests_or_manual_surface_qa
+      - known_limitations_are_documented
+  tdd_gate:
+    required_for_code_changes: true
+    pass_when:
+      - first_behavior_test_fails_before_implementation
+      - implementation_is_minimal_for_current_test
+      - tests_use_public_interface_not_private_helpers
+      - focused_tests_pass
+  diagnostics_and_build_gate:
+    required: true
+    owner: worker_self_check_or_pr_verifier
+    pass_when:
+      - lsp_diagnostics_clean_for_changed_files_when_supported
+      - related_tests_pass
+      - build_or_equivalent_command_passes_when_applicable
+      - pre_existing_failures_are_named_and_not_mixed_with_issue_work
+  surface_qa_gate:
+    required: true
+    owner: pr_verifier_or_phase_verifier
+    pass_when:
+      - deliverable_is_used_through_real_user_surface
+      - happy_path_observed
+      - at_least_one_error_or_refusal_path_observed_when_applicable
+      - evidence_is_recorded_in_issue_or_pr_notes
+  review_gate:
+    policy: major_full_minor_lightweight
+    owner: pr_verifier
+    major_change_requires:
+      - review-work_all_agents_pass
+    lightweight_change_requires:
+      - goal_check_passes
+      - changed_file_diagnostics_or_doc_review_passes
+      - relevant_tests_or_not_applicable_reason_recorded
+  risk_gate:
+    applies_when:
+      - refactor_candidate_issue
+    pass_when:
+      - candidate_is_low_risk_with_high_or_medium_value
+      - or_medium_risk_has_regression_bucket_and_rollback_plan
+      - high_risk_candidate_is_ready_for_human_or_split_smaller
+  security_gate:
+    required: true
+    pass_when:
+      - no_secrets_in_diff
+      - no_new_unapproved_network_or_script_execution_surface
+      - data_access_and_sql_remain_read_only_unless_explicitly_approved
+      - third_party_skill_or_tool_installs_pass_external_skill_gate
+  git_gate:
+    required: true
+    pass_when:
+      - git_status_and_diff_reviewed_before_commit
+      - commit_contains_only_relevant_files
+      - commit_message_matches_repo_style
+      - push_and_pr_actions_follow_branch_and_pr_policy
+
+repo_specific_gates:
+  setup_gate:
+    commands:
+      - python3 -m pip install pymssql pandas pytest
+      - pytest tests/skill_scripts/test_schema_loader.py -v
+      - python3 -m skill_scripts.cli_generate_select --build-artifacts
+    pass_when:
+      - required_python_dependencies_available
+      - schema_loader_smoke_test_passes
+      - artifacts_build_if_needed
+  sql_generation_gate:
+    applies_when:
+      - skill_scripts_changed
+      - prompt_to_sql_behavior_changed
+      - dashboard_data_source_or_query_execution_changed
+    required_commands:
+      - docker compose -f test_db/docker-compose.testdb.yml up -d
+      - docker exec -i wferp-mssql-test /opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P Passw0rd\!234 -i /init/01_create_wferp_test.sql
+      - export DB_DRIVER=mssql
+      - export DB_AUTH_MODE=sql_auth
+      - export DB_CONNECTION_STRING="server=127.0.0.1:1433;user=sa;password=Passw0rd!234;database=wferp_test"
+      - export DB_ENV=test
+    pass_when:
+      - sql_is_single_select_statement
+      - sql_server_2000_guard_passes
+      - metadata_and_prompt_consistency_pass
+      - sql_executes_in_test_db
+      - returned_columns_rows_and_aggregates_match_prompt_intent
+  static_docs_gate:
+    applies_when:
+      - index_html_or_df_style_or_HTML_changed
+      - _Source_generator_changed
+    pass_when:
+      - legacy_generators_run_from__Source_when_regeneration_needed
+      - utf8_chinese_vietnamese_text_preserved
+      - windows_style_generated_paths_preserved
+      - browser_opens_index_html_and_iframe_pages_load
+  browser_e2e_gate:
+    applies_when:
+      - web_ui_or_static_html_surface_changed
+      - dashboard_builder_ui_changed
+    skills_or_references:
+      - playwright
+      - e2e-testing
+      - browser-qa
+    pass_when:
+      - browser_loaded_real_local_or_preview_url
+      - critical_user_journey_executed
+      - console_and_network_failures_checked
+      - desktop_and_mobile_viewports_checked_when_visual_behavior_changed
+      - screenshots_or_trace_recorded_for_failures
+
+external_skill_gate:
+  purpose: Decide whether to install missing third-party skills.
+  pass_when:
+    - source_repo_is_allowlisted
+    - license_is_compatible
+    - requested_component_is_necessary_for_current_workflow_gap
+    - install_plan_excludes_hooks_scripts_plugins_unless_explicitly_approved
+    - target_paths_do_not_overwrite_existing_skills_without_diff_review
+    - installation_is_verified_by_reading_installed_files
+  allowlist:
+    - repo: affaan-m/everything-claude-code
+      allowed_components:
+        - skills/e2e-testing/SKILL.md
+        - skills/browser-qa/SKILL.md
+        - skills/canary-watch/SKILL.md
+      default_policy: pure_markdown_copy_only
+  deny_by_default:
+    - npm_packages
+    - hooks
+    - shell_scripts
+    - mcp_configs_with_secrets
+    - full_config_overlays
+
+issue_selection:
+  source: github_issues
+  query_policy:
+    parent_scope: same_prd_or_parent_issue_only
+    required_label: ready-for-agent
+    allowed_slice_type: AFK
+    blockers: all_blockers_closed_or_satisfied
+  ordering:
+    - dependency_topological_order
+    - oldest_ready_issue_first
+  execution:
+    mode: serial_single_issue
+    allow_parallel_ready_issues: false
+    rationale:
+      - one_issue_one_branch_one_commit_one_pr
+      - fresh_worker_and_verifier_session_per_issue
+      - release_worker_cleanup_tracks_one_selected_issue_at_a_time
+  on_no_ready_issue:
+    - run_prd_phase_completeness_audit
+  skip_when:
+    - issue_has_needs_info_or_needs_triage
+    - acceptance_criteria_not_observable
+    - issue_requires_human_judgment_or_external_secret
+    - working_tree_conflicts_with_unrelated_user_changes
+
+branch_and_pr_policy:
+  granularity: one_issue_one_branch_one_commit_one_pr
+  branch_name_template: "agent/issue-{issue_number}-{slug}"
+  commit_policy:
+    auto_commit_after_all_gates_pass: true
+    require_clean_relevant_diff: true
+    avoid_committing_unrelated_dirty_worktree_changes: true
+  push_policy:
+    automatic_after_all_gates_pass: true
+  pr_policy:
+    automatic_after_all_gates_pass: true
+    body_must_include:
+      - linked_issue
+      - compact_acceptance_criteria_matrix
+      - verification_summary_and_artifact_refs
+      - verifier_manual_qa_result_summary
+      - review_gate_result
+      - known_limitations_or_pre_existing_failures
+    final_qa_statement_requires_verifier_packet: true
+  merge_policy:
+    requires_human_review_and_merge_approval: true
+    runtime_override_policy:
+      default_mode: human_required
+      runtime_override_allowed: true
+      allowed_override_modes:
+        - bypass_approval
+      set_only_at_workflow_start: true
+      mutable_after_start: false
+      scope: workflow_run_only
+      applies_to: all_prs_created_by_this_run
+      affects_stage: release_worker_only
+      bypasses:
+        - human_merge_approval_policy_satisfied
+      does_not_bypass:
+        - verifier_packet_status_pass
+        - required_checks_pass
+        - pr_is_mergeable
+        - review_gate
+        - surface_qa_gate
+        - diagnostics_and_build_gate
+
+context_budget_policy:
+  measurement: percent_of_available_session_context_used
+  checkpoint_warning_at_percent: 45
+  stop_and_rotate_at_percent: 50
+  checkpoint_template_path: docs/agents/runtime/context-checkpoint.yaml
+  checkpoint_only_cross_session_resume: true
+  orchestrator_bootstrap_checkpoint_to_new_session_policy:
+    status: active_mvp
+    implementation_spec_path: docs/agents/runtime/orchestrator-bootstrap-checkpoint-to-new-session.md
+    applies_to:
+      - main_orchestrator_session_only
+    trigger:
+      - selected_issue_is_ready_for_agent
+      - selected_issue_slice_type_is_AFK
+      - orchestrator_is_about_to_enter_per_issue_flow
+    sequence:
+      - create_or_update_checkpoint_before_pr_flow
+      - derive_compact_payload_from_checkpoint
+      - write_new_session_continuation_request
+      - continue_with_selected_issue_pr_flow_in_fresh_session
+    exclusions:
+      - do_not_apply_to_issue_worker_sessions
+      - do_not_apply_to_pr_verifier_sessions
+      - do_not_apply_to_phase_verifier_sessions
+    notes:
+      - Orchestrator bootstrap now uses checkpoint plus explicit fresh-session dispatch for new issue PR flow startup.
+      - The 50 percent stop-and-rotate policy remains the long-term cross-session contract and is not automated by this MVP.
+  resume_policy:
+    allowed_context:
+      - issue_packet
+      - repo_policy_docs
+      - latest_context_checkpoint
+      - compact_handoff_refs
+    forbidden_context:
+      - full_prior_worker_transcript
+      - raw_test_logs
+      - raw_browser_traces
+      - raw_sql_execution_logs
+    requirements:
+      - create_or_update_checkpoint_before_rotation
+      - resume_from_checkpoint_not_chat_history
+      - keep_checkpoint_at_or_below_80_lines
+
+artifact_caps_policy:
+  raw_evidence_policy: index_only_in_repo_docs_and_main_context
+  line_caps:
+    issue_packet: 80
+    issue_handoff: 35
+    evidence_packet: 60
+    context_checkpoint: 80
+    worker_result: 80
+    test_case_catalog: 80
+    failure_registry: 80
+    refactor_candidate_audit: 80
+  templates_must_declare_caps: true
+  script_gate: scripts/agent_context_budget_check.py
+  forbidden_payloads:
+    - full_worker_transcript
+    - full_verifier_transcript
+    - raw_test_logs
+    - raw_browser_traces
+    - raw_sql_execution_logs
+    - screenshot_binary_or_base64
+
+release_worker_policy:
+  role: release_worker
+  purpose: Narrow post-verifier PR release and issue-close executor.
+  merge_approval_policy:
+    default_mode: human_required
+    runtime_override_source: workflow_start_and_checkpoint
+    bypass_approval_requires:
+      - approval_override_mode_is_bypass_approval
+      - override_scope_is_workflow_run_only
+      - override_was_set_at_workflow_start
+      - override_was_not_mutated_after_start
+  may_run_only_after:
+    - verifier_packet_status_pass
+    - pr_is_mergeable
+    - required_checks_pass
+    - human_merge_approval_policy_satisfied
+  allowed_actions:
+    - confirm_pr_mergeability_and_required_checks
+    - merge_approved_pull_request
+    - run_post_merge_workspace_hygiene
+    - close_linked_issue_after_merge
+    - post_compact_release_summary_with_evidence_packet_ref
+    - post_merge_workspace_hygiene_summary
+  execution_order:
+    - merge_approved_pull_request
+    - run_post_merge_workspace_hygiene
+    - close_linked_issue_after_merge
+    - post_compact_release_summary_with_evidence_packet_ref
+    - post_merge_workspace_hygiene_summary
+  close_issue_only_after:
+    - post_merge_workspace_hygiene_passes
+  approval_gate_evaluation:
+    human_required_mode:
+      require:
+        - verifier_packet_status_pass
+        - pr_is_mergeable
+        - required_checks_pass
+        - human_merge_approval_policy_satisfied
+    bypass_approval_mode:
+      require:
+        - verifier_packet_status_pass
+        - pr_is_mergeable
+        - required_checks_pass
+      skip:
+        - human_merge_approval_policy_satisfied
+  post_merge_workspace_hygiene:
+    scope: primary_workspace_and_issue_worktree_hygiene_only
+    primary_workspace:
+      inspect_current_branch_first: true
+      if_not_main_and_clean: switch_to_main
+      if_not_main_and_dirty: create_wip_branch_and_stash_then_switch_to_main
+      if_main_and_dirty: create_wip_branch_and_stash
+      if_main_and_clean: no_branch_restore_needed
+      wip_branch_name_template: "agent/wip/post-merge-issue-{issue_number}-{yyyyMMdd-HHmm}"
+      stash_message_template: "post-merge hygiene preserve issue-{issue_number} from {source_branch}"
+      final_git_status_must_be_clean: true
+    issue_worktree:
+      remove_when_pr_merged_and_clean: true
+      block_when_dirty_or_unknown: true
+    summary:
+      checkpoint_fields:
+        - primary_workspace_branch_before
+        - primary_workspace_branch_after
+        - dirty_state_detected
+        - wip_branch_created
+        - stash_created
+        - workspace_clean_after
+        - issue_worktree_removed
+        - cleanup_status
+        - blocked_reason
+      github_comment_uses_same_fields: true
+      blocked_reason_enum:
+        - dirty_workspace_preserve_failed
+        - switch_main_failed
+        - fast_forward_main_failed
+        - worktree_remove_failed
+        - workspace_not_clean_after_cleanup
+        - issue_worktree_dirty_blocked
+  forbidden_actions:
+    - implement_issue_scope
+    - run_final_acceptance_qa
+    - bypass_required_checks_or_reviews
+    - merge_without_required_human_approval
+    - close_issue_before_pr_merge
+    - modify_issue_scope_files_during_cleanup
+  blocked_when:
+    - verifier_packet_missing_or_not_pass
+    - pr_not_mergeable
+    - required_checks_pending_or_failed
+    - human_approval_required_but_absent
+    - post_merge_workspace_hygiene_failed
+    - issue_worktree_dirty_or_unknown
+
+session_isolation_policy:
+  main_agent_role: orchestrator_only
+  main_agent_may_implement:
+    - workflow_self_repair_only
+    - worker_boot_failure_recovery
+    - tiny_process_doc_fix
+  main_agent_must_not:
+    - implement_general_issue_scope
+    - retain_full_worker_transcript_across_issues
+    - run_issue_or_phase_qa_except_contract_validation
+    - run_tests_builds_diagnostics_or_manual_qa_for_issue_acceptance
+    - run_review_work_as_issue_or_pr_qa
+  contract_validation_definition:
+    allowed:
+      - schema_check_worker_result_required_fields
+      - schema_check_evidence_packet_required_fields
+      - verify_worker_and_verifier_refs_are_present
+      - verify_acceptance_criteria_map_to_evidence_refs
+      - verify_worker_verifier_proof_of_separation_is_present
+      - validate_test_case_catalog_shape
+      - validate_failure_registry_shape
+      - validate_refactor_candidate_audit_shape
+      - update_handoff_and_tracker_with_compact_refs
+    forbidden:
+      - run_pytest
+      - run_py_compile
+      - run_lsp_diagnostics_on_issue_code
+      - run_browser_qa
+      - run_sql_execution_validation
+      - run_manual_surface_driver
+      - run_review_work
+  issue_execution:
+    use_fresh_worker_session_per_issue: true
+    use_fresh_verifier_session_per_pr: true
+    use_fresh_verifier_session_per_phase: true
+    allow_parallel_ready_issues: false
+    ultrawork_policy:
+      allowed_inside_single_issue_worker_or_single_verifier: true
+      forbid_orchestrator_multi_issue_ultrawork: true
+      requires_explicit_concurrency_policy_before_parallel_issue_execution: true
+    worker_reads_issue_packet_first: true
+    worker_must_terminate_after_issue: true
+    worker_returns_structured_result_only: true
+    verifier_returns_evidence_packet_only: true
+    proof_of_separation_required: true
+    allow_specialist_helpers:
+      - explore
+      - librarian
+      - oracle
+    max_delegation_depth: 3
+  issue_bootstrap_context:
+    - issue_packet
+    - AGENTS.md
+    - CONTEXT.md
+    - docs/agents/domain.md
+    - docs/agents/autonomous-development-workflow.yaml
+    - parent_prd_relevant_slice
+    - previous_issue_handoff
+
+handoff_policy:
+  on_success: required
+  on_blocked: required
+  on_failed_after_retries: required
+  repo_path_template: "docs/agents/handoffs/issue-{issue_number}.yaml"
+  github_summary_required: true
+  include_sections:
+    - issue_identity
+    - acceptance_criteria_evidence
+    - compact_verification_summary
+    - evidence_packet_refs
+    - files_changed_summary
+    - blockers_or_risks
+    - next_recommended_step
+
+issue_packet_policy:
+  template_path: docs/agents/issue-packet-template.yaml
+  required_fields:
+    - issue
+    - branch
+    - objective
+    - acceptance_criteria
+    - scope
+    - bootstrap_context
+    - implementation_notes
+    - verification_plan
+    - handoff_contract
+    - result_contract
+  optional_fields:
+    - test_case
+  forbidden_payloads:
+    - full_orchestrator_transcript
+    - unrelated_repo_search_dumps
+    - speculative_solution_branches
+
+worker_result_policy:
+  template_path: docs/agents/worker-result-template.yaml
+  required_fields:
+    - issue
+    - branch
+    - status
+    - summary
+    - files_changed
+    - verification
+    - pr
+    - blockers
+    - next_recommended_step
+    - evidence_packet_refs
+    - role_boundary
+  optional_fields:
+    - test_case_repair
+  forbidden_payloads:
+    - full_worker_transcript
+    - long_form_chain_of_thought
+    - repeated_search_output
+
+evidence_packet_policy:
+  template_path: docs/agents/evidence-packet-template.yaml
+  purpose: >
+    Keep verbose verification evidence outside the main agent context while
+    preserving an auditable chain from acceptance criteria to raw artifacts.
+  required_for:
+    - every_issue_pr_verifier_run
+    - every_phase_cross_issue_verifier_run
+    - every_e2e_test_case_verifier_run
+  storage_policy:
+    repo_handoff_keeps: compact_summary_and_refs_only
+    raw_evidence_kept_in: ci_or_local_artifact_bundle
+    main_agent_consumes: evidence_packet_index_only
+    raw_evidence_policy: index_only_no_raw_logs_or_traces_in_repo_docs
+  required_fields:
+    - subject
+    - verifier
+    - proof_of_separation
+    - status
+    - acceptance_criteria_matrix
+    - gates
+    - role_boundary
+    - artifact_manifest
+    - compact_summary
+    - next_recommended_step
+  optional_fields:
+    - test_case_verification
+  forbidden_payloads:
+    - full_command_output
+    - full_test_logs
+    - screenshot_binary_or_base64
+    - verbose_browser_trace
+    - full_verifier_transcript
+  line_cap: 60
+
+e2e_test_case_issue_loop:
+  spec_path: docs/agents/e2e/test-case-issue-loop.md
+  catalog_path: docs/agents/e2e/test-case-catalog.yaml
+  failure_registry_path: docs/agents/e2e/failure-registry.yaml
+  issue_unit: one_github_issue_per_executable_e2e_test_case
+  timing:
+    draft_intent_created_during: create_prd
+    executable_issue_materialized_after: feature_issue_verifier_passes
+  labels:
+    canonical_ready_label: ready-for-agent
+    supplemental: [e2e-test-case, blocked-by-spec, blocked-by-infra]
+  ready_for_agent_requires:
+    - source_ref_present
+    - setup_execution_and_expected_outcome_explicit
+    - surface_and_regression_bucket_declared
+    - evidence_requirements_index_only
+  same_issue_fix_allowed: [product, test, fixture, harness, test_data_seed]
+  worker_forbidden_changes:
+    - weaken_assertions
+    - change_expected_outcome_without_spec_repair_issue
+    - claim_final_e2e_acceptance
+  loop_control:
+    max_worker_verifier_cycles: 3
+    max_same_root_cause_repairs: 2
+    shared_failure_parent_issue_threshold: 2
+  pass_condition:
+    target_case: pass
+    required_regression_bucket: pass
+    proof_of_separation: true
+    artifact_manifest_present: true
+  release_worker_may_rerun_e2e: false
+
+refactor_candidate_loop:
+  spec_path: docs/agents/refactor/refactor-candidate-loop.md
+  audit_template_path: docs/agents/refactor/refactor-candidate-audit-template.yaml
+  issue_unit: one_github_issue_per_refactor_candidate
+  timing:
+    starts_after: e2e_test_case_issue_loop
+    continues_to: documentation_and_tracker_update
+  execution_policy:
+    conditional: true
+    no_candidates: skip_with_refactor_candidate_audit_note
+    candidate_source: phase_refactor_audit
+  labels:
+    canonical_ready_label: ready-for-agent
+    supplemental: [refactor-candidate, blocked-by-spec, blocked-by-risk]
+  safety_refactor_only:
+    allowed: [rename, extract_function_or_class, remove_duplication, simplify_control_flow, improve_boundaries, reduce_coupling, improve_testability]
+    forbidden: [new_feature, ux_change, sql_semantics_change, public_contract_change, expected_output_change, acceptance_criteria_change, e2e_expected_outcome_change]
+  risk_gate:
+    low_risk: high_or_medium_value_may_be_ready_for_agent
+    medium_risk: requires_regression_bucket_and_rollback_plan
+    high_risk: ready_for_human_or_split_smaller
+  regression_policy:
+    mode: impact_based
+    uncertain_impact_fallback: rerun_all_materialized_e2e_test_case_regression_buckets
+  metadata_update_policy:
+    may_update_e2e_metadata_refs: true
+    may_change_expected_outcomes: false
+
+phases:
+  - id: clarify_requirements
+    goal: Resolve product intent and ambiguous decisions before implementation.
+    primary_skills:
+      - grill-me
+      - grill-with-docs
+    actions:
+      - read_domain_docs
+      - ask_one_decision_question_at_a_time
+      - record_decisions_in_context_or_prd_notes
+    exit_gate: spec_gate
+
+  - id: create_prd
+    goal: Convert clarified context into a PRD.
+    primary_skills:
+      - to-prd
+    actions:
+      - synthesize_problem_solution_user_stories_decisions_tests_out_of_scope
+      - draft_e2e_test_intents_from_acceptance_criteria
+      - publish_prd_to_github_issue_with_needs_triage
+      - store_local_copy_when_useful
+    exit_gate: spec_gate
+
+  - id: create_vertical_slice_issues
+    goal: Break the PRD into independently verifiable tracer-bullet issues.
+    primary_skills:
+      - to-issues
+      - triage
+    actions:
+      - draft_AFk_and_HITL_vertical_slices
+      - confirm_granularity_dependencies_and_AFk_status
+      - publish_issues_in_dependency_order
+      - label_ready_for_agent_when_fully_specified
+    exit_gate: traceability_gate
+
+  - id: environment_setup
+    goal: Prepare local dependencies and test surfaces.
+    primary_skills:
+      - karpathy-guidelines
+    actions:
+      - install_documented_python_dependencies
+      - start_and_seed_test_db_when_sql_execution_needed
+      - run_smoke_tests
+      - install_external_skills_only_through_external_skill_gate
+    exit_gate: setup_gate
+
+  - id: issue_development_loop
+    goal: Orchestrate ready AFK issues through issue-scoped worker/verifier/release subagents until the PRD phase is complete or blocked.
+    loop:
+      select_next_issue: issue_selection
+      on_no_ready_issue:
+        - run_prd_phase_completeness_audit
+        - if_prd_phase_incomplete_return_to_create_vertical_slice_issues
+        - if_prd_phase_complete_continue_to_e2e_test_case_issue_loop
+        - if_audit_cannot_confirm_coverage_or_publish_more_issues_stop_for_human_decision
+      max_issue_gate_repair_attempts: 3
+      on_worker_boot_failure:
+        - create_handoff_with_attempts_and_failures
+        - stop_for_human_decision
+      on_invalid_worker_result:
+        - request_worker_result_repair_once
+        - create_handoff_with_attempts_and_failures
+        - stop_for_human_decision
+      on_repair_attempts_exhausted:
+        - run_diagnose_or_consult_oracle_when_debugging_or_architecture_blocks
+        - create_handoff_with_attempts_and_failures
+        - stop_for_human_decision
+    per_issue_flow:
+      - create_or_update_checkpoint_for_selected_AFK_issue
+      - derive_compact_payload_from_checkpoint
+      - write_main_orchestrator_root_session_request_before_pr_flow
+      - create_or_switch_issue_branch
+      - build_issue_packet
+      - delegate_issue_worker_subagent
+      - wait_for_worker_result
+      - validate_worker_result_schema
+      - delegate_pr_verifier_subagent
+      - wait_for_evidence_packet
+      - validate_evidence_packet_schema
+      - record_issue_handoff
+      - stop_for_pr_merge_review
+
+  - id: issue_worker_execution
+    goal: Execute one issue inside an isolated worker subagent coordinated by the main_orchestrator root session.
+    primary_skills:
+      - tdd
+      - karpathy-guidelines
+      - git-master
+    fallback_skills:
+      - diagnose
+    actions:
+      - read_issue_packet_only
+      - expand_context_on_demand
+      - map_acceptance_criteria_to_planned_evidence
+      - run_tdd_red_green_refactor_vertical_slices
+      - run_implementation_self_checks_for_feedback
+      - report_self_check_summary_without_final_acceptance_claim
+      - commit_if_all_gates_pass
+      - push_branch_if_all_gates_pass
+      - create_pr_if_all_gates_pass
+      - write_worker_result_or_draft_handoff_refs
+      - post_implementation_self_check_summary_without_final_acceptance_claim
+      - emit_structured_result_object
+      - return_control_to_main_orchestrator
+    gates:
+      - tdd_gate
+      - implementation_self_check_gate
+      - git_gate
+
+  - id: per_issue_tdd
+    goal: Implement each issue through public-interface behavior tests.
+    primary_skills:
+      - tdd
+      - karpathy-guidelines
+    fallback_skills:
+      - diagnose
+    gates:
+      - tdd_gate
+      - implementation_self_check_gate
+
+  - id: per_issue_e2e
+    goal: Verify each issue through its smallest real user surface.
+    policy: verifier_owned_issue_small_e2e
+    primary_skills:
+      - playwright
+      - e2e-testing
+      - browser-qa
+    examples:
+      cli: run_command_and_check_happy_and_error_paths
+      library: run_minimal_driver_script
+      api: hit_live_process_with_curl_or_driver
+      browser: load_page_click_fill_assert_console_network_and_screenshot_failures
+      sql: execute_against_test_db_and_validate_result_evidence
+    gates:
+      - surface_qa_gate
+
+  - id: per_pr_review
+    goal: Ensure a PR is releasable before human merge review.
+    policy: major_full_minor_lightweight
+    major_primary_skill: review-work
+    lightweight_checks:
+      - goal_vs_diff_check
+      - changed_file_diagnostics
+      - relevant_tests_or_not_applicable_reason
+      - manual_surface_qa_notes
+    gates:
+      - review_gate
+      - security_gate
+
+  - id: pr_verifier_execution
+    goal: Independently verify one issue PR from its worker result, diff, and issue packet without importing verbose evidence into the main agent context.
+    policy: fresh_verifier_subagent_per_pr
+    primary_skills:
+      - karpathy-guidelines
+      - review-work
+    actions:
+      - read_issue_packet_worker_result_and_diff_only
+      - rerun_required_focused_checks_or_confirm_ci_artifacts
+      - rerun_surface_specific_qa_when_artifact_absent_or_untrusted
+      - compare_acceptance_criteria_to_observed_evidence
+      - confirm_worker_verifier_role_separation
+      - emit_evidence_packet_with_artifact_manifest
+      - return_control_to_main_orchestrator
+    gates:
+      - traceability_gate
+      - diagnostics_and_build_gate
+      - surface_qa_gate
+      - review_gate
+
+  - id: commit_push_and_create_pr
+    goal: Inside the issue worker, save verified local work and automatically publish the verified issue branch and PR.
+    primary_skills:
+      - git-master
+    actions:
+      - inspect_git_status_diff_and_log
+      - stage_only_relevant_files
+      - commit_with_accurate_message
+      - push_branch_to_remote
+      - create_pull_request
+    gates:
+      - git_gate
+
+  - id: prd_phase_completeness_audit
+    goal: When no ready AFK issue remains, determine whether the current PRD phase is fully covered before E2E test case issue materialization or closure.
+    primary_skills:
+      - to-issues
+      - triage
+      - zoom-out
+    actions:
+      - compare_prd_acceptance_criteria_and_user_journeys_to_completed_open_and_missing_issue_slices
+      - confirm_no_dependency_ready_issue_was_missed
+      - if_prd_phase_incomplete_return_to_create_vertical_slice_issues
+      - if_prd_phase_complete_continue_to_e2e_test_case_issue_loop
+      - record_audit_summary_and_next_recommended_step
+    exit_paths:
+      prd_phase_incomplete:
+        - create_vertical_slice_issues
+        - issue_development_loop
+      prd_phase_complete:
+        - e2e_test_case_issue_loop
+        - phase_refactor
+        - documentation_and_tracker_update
+      blocked:
+        - stop_for_human_decision
+
+  - id: e2e_test_case_issue_loop
+    goal: Materialize executable E2E test intents into GitHub issues and cycle each case through repair, fresh verification, and release readiness.
+    policy: test_case_issue_loop
+    reference: docs/agents/e2e/test-case-issue-loop.md
+    primary_skills:
+      - to-issues
+      - triage
+      - e2e-testing
+    actions:
+      - convert_ready_e2e_intents_to_one_issue_per_test_case
+      - update_test_case_catalog_after_issue_creation
+      - run_serial_issue_worker_and_fresh_verifier_subagent_cycles
+      - update_failure_registry_from_verifier_evidence
+      - create_or_link_parent_infra_issue_when_signature_threshold_met
+      - require_target_case_and_regression_bucket_pass_before_release
+    gates:
+      - traceability_gate
+      - surface_qa_gate
+      - diagnostics_and_build_gate
+
+  - id: phase_refactor
+    goal: Improve architecture only after behavior is green and all materialized E2E test case issues pass.
+    policy: refactor_candidate_loop
+    reference: docs/agents/refactor/refactor-candidate-loop.md
+    issue_unit: one_github_issue_per_refactor_candidate
+    scope: safety_refactor_only
+    skip_when:
+      - no_refactor_candidates_identified_in_audit
+    skip_evidence_required: true
+    regression_strategy: impact_based
+    e2e_metadata_policy:
+      may_update: [test_case_catalog_refs, failure_registry_refs]
+      must_not_change: [expected_outcomes, assertions, acceptance_criteria]
+    primary_skills:
+      - improve-codebase-architecture
+      - karpathy-guidelines
+      - ai-slop-remover
+    actions:
+      - run_refactor_candidate_audit_after_e2e_test_case_loop_passes
+      - write_refactor_candidate_audit_artifact
+      - if_no_candidates_skip_with_evidence_note
+      - score_candidates_by_value_risk_regression_coverage_and_rollback_boundary
+      - create_one_github_issue_per_approved_refactor_candidate
+      - label_refactor_issues_with_canonical_and_supplemental_labels
+      - route_each_refactor_issue_through_issue_worker_verifier_and_release_worker
+      - require_impact_based_regression_or_all_e2e_buckets_when_uncertain
+      - update_refactor_audit_and_e2e_metadata_refs_without_expected_behavior_changes
+    gates:
+      - traceability_gate
+      - risk_gate
+      - diagnostics_and_build_gate
+      - surface_qa_gate
+      - review_gate
+
+  - id: documentation_and_tracker_update
+    goal: Write durable issue-scoped handoff evidence and update docs after verified behavior.
+    primary_skills:
+      - grill-with-docs
+      - write-a-skill
+    actions:
+      - update_context_or_adr_when_domain_decisions_changed
+      - update_operator_docs_when commands_or_gates_changed
+      - write_issue_scoped_handoff_snapshot
+      - post_issue_or_pr_evidence_summary
+      - recommend_next_step_after_each_completed_unit
+    gates:
+      - traceability_gate
+
+stop_conditions:
+  success:
+    - all_prd_ready_for_agent_issues_completed
+    - prd_phase_completeness_audit_passed
+    - all_issue_prs_have_passed_required_gates
+    - all_materialized_e2e_test_case_issues_verified_or_released
+    - refactor_candidate_audit_recorded_and_refactor_issues_completed_or_skipped
+    - docs_and_tracker_evidence_posted
+  blocked:
+    - missing_secret_or_external_access
+    - unresolved_product_decision
+    - destructive_action_required
+    - three_materially_different_fix_attempts_failed
+    - required_external_skill_or_tool_install_not_approved
+    - issue_worker_boot_or_result_contract_failure
+    - prd_phase_completeness_audit_cannot_confirm_coverage_or_publish_more_issues
+    - pull_request_review_or_merge_requires_human_action
+    - review_work_fails_with_blocking_issue_that_requires_human_decision
+
+evidence_templates:
+  acceptance_criteria_table_columns:
+    - ac_number
+    - acceptance_criterion
+    - evidence_type
+    - command_or_surface
+    - result
+    - notes
+  issue_completion_comment_sections:
+    - summary
+    - compact_ac_matrix
+    - evidence_packet_refs
+    - tests_and_e2e_summary
+    - review_gate
+    - risks_or_limitations
+    - next_step_recommendation
+  post_merge_workspace_hygiene_comment_fields:
+    - primary_workspace_branch_before
+    - primary_workspace_branch_after
+    - dirty_state_detected
+    - wip_branch_created
+    - stash_created
+    - workspace_clean_after
+    - issue_worktree_removed
+    - cleanup_status
+    - blocked_reason
+  release_summary_override_fields:
+    - merge_approval_mode
+    - human_approval_skipped
+    - override_source
+    - override_scope
+  repo_handoff_sections:
+    - issue_identity
+    - acceptance_criteria_evidence
+    - compact_verification_summary
+    - evidence_packet_refs
+    - files_changed_summary
+    - blockers_or_risks
+    - next_recommended_step
+  worker_result_object_fields:
+    - issue
+    - branch
+    - status
+    - summary
+    - files_changed
+    - verification
+    - pr
+    - blockers
+    - next_recommended_step
+    - evidence_packet_refs
+    - role_boundary
+  evidence_packet_fields:
+    - subject
+    - verifier
+    - proof_of_separation
+    - status
+    - acceptance_criteria_matrix
+    - gates
+    - role_boundary
+    - artifact_manifest
+    - compact_summary
+    - next_recommended_step
+  pr_body_sections:
+    - summary
+    - linked_issue
+    - compact_acceptance_criteria_matrix
+    - verification_summary_and_artifact_refs
+    - verifier_manual_qa_result_summary
+    - review_gate
+    - rollout_or_followup

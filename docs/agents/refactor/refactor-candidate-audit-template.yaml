@@ -1,0 +1,32 @@
+schema_version: "1.0"
+kind: refactor_candidate_audit
+line_cap: 80
+raw_evidence_policy: index_only_refs_no_raw_logs_or_transcripts
+
+phase: "<phase-name>"
+status: "candidates_found|skipped_no_candidates|blocked"
+
+inputs:
+  e2e_catalog_ref: "docs/agents/e2e/test-case-catalog.yaml"
+  failure_registry_ref: "docs/agents/e2e/failure-registry.yaml"
+  worker_or_verifier_suggestions: ["<artifact-ref-or-none>"]
+
+risk_gate:
+  low_risk_policy: "high_or_medium_value_may_be_ready_for_agent"
+  medium_risk_policy: "requires_regression_bucket_and_rollback_plan"
+  high_risk_policy: "ready_for_human_or_split_smaller"
+
+candidates:
+  - id: "REF-001"
+    source: "failure_registry|worker_suggestion|verifier_suggestion|code_audit|human"
+    summary: "<behavior-preserving refactor candidate>"
+    value: "high|medium|low"
+    risk: "high|medium|low"
+    affected_surfaces: ["cli|api|browser|library|sql|static-html|none"]
+    regression_bucket: ["<focused-check-or-e2e-bucket>"]
+    issue: {number: "<issue-number-or-empty>", url: "<issue-url-or-empty>"}
+    status: "proposed|needs-triage|ready-for-agent|ready-for-human|done|wontfix"
+
+skip_reason: "<reason when status is skipped_no_candidates, otherwise empty>"
+blockers: ["<blocking item or none>"]
+next_recommended_step: "<single next action>"

@@ -1,0 +1,74 @@
+schema_version: "1.0"
+kind: issue_packet
+line_cap: 80
+raw_evidence_policy: index_only_refs_no_raw_logs_or_transcripts
+
+issue:
+  number: "<issue-number>"
+  title: "<issue-title>"
+  url: "<issue-url>"
+  labels: [ready-for-agent]
+  parent: {type: "<prd-or-parent-issue>", reference: "<issue-number-or-doc-path>"}
+
+branch: {name: "agent/issue-<issue-number>-<slug>", base: "main"}
+objective: "<single-sentence goal for this worker>"
+
+acceptance_criteria:
+  - {id: "AC1", text: "<observable behavior>", evidence_hint: "<test, command, or manual surface check>"}
+
+test_case:
+  applies: false
+  id: "<E2E-id-or-empty>"
+  source: {type: "<prd_ac|bug_report|regression|manual_risk|none>", ref: "<ref-or-empty>"}
+  surface: "<cli|api|browser|library|sql|static-html|none>"
+  scenario: "<one user-visible journey or empty>"
+  expected_outcome: "<observable pass condition or empty>"
+  regression_bucket: ["<focused verifier checks or none>"]
+
+scope:
+  in: ["<repo path or behavior in scope>"]
+  out: ["<explicit non-goal>"]
+
+bootstrap_context:
+  required_reads: ["AGENTS.md", "docs/agents/autonomous-development-workflow.yaml"]
+  relevant_paths: ["<file-or-directory-path>"]
+  prior_handoff: "<docs/agents/handoffs/issue-N.yaml-or-none>"
+  context_budget: {checkpoint_warning_at_percent: 45, stop_and_rotate_at_percent: 50}
+
+implementation_notes:
+  constraints:
+    - "Keep artifacts within line caps and raw evidence index-only."
+  risks: ["<known risk or none>"]
+  dependencies: ["<blocking issue, PR, service, or none>"]
+
+verification_plan:
+  worker_self_checks:
+    - {command: "<command>", purpose: "implementation feedback only; not final acceptance QA", success_criteria: "<what should pass before worker returns>"}
+  verifier_acceptance_checks:
+    required_gates: ["diagnostics_and_build_gate", "surface_qa_gate", "review_gate"]
+    automated_checks:
+      - {command: "<command-or-ci-artifact-ref>", success_criteria: "<what verifier must observe or confirm>"}
+  verifier_manual_qa:
+    owner: "pr_verifier"
+    surface: "<cli|api|browser|library|sql|static-html>"
+    happy_path: "<what verifier exercises>"
+    refusal_or_error_path: "<edge/refusal path or n/a>"
+
+handoff_contract:
+  repo_path: "docs/agents/handoffs/issue-<issue-number>.yaml"
+  github_summary_required: true
+  required_sections: [issue_identity, acceptance_criteria_evidence, compact_verification_summary, evidence_packet_refs, files_changed_summary, blockers_or_risks, next_recommended_step]
+
+result_contract:
+  template_path: "docs/agents/worker-result-template.yaml"
+  verifier_template_path: "docs/agents/evidence-packet-template.yaml"
+  allowed_statuses: [success, blocked, failed]
+  required_fields: [issue, branch, status, summary, files_changed, verification, pr, blockers, next_recommended_step, evidence_packet_refs, role_boundary]
+  forbidden_payloads: [full_worker_transcript, full_verifier_transcript, raw_test_logs, verbose_manual_qa_transcript]
+
+role_boundary:
+  orchestrator_may_validate_contract_only: true
+  worker_may_emit_final_acceptance: false
+  verifier_packet_required_for_completion: true
+
+prepared_by: {actor: "<orchestrator-name>", prepared_at: "<ISO-8601 timestamp>"}

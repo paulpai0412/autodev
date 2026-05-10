@@ -1,0 +1,73 @@
+schema_version: "1.0"
+kind: context_checkpoint
+line_cap: 80
+
+subject:
+  issue_number: "0"
+  branch: "agent/issue-0-bootstrap"
+  role: "main_orchestrator"
+  checkpoint_reason: "standalone_autodev_bootstrap"
+
+context_budget:
+  warning_at_percent: 45
+  stop_and_rotate_at_percent: 50
+  measured_percent_used: "unknown"
+  must_rotate_now: false
+
+resume_policy:
+  checkpoint_only_cross_session_resume: true
+  do_not_import_full_prior_transcript: true
+  raw_evidence_policy: "index_only; raw logs/traces stay in artifact bundle"
+
+runtime_controls:
+  approval_override_mode: ""
+  default_merge_approval_mode: "human_required"
+  set_only_at_workflow_start: true
+  mutable_after_start: false
+  scope: "workflow_run_only"
+  applies_to: "all_prs_created_by_this_run"
+  affects_stage: "release_worker_only"
+  override_source: "none"
+  human_approval_skipped: false
+
+state:
+  completed: []
+  in_progress:
+    - "Select a ready issue and bootstrap the standalone orchestrator session."
+  next:
+    - "Run scripts/orchestrator_bootstrap_runner.py for the next AFK issue."
+  blockers:
+    - "none"
+
+refs:
+  issue_packet: ""
+  worker_result: ""
+  evidence_packet: ""
+  handoff: ""
+  artifact_bundle: ""
+
+compact_payload:
+  active_target: {issue_number: "0", branch: "agent/issue-0-bootstrap", role: "main_orchestrator", agent: "hephaestus", next_flow: "per_issue_flow"}
+  authoritative_refs: ["docs/agents/autonomous-development-workflow.yaml"]
+  state_snapshot:
+    completed: []
+    in_progress: ["Select a ready issue and bootstrap the standalone orchestrator session."]
+    next: ["Run scripts/orchestrator_bootstrap_runner.py for the next AFK issue."]
+    blockers: ["none"]
+  resume_rules: ["Resume from checkpoint and compact payload, not full chat history.", "Keep raw evidence as refs only; do not inline logs or traces."]
+  immediate_next_action: "Run scripts/orchestrator_bootstrap_runner.py for the next AFK issue."
+
+post_merge_workspace_hygiene:
+  primary_workspace_branch_before: "main"
+  primary_workspace_branch_after: "main"
+  dirty_state_detected: false
+  wip_branch_created: "none"
+  stash_created: "none"
+  workspace_clean_after: true
+  issue_worktree_removed: false
+  cleanup_status: "pass"
+  blocked_reason: "none"
+
+metadata:
+  updated_by: "Hephaestus"
+  updated_at: "2026-05-10T00:00:00+08:00"

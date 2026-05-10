@@ -1,0 +1,74 @@
+schema_version: "1.0"
+kind: worker_result
+line_cap: 80
+raw_evidence_policy: index_only_refs_no_raw_logs_or_transcripts
+
+issue:
+  number: "<issue-number>"
+  title: "<issue-title>"
+  url: "<issue-url>"
+
+branch: "agent/issue-<issue-number>-<slug>"
+status: "<success|blocked|failed>"
+failure_classification: {kind: "<none|contract_invalid|transient_tool_failure|issue_scope_blocked|verification_failed|spec_drift|dependency_blocked>", retryable: true, routed_to: "<issue_worker|pr_verifier|main_orchestrator>", root_cause_signature: "<stable-signature-or-none>"}
+
+summary:
+  objective: "<goal from issue packet>"
+  outcome: "<what changed and why>"
+
+files_changed:
+  - path: "<repo-path>"
+    summary: "<why this file changed>"
+
+test_case_repair:
+  applies: false
+  test_case_id: "<E2E-id-or-empty>"
+  attempted_target_case: false
+  repaired_categories: ["<product|test|fixture|harness|test_data_seed|none>"]
+  failure_signature: "<stable-signature-or-none>"
+  assertion_changed: false
+  expected_outcome_changed: false
+
+verification:
+  note: "Worker self-checks support implementation feedback only; final acceptance comes from the verifier evidence packet."
+  gates:
+    tdd_gate: "<pass|not_applicable|fail>"
+    implementation_self_check_gate: "<pass|not_applicable|fail>"
+    git_gate: "<pass|fail>"
+  implementation_self_checks:
+    - command: "<command>"
+      result: "<pass|fail>"
+      evidence_ref: "<artifact-id, check-run-url, or local artifact path>"
+      summary: "<short observed output summary, no raw log>"
+  final_acceptance_claim: false
+
+evidence_packet_refs:
+  worker_artifact_bundle: "<ci-artifact-url-or-local-artifact-path-or-empty>"
+  verifier_packet: "docs/agents/evidence/issue-<issue-number>-pr-<pr-number>.yaml"
+  raw_evidence_policy: "stored_outside_main_agent_context"
+
+role_boundary:
+  actor_role: "issue_worker"
+  may_execute_implementation_self_checks: true
+  may_execute_final_acceptance_qa: false
+  may_emit_final_verification: false
+  verifier_packet_required_for_completion: true
+
+pr:
+  number: "<pr-number-or-none>"
+  url: "<pr-url-or-empty>"
+  ready_for_review: false
+
+blockers:
+  - "<blocking item or none>"
+
+next_recommended_step: "<single next action for orchestrator or human reviewer>"
+
+handoff:
+  repo_path: "docs/agents/handoffs/issue-<issue-number>.yaml"
+  github_summary_posted: false
+
+metadata:
+  worker: "<worker-session-or-agent-name>"
+  worker_session_id: "<session-id-or-artifact-ref>"
+  completed_at: "<ISO-8601 timestamp>"

@@ -1,0 +1,43 @@
+schema_version: "1.0"
+kind: test_case_catalog
+line_cap: 80
+raw_evidence_policy: index_only_refs_no_raw_logs_or_transcripts
+
+purpose: >
+  Compact operational index for executable E2E test case issues. Raw logs,
+  traces, screenshots, and transcripts stay outside repo docs.
+
+update_policy:
+  owner: main_orchestrator_contract_validation_only
+  update_when:
+    - e2e_test_case_issue_created
+    - verifier_evidence_packet_validated
+    - release_worker_reports_merge_or_blocker
+    - phase_refactor_updates_metadata_refs
+
+entries:
+  - id: "E2E-001"
+    source: {type: "prd_ac", ref: "#30 E2E-001"}
+    issue: {number: "32", url: "https://github.com/paulpai0412/wferp/issues/32", labels: [ready-for-agent, e2e-test-case]}
+    surface: "cli|library"
+    status: "blocked"
+    latest_pr: {number: "36", url: "https://github.com/paulpai0412/wferp/pull/36"}
+    latest_evidence_packet: "docs/agents/evidence/issue-32-pr-36.yaml"
+    latest_failure_signature: "changed-test-lsp-dict-invariance"
+    prior_verified_refs: [{issue: "28", pr: "29", evidence_packet: "docs/agents/evidence/issue-28-pr-29.yaml", source: "#1 AC17"}]
+    latest_refactor_refs: []
+    affected_by_refactor: false
+    next_recommended_step: "Return PR #36 to an issue worker to fix the changed-file LSP diagnostics error, then rerun a fresh verifier."
+
+entry_schema:
+  id: "E2E-001"
+  source: {type: "prd_ac|bug_report|regression|manual_risk", ref: "<ref>"}
+  issue: {number: "<issue-number>", url: "<issue-url>", labels: [e2e-test-case]}
+  surface: "cli|api|browser|library|sql|static-html"
+  status: "draft|needs-triage|ready-for-agent|in-progress|verified|blocked|released|wontfix"
+  latest_pr: {number: "<pr-number-or-none>", url: "<pr-url-or-empty>"}
+  latest_evidence_packet: "docs/agents/evidence/issue-<issue-number>-pr-<pr-number>.yaml"
+  latest_failure_signature: "<stable-signature-or-none>"
+  latest_refactor_refs: ["docs/agents/refactor/<phase-name>-audit.yaml"]
+  affected_by_refactor: false
+  next_recommended_step: "<single next action>"

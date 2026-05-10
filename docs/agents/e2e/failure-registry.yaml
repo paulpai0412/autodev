@@ -1,0 +1,32 @@
+schema_version: "1.0"
+kind: failure_registry
+line_cap: 80
+raw_evidence_policy: index_only_refs_no_raw_logs_or_transcripts
+
+purpose: >
+  Compact registry of stable E2E failure signatures used to detect shared
+  harness, fixture, environment, or infrastructure failures across test cases.
+
+update_policy:
+  owner: main_orchestrator_contract_validation_only
+  update_when:
+    - verifier_evidence_packet_reports_failure_signature
+    - same_signature_reaches_parent_issue_threshold
+    - blocking_parent_issue_status_changes
+    - phase_refactor_updates_metadata_refs
+
+thresholds:
+  shared_failure_parent_issue_threshold: 2
+  max_same_root_cause_repairs: 2
+
+entries: []
+
+entry_schema:
+  signature: "<stable-failure-signature>"
+  category: "product|test|fixture|harness|test_data_seed|infra|spec_drift"
+  affected_test_cases: ["E2E-001"]
+  evidence_refs: ["docs/agents/evidence/issue-<issue-number>-pr-<pr-number>.yaml"]
+  refactor_issue_refs: ["<github-issue-url-or-empty>"]
+  parent_issue: {number: "<issue-number-or-none>", url: "<issue-url-or-empty>"}
+  disposition: "open|blocked-by-spec|blocked-by-infra|fixed|wontfix"
+  next_recommended_step: "<single next action>"

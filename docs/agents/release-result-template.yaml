@@ -1,0 +1,33 @@
+schema_version: "1.0"
+kind: release_result
+line_cap: 60
+raw_evidence_policy: index_only_refs_no_raw_logs_or_transcripts
+
+subject:
+  issue_number: "<issue-number>"
+  pr_number: "<pr-number>"
+  branch: "<branch-name>"
+
+status: "<success|blocked|failed>"
+blocked_reason: "<none|required_checks_pending|required_checks_failed|pr_not_mergeable|human_approval_required|workspace_hygiene_failed|issue_worktree_dirty|transient_tool_failure|unknown>"
+
+summary:
+  outcome: "<what the release worker observed>"
+  next_recommended_step: "<single next action for supervisor or orchestrator>"
+
+failure_classification: {kind: "<none|checks_pending|checks_failed|merge_conflict|approval_blocked|cleanup_failed|contract_invalid|transient_tool_failure>", retryable: true, routed_to: "<release_worker|main_orchestrator|none>", root_cause_signature: "<stable-signature-or-none>"}
+
+merge:
+  attempted: false
+  merged: false
+  merged_sha: "<commit-sha-or-empty>"
+
+role_boundary:
+  actor_role: "release_worker"
+  may_run_final_acceptance_qa: false
+  may_merge_only_after_verifier_pass: true
+
+metadata:
+  worker: "<release-worker-session-or-agent-name>"
+  worker_session_id: "<session-id-or-artifact-ref>"
+  completed_at: "<ISO-8601 timestamp>"
