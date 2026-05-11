@@ -19,18 +19,41 @@ def write(path: Path, text: str) -> None:
     _ = path.write_text(text, encoding="utf-8")
 
 
+def completed(args: list[str], *, returncode: int = 0, stdout: str = "", stderr: str = "") -> CompletedProcess[str]:
+    return CompletedProcess(args=args, returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+def fake_init_bootstrap_run(args: list[str], **_kwargs: object) -> CompletedProcess[str]:
+    if args[:3] == ["git", "rev-parse", "--is-inside-work-tree"]:
+        return completed(args, returncode=128, stderr="not a git repository")
+    if args[:4] == ["git", "remote", "get-url", "origin"]:
+        return completed(args, returncode=2, stderr="no such remote")
+    if args[:3] == ["gh", "repo", "view"]:
+        return completed(args, returncode=1, stderr="not found")
+    if args[:3] == ["git", "init", "-b"]:
+        return completed(args, stdout="initialized")
+    if args[:3] == ["git", "remote", "add"]:
+        return completed(args)
+    if args[:3] == ["gh", "repo", "create"]:
+        return completed(args, stdout="created")
+    if args[:3] == ["gh", "label", "create"]:
+        return completed(args)
+    raise AssertionError(f"unexpected command: {args}")
+
+
 def test_init_creates_project_contract_dirs_and_agents_managed_block(tmp_path: Path):
     write(tmp_path / "AGENTS.md", "# Project Agents\n\nKeep this project-specific guidance.\n")
 
-    exit_code = autodev_project.main(
-        [
-            "init",
-            "--project-root",
-            str(tmp_path),
-            "--github-repo",
-            "paulpai0412/wferp",
-        ]
-    )
+    with patch("scripts.autodev_project.subprocess.run", side_effect=fake_init_bootstrap_run) as run:
+        exit_code = autodev_project.main(
+            [
+                "init",
+                "--project-root",
+                str(tmp_path),
+                "--github-repo",
+                "paulpai0412/wferp",
+            ]
+        )
 
     assert exit_code == 0
     config = read(tmp_path / ".autodev.yaml")
@@ -46,14 +69,22 @@ def test_init_creates_project_contract_dirs_and_agents_managed_block(tmp_path: P
     assert "Keep this project-specific guidance." in agents
     assert "<!-- AUTODEV:BEGIN -->" in agents
     assert "Do not copy workflow implementation" in agents
+    commands = [call.args[0] for call in run.call_args_list]
+    assert ["git", "init", "-b", "main"] in commands
+    assert ["git", "remote", "add", "origin", "https://github.com/paulpai0412/wferp.git"] in commands
+    assert ["gh", "repo", "create", "paulpai0412/wferp", "--private", "--description", autodev_project.DEFAULT_REPO_DESCRIPTION] in commands
+    label_commands = [command for command in commands if isinstance(command, list) and command[:3] == ["gh", "label", "create"]]
+    assert len(label_commands) == len(autodev_project.BOOTSTRAP_LABELS)
 
 
 def test_init_dry_run_writes_nothing(tmp_path: Path):
-    exit_code = autodev_project.main(["init", "--project-root", str(tmp_path), "--dry-run"])
+    with patch("scripts.autodev_project.subprocess.run") as run:
+        exit_code = autodev_project.main(["init", "--project-root", str(tmp_path), "--dry-run"])
 
     assert exit_code == 0
     assert not (tmp_path / ".autodev.yaml").exists()
     assert not (tmp_path / "docs").exists()
+    run.assert_not_called()
 
 
 def test_install_commands_writes_autodev_prefixed_global_commands(tmp_path: Path):
@@ -98,6 +129,91 @@ def test_doctor_reports_missing_control_plane_db(tmp_path: Path, capsys: Capture
 
     assert exit_code == 1
     assert "missing .opencode/runtime/control-plane.sqlite3" in captured.out
+
+
+def test_doctor_passes_freshly_initialized_project(tmp_path: Path, capsys: CaptureFixture[str]):
+    write(tmp_path / "AGENTS.md", "# AGENTS.md\n")
+
+    with patch("scripts.autodev_project.subprocess.run", side_effect=fake_init_bootstrap_run):
+        init_exit_code = autodev_project.main(
+            [
+                "init",
+                "--project-root",
+                str(tmp_path),
+                "--github-repo",
+                "paulpai0412/autodev-demo-todo",
+            ]
+        )
+    assert init_exit_code == 0
+
+    exit_code = autodev_project.main(["doctor", "--project-root", str(tmp_path)])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "legacy residue: docs/agents/runtime/context-checkpoint.yaml" not in captured.out
+
+
+def test_init_updates_origin_when_force_is_set(tmp_path: Path):
+    write(tmp_path / "AGENTS.md", "# AGENTS.md\n")
+
+    def fake_run(args: list[str], **_kwargs: object) -> CompletedProcess[str]:
+        if args[:3] == ["git", "rev-parse", "--is-inside-work-tree"]:
+            return completed(args, stdout="true\n")
+        if args[:4] == ["git", "remote", "get-url", "origin"]:
+            return completed(args, stdout="https://github.com/example/old.git\n")
+        if args[:3] == ["gh", "repo", "view"]:
+            return completed(args, stdout="repo exists")
+        if args[:4] == ["git", "remote", "set-url", "origin"]:
+            return completed(args)
+        if args[:3] == ["gh", "label", "create"]:
+            return completed(args)
+        raise AssertionError(f"unexpected command: {args}")
+
+    with patch("scripts.autodev_project.subprocess.run", side_effect=fake_run) as run:
+        exit_code = autodev_project.main(
+            [
+                "init",
+                "--project-root",
+                str(tmp_path),
+                "--github-repo",
+                "paulpai0412/autodev-demo-todo",
+                "--force",
+            ]
+        )
+
+    assert exit_code == 0
+    commands = [call.args[0] for call in run.call_args_list]
+    assert ["git", "remote", "set-url", "origin", "https://github.com/paulpai0412/autodev-demo-todo.git"] in commands
+
+
+def test_init_reports_origin_mismatch_without_force(tmp_path: Path, capsys: CaptureFixture[str]):
+    write(tmp_path / "AGENTS.md", "# AGENTS.md\n")
+
+    def fake_run(args: list[str], **_kwargs: object) -> CompletedProcess[str]:
+        if args[:3] == ["git", "rev-parse", "--is-inside-work-tree"]:
+            return completed(args, stdout="true\n")
+        if args[:4] == ["git", "remote", "get-url", "origin"]:
+            return completed(args, stdout="https://github.com/example/old.git\n")
+        if args[:3] == ["gh", "repo", "view"]:
+            return completed(args, stdout="repo exists")
+        if args[:3] == ["gh", "label", "create"]:
+            return completed(args)
+        raise AssertionError(f"unexpected command: {args}")
+
+    with patch("scripts.autodev_project.subprocess.run", side_effect=fake_run):
+        exit_code = autodev_project.main(
+            [
+                "init",
+                "--project-root",
+                str(tmp_path),
+                "--github-repo",
+                "paulpai0412/autodev-demo-todo",
+            ]
+        )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "origin remote points to https://github.com/example/old.git; expected https://github.com/paulpai0412/autodev-demo-todo.git" in captured.out
 
 
 def test_migrate_dry_run_lists_legacy_files_but_preserves_history(tmp_path: Path, capsys: CaptureFixture[str]):

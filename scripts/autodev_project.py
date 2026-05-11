@@ -19,6 +19,18 @@ DEFAULT_COMMANDS_DIR = Path.home() / ".config/opencode/commands"
 AGENTS_BEGIN = "<!-- AUTODEV:BEGIN -->"
 AGENTS_END = "<!-- AUTODEV:END -->"
 CHECKPOINT_TEMPLATE_PATH = ROOT / "docs/agents/runtime/context-checkpoint.yaml"
+DEFAULT_REPO_DESCRIPTION = "Autodev consumer project"
+
+BOOTSTRAP_LABELS = [
+    ("needs-triage", "D4C5F9", "Maintainer needs to evaluate this issue"),
+    ("needs-info", "F9D0C4", "Waiting on reporter for more information"),
+    ("ready-for-agent", "0E8A16", "Fully specified and ready for an AFK agent"),
+    ("ready-for-human", "BFDADC", "Requires human implementation"),
+    ("wontfix", "FFFFFF", "Will not be actioned"),
+    ("agent-dispatching", "FBCA04", "Claimed by scheduler and dispatch in progress"),
+    ("agent-in-progress", "5319E7", "Issue actively running in autodev"),
+    ("quarantined", "B60205", "Requires controlled recovery before it can continue"),
+]
 
 DOMAIN_DOCS = {
     "docs/agents/domain.md": "# Domain context\n\nDescribe the project domain language, high-value paths, and gotchas for autodev workers.\n",
@@ -57,7 +69,6 @@ LEGACY_PATHS = [
     "docs/agents/worker-result-template.yaml",
     "docs/agents/evidence-packet-template.yaml",
     "docs/agents/release-result-template.yaml",
-    "docs/agents/runtime/context-checkpoint.yaml",
     ".opencode/runtime/orchestrator-ledger.json",
     ".opencode/runtime/new-session-request.json",
     ".opencode/runtime/new-session-result.json",
@@ -160,6 +171,114 @@ def _ensure_checkpoint_file(root: Path) -> None:
     _write_text(checkpoint_path, _read_text(CHECKPOINT_TEMPLATE_PATH))
 
 
+def _run_command(args: list[str], *, cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, cwd=cwd, check=check, capture_output=True, text=True)
+
+
+def _repo_https_url(github_repo: str) -> str:
+    return f"https://github.com/{github_repo}.git"
+
+
+def _is_git_repo(root: Path) -> bool:
+    result = _run_command(["git", "rev-parse", "--is-inside-work-tree"], cwd=root, check=False)
+    return result.returncode == 0 and result.stdout.strip() == "true"
+
+
+def _git_remote_url(root: Path, remote: str) -> str | None:
+    result = _run_command(["git", "remote", "get-url", remote], cwd=root, check=False)
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def _github_repo_exists(github_repo: str) -> bool:
+    result = _run_command(["gh", "repo", "view", github_repo], check=False)
+    return result.returncode == 0
+
+
+def _ensure_git_repository(root: Path, *, dry_run: bool, check: bool, report: ActionReport) -> None:
+    if _is_git_repo(root):
+        return
+    report.actions.append("initialize git repository")
+    if dry_run or check:
+        return
+    _ = _run_command(["git", "init", "-b", "main"], cwd=root)
+
+
+def _ensure_git_remote(root: Path, *, github_repo: str, dry_run: bool, check: bool, force: bool, report: ActionReport) -> None:
+    expected_url = _repo_https_url(github_repo)
+    current_url = _git_remote_url(root, "origin")
+    if current_url is None:
+        report.actions.append(f"add git remote origin {expected_url}")
+        if dry_run or check:
+            return
+        _ = _run_command(["git", "remote", "add", "origin", expected_url], cwd=root)
+        return
+    if current_url == expected_url:
+        return
+    if not force:
+        report.findings.append(f"origin remote points to {current_url}; expected {expected_url}. Rerun init with --force to update it")
+        return
+    report.actions.append(f"update git remote origin {expected_url}")
+    if dry_run or check:
+        return
+    _ = _run_command(["git", "remote", "set-url", "origin", expected_url], cwd=root)
+
+
+def _ensure_github_repo(github_repo: str, *, dry_run: bool, check: bool, report: ActionReport) -> None:
+    if _github_repo_exists(github_repo):
+        return
+    report.actions.append(f"create GitHub repository {github_repo}")
+    if dry_run or check:
+        return
+    _ = _run_command(["gh", "repo", "create", github_repo, "--private", "--description", DEFAULT_REPO_DESCRIPTION])
+
+
+def _ensure_github_labels(github_repo: str, *, dry_run: bool, check: bool, report: ActionReport) -> None:
+    for name, color, description in BOOTSTRAP_LABELS:
+        report.actions.append(f"ensure GitHub label {name}")
+        if dry_run or check:
+            continue
+        _ = _run_command(
+            [
+                "gh",
+                "label",
+                "create",
+                name,
+                "--repo",
+                github_repo,
+                "--color",
+                color,
+                "--description",
+                description,
+                "--force",
+            ]
+        )
+
+
+def _bootstrap_project_repository(root: Path, *, github_repo: str, dry_run: bool, check: bool, force: bool, report: ActionReport) -> None:
+    if dry_run or check:
+        report.actions.append("initialize git repository")
+        report.actions.append(f"add git remote origin {_repo_https_url(github_repo)}")
+        report.actions.append(f"create GitHub repository {github_repo}")
+        for name, _, _ in BOOTSTRAP_LABELS:
+            report.actions.append(f"ensure GitHub label {name}")
+        return
+    try:
+        _ensure_git_repository(root, dry_run=dry_run, check=check, report=report)
+        _ensure_git_remote(root, github_repo=github_repo, dry_run=dry_run, check=check, force=force, report=report)
+        _ensure_github_repo(github_repo, dry_run=dry_run, check=check, report=report)
+        _ensure_github_labels(github_repo, dry_run=dry_run, check=check, report=report)
+    except FileNotFoundError as error:
+        missing = str(getattr(error, "filename", "") or error)
+        report.findings.append(f"missing bootstrap dependency: {missing}")
+    except subprocess.CalledProcessError as error:
+        stderr = cast(str, error.stderr or "").strip()
+        stdout = cast(str, error.stdout or "").strip()
+        detail = stderr or stdout or str(error)
+        report.findings.append(f"bootstrap command failed: {' '.join(cast(list[str], error.cmd))}: {detail}")
+
+
 def _config_text(root: Path, github_repo: str) -> str:
     project_name = root.name
     return "\n".join(
@@ -226,7 +345,6 @@ def _replace_managed_block(original: str, block: str) -> str:
 
 
 def init_project(root: Path, *, github_repo: str, dry_run: bool, check: bool, force: bool) -> ActionReport:
-    del force
     report = ActionReport(actions=[], findings=[])
     config_path = root / ".autodev.yaml"
     expected_config = _config_text(root, github_repo)
@@ -257,7 +375,7 @@ def init_project(root: Path, *, github_repo: str, dry_run: bool, check: bool, fo
     if not control_plane_db.exists():
         report.actions.append("create .opencode/runtime/control-plane.sqlite3")
         if not dry_run and not check:
-            ensure_control_plane_db(root)
+            _ = ensure_control_plane_db(root)
 
     checkpoint_path = root / "docs/agents/runtime/context-checkpoint.yaml"
     if not checkpoint_path.exists():
@@ -283,6 +401,8 @@ def init_project(root: Path, *, github_repo: str, dry_run: bool, check: bool, fo
             report.actions.append("update AGENTS.md autodev managed block")
             if not dry_run and not check:
                 _write_text(agents_path, updated_agents)
+
+    _bootstrap_project_repository(root, github_repo=github_repo, dry_run=dry_run, check=check, force=force, report=report)
 
     return report
 
