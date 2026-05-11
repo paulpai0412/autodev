@@ -7,7 +7,7 @@
 
 ## Exact operator commands
 - Minimal verified setup: `python3 -m pip install pytest`
-- Initialize a consumer project: `PYTHONPATH=. python3 scripts/autodev_project.py init --project-root <project> --github-repo <owner/repo>`
+- Initialize a consumer project and bootstrap git/GitHub wiring: `PYTHONPATH=. python3 scripts/autodev_project.py init --project-root <project> --github-repo <owner/repo>`
 - Install user-global OpenCode commands: `PYTHONPATH=. python3 scripts/autodev_project.py install-commands`
 - Check a consumer project: `PYTHONPATH=. python3 scripts/autodev_project.py doctor --project-root <project>`
 - Report/remove legacy local workflow files: `PYTHONPATH=. python3 scripts/autodev_project.py migrate --project-root <project> --dry-run`

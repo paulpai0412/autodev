@@ -186,6 +186,15 @@ PYTHONPATH=. python3 scripts/autodev_project.py init --project-root /path/to/pro
 - `.opencode/runtime/`
 - `.opencode/runtime/control-plane.sqlite3`
 
+目前 `init` 也會一併完成 repository bootstrap：
+
+- 若目標目錄尚未是 git repo，會自動以 `main` 初始化本地 git repository
+- 自動設定 `origin` 為 `https://github.com/<owner/repo>.git`
+- 若指定的 GitHub repository 尚不存在，會自動建立該 repo
+- 自動補齊 autodev 核心 workflow labels，例如 `needs-triage`、`ready-for-agent`、`agent-dispatching`、`agent-in-progress`、`quarantined`
+
+這代表 `init` 現在不只建立 consumer project 契約，也會把專案接到可用的 git / GitHub tracker 基礎設施。
+
 ### 4.3 安裝全域 OpenCode 指令
 
 ```bash
@@ -212,6 +221,8 @@ doctor 會檢查：
 - control-plane DB
 - legacy local workflow residue
 - 命令安裝情況
+
+如果 `init` 已成功完成，doctor 應該能在乾淨 consumer project 上回報 `autodev project: no changes needed`。
 
 ### 4.5 舊版本地 workflow 遷移
 

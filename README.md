@@ -21,6 +21,13 @@ Initialize a project so it can be driven by the shared autodev workflow:
 PYTHONPATH=. python3 scripts/autodev_project.py init --project-root /path/to/project --github-repo owner/repo
 ```
 
+`init` now bootstraps the consumer project contract **and** repository wiring:
+
+- initializes a local git repository on `main` when needed
+- adds `origin` for `https://github.com/<owner/repo>.git`
+- creates the GitHub repository when it does not exist yet
+- provisions the canonical autodev issue labels on that repository
+
 Install user-global OpenCode commands with explicit autodev names:
 
 ```bash
