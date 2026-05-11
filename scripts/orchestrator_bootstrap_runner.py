@@ -6,13 +6,16 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
+import json
 from typing import cast
 
 from scripts.orchestrator_supervisor import (
     DEFAULT_ROOT_SESSION_AGENT,
     DEFAULT_LEDGER_PATH,
+    _infer_artifact_base_dir,
     _dispatch_consumed_request,
     build_orchestrator_request,
+    claim_issue_execution,
     create_initial_ledger,
     default_session_result_path_for_request,
     parse_issue_packet_text,
@@ -92,6 +95,14 @@ def run_orchestrator_bootstrap(
     issue_packet = parse_issue_packet_text(
         issue_packet_path.read_text(encoding="utf-8"),
         _normalize_issue_packet_ref(issue_packet_path),
+    )
+    base_dir = _infer_artifact_base_dir(ledger_path)
+    claim_issue_execution(
+        base_dir=base_dir,
+        issue_number=issue_packet.issue_number,
+        branch=issue_packet.branch,
+        source_session_id=source_session_id,
+        updated_at=updated_at,
     )
 
     _ = write_checkpoint_file(
@@ -195,7 +206,12 @@ def main(argv: list[str] | None = None) -> int:
     print(f"orchestrator bootstrap: wrote supervisor ledger {result.ledger_path}")
     print(f"orchestrator bootstrap: wrote continuation request {result.new_session_request_path}")
     if result.new_session_result_path is not None:
-        print(f"orchestrator bootstrap: dispatched fresh root session and wrote session result {result.new_session_result_path}")
+        session_result = cast(dict[str, object], json.loads(result.new_session_result_path.read_text(encoding="utf-8")))
+        status = str(session_result.get("status", "unknown"))
+        if status == "success":
+            print(f"orchestrator bootstrap: dispatched fresh root session and wrote session result {result.new_session_result_path}")
+        else:
+            print(f"orchestrator bootstrap: dispatch recorded {status} session result {result.new_session_result_path}")
     print(f"orchestrator bootstrap: next action -> {result.immediate_next_action}")
     return 0
 

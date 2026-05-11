@@ -7,6 +7,7 @@ import argparse
 import json
 import re
 import subprocess
+import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -21,11 +22,15 @@ DEFAULT_LEDGER_PATH = ROOT / ".opencode/runtime/orchestrator-ledger.json"
 DEFAULT_REQUEST_PATH = ROOT / ".opencode/runtime/new-session-request.json"
 DEFAULT_SESSION_RESULT_PATH = ROOT / ".opencode/runtime/new-session-result.json"
 DEFAULT_ISSUE_INTAKE_SCRIPT_PATH = ROOT / "scripts/issue_packet_intake.py"
+DEFAULT_PROJECT_CONFIG_PATH = ".autodev.yaml"
+DEFAULT_ISSUE_LOCKS_DIR = ".opencode/runtime/issue-locks"
 DEFAULT_CHECKPOINT_PATH = "docs/agents/runtime/context-checkpoint.yaml"
 DEFAULT_WORKFLOW_POLICY_PATH = "docs/agents/autonomous-development-workflow.yaml"
 DEFAULT_SUPERVISOR_DOC_PATH = "docs/agents/runtime/nonstop-supervisor-loop.md"
 DEFAULT_RELEASE_RESULT_TEMPLATE_PATH = "docs/agents/release-result-template.yaml"
 DEFAULT_ROOT_SESSION_AGENT = "hephaestus"
+READY_FOR_AGENT_LABEL = "ready-for-agent"
+AGENT_IN_PROGRESS_LABEL = "agent-in-progress"
 MAX_ROLE_ATTEMPTS = 3
 TRANSIENT_RELEASE_BLOCKERS = {
     "required_checks_pending",
@@ -34,6 +39,23 @@ TRANSIENT_RELEASE_BLOCKERS = {
     "workspace_hygiene_failed",
     "transient_tool_failure",
 }
+
+
+def _resolve_opencode_cli() -> str | None:
+    opencode_cli = shutil.which("opencode")
+    if opencode_cli:
+        return opencode_cli
+
+    known_install_paths = [
+        Path.home() / ".opencode/bin/opencode",
+        Path.home() / ".local/bin/opencode",
+        Path.home() / "bin/opencode",
+    ]
+    for candidate in known_install_paths:
+        if candidate.exists():
+            return str(candidate)
+
+    return shutil.which("opencode-desktop")
 
 
 @dataclass
@@ -389,6 +411,137 @@ def _write_json(path: Path, payload: JsonObject) -> None:
     _ = path.write_text(f"{json.dumps(payload, indent=2, ensure_ascii=False)}\n", encoding="utf-8")
 
 
+def _read_project_github_repo(base_dir: Path) -> str:
+    config_path = base_dir / DEFAULT_PROJECT_CONFIG_PATH
+    if not config_path.exists():
+        return ""
+    try:
+        return _extract_nested_scalar(config_path.read_text(encoding="utf-8"), "project", "github_repo")
+    except ValueError:
+        return ""
+
+
+def issue_lock_path(base_dir: Path, issue_number: str) -> Path:
+    return base_dir / DEFAULT_ISSUE_LOCKS_DIR / f"issue-{issue_number}.json"
+
+
+def has_issue_execution_lock(base_dir: Path, issue_number: str) -> bool:
+    return issue_lock_path(base_dir, issue_number).exists()
+
+
+def _read_issue_lock(path: Path) -> JsonObject:
+    try:
+        return _read_json(path)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _write_issue_lock(path: Path, payload: JsonObject) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _ = path.write_text(f"{json.dumps(payload, indent=2, ensure_ascii=False)}\n", encoding="utf-8")
+
+
+def update_issue_execution_claim(
+    *,
+    base_dir: Path,
+    issue_number: str,
+    updates: JsonObject,
+) -> None:
+    lock_path = issue_lock_path(base_dir, issue_number)
+    if not lock_path.exists():
+        return
+    payload = _read_issue_lock(lock_path)
+    payload.update(updates)
+    _write_issue_lock(lock_path, payload)
+
+
+def _sync_issue_progress_label(
+    *,
+    base_dir: Path,
+    issue_number: str,
+    add_labels: list[str],
+    remove_labels: list[str],
+) -> str:
+    repo = _read_project_github_repo(base_dir)
+    if not repo:
+        return ""
+    command = ["gh", "issue", "edit", issue_number, "--repo", repo]
+    for label in add_labels:
+        command.extend(["--add-label", label])
+    for label in remove_labels:
+        command.extend(["--remove-label", label])
+    completed = subprocess.run(command, cwd=base_dir, check=False, capture_output=True, text=True)
+    if completed.returncode == 0:
+        return ""
+    return (completed.stderr or completed.stdout).strip() or f"gh issue edit failed with exit code {completed.returncode}"
+
+
+def claim_issue_execution(
+    *,
+    base_dir: Path,
+    issue_number: str,
+    branch: str,
+    source_session_id: str,
+    updated_at: str | None = None,
+) -> None:
+    lock_path = issue_lock_path(base_dir, issue_number)
+    if lock_path.exists():
+        existing = _read_issue_lock(lock_path)
+        holder = str(existing.get("rootSessionID") or existing.get("sourceSessionID") or "unknown-session")
+        created_at = str(existing.get("createdAt") or existing.get("recordedAt") or "unknown-time")
+        resume_hint = ""
+        root_session_id = str(existing.get("rootSessionID") or "")
+        if root_session_id:
+            resume_hint = f" Resume with: opencode --session {root_session_id}."
+        raise RuntimeError(
+            f"issue #{issue_number} is already in progress via {holder} since {created_at}; refusing duplicate start.{resume_hint}"
+        )
+
+    payload: JsonObject = {
+        "issueNumber": issue_number,
+        "branch": branch,
+        "sourceSessionID": source_session_id,
+        "createdAt": _now(updated_at),
+        "status": "claimed",
+    }
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with lock_path.open("x", encoding="utf-8") as handle:
+            handle.write(f"{json.dumps(payload, indent=2, ensure_ascii=False)}\n")
+    except FileExistsError as error:
+        raise RuntimeError(f"issue #{issue_number} is already in progress; refusing duplicate start") from error
+
+    sync_error = _sync_issue_progress_label(
+        base_dir=base_dir,
+        issue_number=issue_number,
+        add_labels=[AGENT_IN_PROGRESS_LABEL],
+        remove_labels=[READY_FOR_AGENT_LABEL],
+    )
+    if sync_error:
+        lock_path.unlink(missing_ok=True)
+        raise RuntimeError(f"failed to sync GitHub in-progress state for issue #{issue_number}: {sync_error}")
+
+
+def release_issue_execution(
+    *,
+    base_dir: Path,
+    issue_number: str,
+    restore_ready_for_agent: bool,
+) -> None:
+    lock_path = issue_lock_path(base_dir, issue_number)
+    if lock_path.exists():
+        lock_path.unlink(missing_ok=True)
+
+    remove_labels = [AGENT_IN_PROGRESS_LABEL]
+    add_labels = [READY_FOR_AGENT_LABEL] if restore_ready_for_agent else []
+    _ = _sync_issue_progress_label(
+        base_dir=base_dir,
+        issue_number=issue_number,
+        add_labels=add_labels,
+        remove_labels=remove_labels,
+    )
+
+
 def _consume_session_request(request_path: Path) -> SessionRequest:
     payload = cast(object, _read_json(request_path))
     request_path.unlink(missing_ok=True)
@@ -442,7 +595,7 @@ def validate_session_request_for_dispatch(
     if not issue_packet_path.exists():
         return f"issue packet not found for issue #{request['issueNumber']}: {issue['issuePacketPath']}"
     packet = parse_issue_packet_text(issue_packet_path.read_text(encoding="utf-8"), issue["issuePacketPath"])
-    if "ready-for-agent" not in packet.labels:
+    if READY_FOR_AGENT_LABEL not in packet.labels:
         return f"issue #{request['issueNumber']} is not ready-for-agent; refusing to dispatch"
     if packet.issue_number != request["issueNumber"]:
         return f"issue packet {issue['issuePacketPath']} belongs to issue #{packet.issue_number}, not request issue #{request['issueNumber']}"
@@ -480,9 +633,24 @@ def dispatch_session_request(
     source_session_id: str,
     updated_at: str | None = None,
 ) -> SessionResult:
+    cli_command = _resolve_opencode_cli()
+    timestamp = _now(updated_at)
+    if not cli_command:
+        return {
+            "status": "error",
+            "sourceSessionID": source_session_id,
+            "title": request["title"],
+            "reason": request["reason"],
+            "role": request["role"],
+            "stage": request["stage"],
+            "issueNumber": request["issueNumber"],
+            "branch": request["branch"],
+            "error": 'OpenCode CLI not found in PATH. Install or expose the core "opencode" (or "opencode-desktop") executable before running autodev dispatch.',
+            "recordedAt": timestamp,
+        }
     completed = subprocess.run(
         [
-            "opencode",
+            cli_command,
             "run",
             "--format",
             "json",
@@ -497,7 +665,6 @@ def dispatch_session_request(
         capture_output=True,
         text=True,
     )
-    timestamp = _now(updated_at)
     if completed.returncode != 0:
         return {
             "status": "error",
@@ -562,11 +729,10 @@ def _resolve_artifact_path(path_text: str, *, base_dir: Path) -> Path:
 
 
 def _infer_artifact_base_dir(ledger_path: Path) -> Path:
-    parents = ledger_path.parents
-    if len(parents) >= 3:
-        return parents[2]
-    if len(parents) >= 1:
-        return parents[len(parents) - 1]
+    if ledger_path.parent.name == "runtime" and ledger_path.parent.parent.name == ".opencode":
+        return ledger_path.parent.parent.parent
+    if ledger_path.parent != ledger_path:
+        return ledger_path.parent
     return ROOT
 
 
@@ -714,7 +880,11 @@ def select_next_issue_packet(base_dir: Path, *, workflow: dict[str, str], curren
         packet = parse_issue_packet_text(path.read_text(encoding="utf-8"), str(path.relative_to(base_dir)))
         if packet.issue_number == current_number:
             continue
-        if "ready-for-agent" not in packet.labels:
+        if READY_FOR_AGENT_LABEL not in packet.labels:
+            continue
+        if AGENT_IN_PROGRESS_LABEL in packet.labels:
+            continue
+        if has_issue_execution_lock(base_dir, packet.issue_number):
             continue
         if current_parent and packet.parent_reference != current_parent:
             continue
@@ -838,6 +1008,26 @@ def _dispatch_consumed_request(
             source_session_id=source_session_id,
             updated_at=updated_at,
         )
+        root_session_id = session_result.get("rootSessionID")
+        if isinstance(root_session_id, str) and root_session_id:
+            update_issue_execution_claim(
+                base_dir=base_dir,
+                issue_number=request["issueNumber"],
+                updates={
+                    "rootSessionID": root_session_id,
+                    "status": "root_session_started",
+                    "recordedAt": str(session_result.get("recordedAt") or _now(updated_at)),
+                },
+            )
+    if ledger and session_result.get("status") != "success":
+        issue = cast(dict[str, str], ledger.get("issue", {}))
+        issue_number = issue.get("number", "")
+        if issue_number:
+            release_issue_execution(
+                base_dir=base_dir,
+                issue_number=issue_number,
+                restore_ready_for_agent=True,
+            )
     write_session_result(session_result_path, session_result)
     if ledger_path.exists():
         synced_ledger = _read_json(ledger_path)
@@ -1085,10 +1275,18 @@ def _queue_orchestrator_recovery(
     updated_at: str,
     summary: str,
 ) -> tuple[JsonObject, SupervisorDecision, SessionRequest]:
+    current_issue = cast(dict[str, str], ledger["issue"])
+    current_number = current_issue.get("number", "")
+    if current_number:
+        release_issue_execution(
+            base_dir=base_dir,
+            issue_number=current_number,
+            restore_ready_for_agent=False,
+        )
     selected_issue = select_next_issue_packet(
         base_dir,
         workflow=cast(dict[str, str], ledger["workflow"]),
-        current_issue=cast(dict[str, str], ledger["issue"]),
+        current_issue=current_issue,
     )
     if selected_issue is None and run_issue_packet_intake(base_dir):
         selected_issue = select_next_issue_packet(
