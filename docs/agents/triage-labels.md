@@ -14,6 +14,12 @@ Source skill setup: <https://github.com/mattpocock/skills/tree/main/skills/engin
 
 When a skill mentions a role, use the corresponding label string from this table.
 
+## Runtime coordination labels
+
+| Supplemental label  | Meaning |
+| ------------------- | ------- |
+| `agent-in-progress` | Claimed by an active autodev run; blocks duplicate starts for the same issue across sessions. |
+
 ## E2E test case labels
 
 E2E-specific labels may add workflow detail, but they must not replace the

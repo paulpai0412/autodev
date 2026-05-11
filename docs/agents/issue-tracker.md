@@ -48,7 +48,9 @@ When running inside this clone, `gh` can also infer the repository from `git rem
 - Post-merge workspace hygiene summaries must use fixed fields in both repo-local checkpoint state and GitHub comments: `primary_workspace_branch_before`, `primary_workspace_branch_after`, `dirty_state_detected`, `wip_branch_created`, `stash_created`, `workspace_clean_after`, `issue_worktree_removed`, `cleanup_status`, and `blocked_reason`.
 - `blocked_reason` values for hygiene failures should use fixed enums: `dirty_workspace_preserve_failed`, `switch_main_failed`, `fast_forward_main_failed`, `worktree_remove_failed`, `workspace_not_clean_after_cleanup`, and `issue_worktree_dirty_blocked`.
 - Do not use `ultrawork` or any continuous autonomous loop to select and implement multiple `ready-for-agent` AFK issues concurrently from one orchestrator path.
-- Until a dedicated concurrency policy exists, issue execution remains serial: one selected issue, one branch, one root orchestrator coordinating worker/verifier/release subagents, and one PR at a time.
+- Concurrency is issue-scoped: one active autodev root orchestrator per issue, enforced by repo-local runtime locks and the GitHub `agent-in-progress` label.
+- Different issues may run in parallel from separate OpenCode sessions or worktrees, but the same issue must not be started twice while `agent-in-progress` is present.
+- Autodev start should add `agent-in-progress` and remove `ready-for-agent` when an issue is claimed. If bootstrap dispatch fails before the root session starts, it should restore `ready-for-agent` and remove `agent-in-progress`.
 - `scripts/issue_packet_intake.py` is the supported bridge from live GitHub `ready-for-agent` issues into repo-local `docs/agents/issue-packets/issue-<n>.yaml` files.
 - Supervisor recovery may invoke that intake script automatically when no eligible local next issue packet exists.
 - Intake fallback is best-effort: if `gh` auth fails, GitHub is unreachable, or no eligible issue is returned, the supervisor must keep the result compact in the ledger and avoid inventing a next issue.
