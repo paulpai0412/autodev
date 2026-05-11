@@ -9,6 +9,10 @@ Standalone autonomous development loop extracted into its own workspace at `~/ap
 - Autodev-owned project init, global command install, doctor, and migration tooling
 - Script-level pytest coverage
 
+## Documentation
+
+- Chinese user manual: [`docs/autodev-user-manual.zh-TW.md`](docs/autodev-user-manual.zh-TW.md)
+
 ## Consumer project setup
 
 Initialize a project so it can be driven by the shared autodev workflow:
