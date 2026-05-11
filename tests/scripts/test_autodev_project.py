@@ -41,6 +41,7 @@ def test_init_creates_project_contract_dirs_and_agents_managed_block(tmp_path: P
     assert (tmp_path / "docs/agents/handoffs").is_dir()
     assert (tmp_path / "docs/agents/runtime/context-checkpoint.yaml").exists()
     assert (tmp_path / ".opencode/runtime/.gitkeep").exists()
+    assert (tmp_path / ".opencode/runtime/control-plane.sqlite3").exists()
     agents = read(tmp_path / "AGENTS.md")
     assert "Keep this project-specific guidance." in agents
     assert "<!-- AUTODEV:BEGIN -->" in agents
@@ -85,6 +86,18 @@ def test_doctor_reports_legacy_residue(tmp_path: Path, capsys: CaptureFixture[st
     assert exit_code == 1
     assert "legacy residue" in captured.out
     assert ".opencode/commands/auto-dev.md" in captured.out
+
+
+def test_doctor_reports_missing_control_plane_db(tmp_path: Path, capsys: CaptureFixture[str]):
+    write(tmp_path / ".autodev.yaml", 'schema_version: "1.0"\nproject:\n  name: demo\n')
+    write(tmp_path / "AGENTS.md", "# AGENTS.md\n")
+
+    exit_code = autodev_project.main(["doctor", "--project-root", str(tmp_path)])
+
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "missing .opencode/runtime/control-plane.sqlite3" in captured.out
 
 
 def test_migrate_dry_run_lists_legacy_files_but_preserves_history(tmp_path: Path, capsys: CaptureFixture[str]):

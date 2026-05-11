@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
+from scripts.control_plane_db import ensure_control_plane_db
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_COMMANDS_DIR = Path.home() / ".config/opencode/commands"
@@ -251,6 +253,12 @@ def init_project(root: Path, *, github_repo: str, dry_run: bool, check: bool, fo
         if not dry_run and not check:
             _write_text(gitkeep, "")
 
+    control_plane_db = root / ".opencode/runtime/control-plane.sqlite3"
+    if not control_plane_db.exists():
+        report.actions.append("create .opencode/runtime/control-plane.sqlite3")
+        if not dry_run and not check:
+            ensure_control_plane_db(root)
+
     checkpoint_path = root / "docs/agents/runtime/context-checkpoint.yaml"
     if not checkpoint_path.exists():
         report.actions.append("create docs/agents/runtime/context-checkpoint.yaml")
@@ -310,6 +318,8 @@ def doctor_project(root: Path) -> ActionReport:
     report = ActionReport(actions=[], findings=[])
     if not (root / ".autodev.yaml").exists():
         report.findings.append("missing .autodev.yaml")
+    if not (root / ".opencode/runtime/control-plane.sqlite3").exists():
+        report.findings.append("missing .opencode/runtime/control-plane.sqlite3")
     agents_path = root / "AGENTS.md"
     if agents_path.exists():
         text = _read_text(agents_path)
