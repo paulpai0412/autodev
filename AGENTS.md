@@ -13,6 +13,11 @@
 - Report/remove legacy local workflow files: `PYTHONPATH=. python3 scripts/autodev_project.py migrate --project-root <project> --dry-run`
 - Start a selected AFK issue: `PYTHONPATH=. python3 scripts/orchestrator_bootstrap_runner.py --issue-number <n> --dispatch-now --source-session-id auto-dev`
 - Reconcile after a worker/verifier/release artifact lands: `PYTHONPATH=. python3 scripts/orchestrator_supervisor.py reconcile --ledger .opencode/runtime/orchestrator-ledger.json --source-session-id supervisor-reconcile`
+- Inspect control-plane state: `PYTHONPATH=. python3 scripts/orchestrator_supervisor.py inspect --ledger .opencode/runtime/orchestrator-ledger.json`
+- Quarantine a running issue: `PYTHONPATH=. python3 scripts/orchestrator_supervisor.py quarantine --ledger .opencode/runtime/orchestrator-ledger.json --reason <why>`
+- Resume a quarantined issue: `PYTHONPATH=. python3 scripts/orchestrator_supervisor.py resume-quarantined --ledger .opencode/runtime/orchestrator-ledger.json --reason <why>`
+- Fail a quarantined issue: `PYTHONPATH=. python3 scripts/orchestrator_supervisor.py fail-quarantined --ledger .opencode/runtime/orchestrator-ledger.json --reason <why>`
+- Retry a failed GitHub sync attempt: `PYTHONPATH=. python3 scripts/orchestrator_supervisor.py retry-github-sync --ledger .opencode/runtime/orchestrator-ledger.json --command-id <id>`
 - Materialize ready GitHub issues into local packets: `AUTODEV_GITHUB_REPO=<owner/repo> PYTHONPATH=. python3 scripts/issue_packet_intake.py`
 - Broad local regression sweep for this repo: `pytest tests/scripts -q`
 - Focused regression: `pytest tests/scripts/test_<script_name>.py -q`
@@ -34,5 +39,6 @@
 ## High-value docs to read first
 - `README.md` for the bootstrap command and tracker override.
 - `docs/agents/autonomous-development-workflow.yaml` for role boundaries, gates, and serial execution policy.
+- `docs/agents/runtime/orchestrator-control-plane-spec.md` for the SQLite control-plane contract, state machine, and operator recovery semantics.
 - `docs/agents/issue-tracker.md` for GitHub tracker commands and verifier/release evidence rules.
 - `scripts/autodev_project.py` for consumer project init, global command install, doctor checks, and legacy migration.

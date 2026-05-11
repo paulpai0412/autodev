@@ -5,6 +5,7 @@ This repo now has a runtime supervisor layer for the autonomous development work
 ## Runtime artifacts
 
 - `.opencode/runtime/orchestrator-ledger.json` is the machine-readable source of truth for the current issue, role, attempts, latest failure, and next dispatch target.
+- `.opencode/runtime/control-plane.sqlite3` is the canonical control-plane store for scheduler leases, issue state, root events, decisions, and GitHub sync attempts.
 - `.opencode/runtime/new-session-request.json` is the queue file consumed by the explicit `dispatch` fallback when a fresh `main_orchestrator` root session must be created.
 - The configured root-session agent must survive checkpoint compaction, runtime-ledger handoff, and fresh-session dispatch; restore must not silently switch agents.
 - `.opencode/runtime/new-session-result.json` records the created root session plus source-session stop status.
@@ -42,3 +43,11 @@ This repo now has a runtime supervisor layer for the autonomous development work
 The supervisor prefers retry or reroute over `stop_for_human_decision`. Human intervention becomes the last resort when the orchestrator cannot select a next issue or cannot classify a terminal blocker honestly.
 
 When `select_next_issue_packet(...)` finds no next local candidate, recovery tries one intake pass from GitHub before giving up. If intake also fails or still produces no eligible packet, the supervisor keeps control with `main_orchestrator` recovery and records the blocked state in the ledger instead of silently stalling.
+
+## Control-plane operator commands
+
+- `inspect` shows the active scheduler lease, canonical issue state, latest decision, and latest GitHub sync attempt.
+- `quarantine` moves a running issue into the explicit quarantined state.
+- `resume-quarantined` performs fenced resume from `quarantined` back to `running`.
+- `fail-quarantined` marks a quarantined issue as terminally failed.
+- `retry-github-sync` replays only the latest failed GitHub label sync attempt for an issue and records an admin audit decision.
