@@ -57,5 +57,4 @@ compact_summary:
   automated_checks: "<one-line pass/fail summary, no raw output>"
   manual_qa: "<one-line surface result, no step transcript>"
   risks_or_limitations: ["<risk, limitation, or none>"]
-
 next_recommended_step: "<single next action for orchestrator or human reviewer>"
