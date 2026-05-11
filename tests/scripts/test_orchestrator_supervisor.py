@@ -10,6 +10,7 @@ import scripts.orchestrator_supervisor as orchestrator_supervisor
 from scripts.orchestrator_supervisor import (
     build_orchestrator_request,
     create_initial_ledger,
+    issue_lock_path,
     parse_issue_packet_text,
     reconcile_ledger,
     select_next_issue_packet,
@@ -168,11 +169,11 @@ def test_build_orchestrator_request_includes_nonce_generation_and_ledger_revisio
 
 def test_build_orchestrator_request_uses_ledger_root_session_agent_override():
     issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
-    ledger = create_initial_ledger(issue_packet=issue_packet, root_session_agent="build", updated_at="2026-05-07T17:00:00+08:00")
+    ledger = create_initial_ledger(issue_packet=issue_packet, root_session_agent="hephaestus", updated_at="2026-05-07T17:00:00+08:00")
 
     request = build_orchestrator_request(ledger)
 
-    assert request["agent"] == "build"
+    assert request["agent"] == "hephaestus"
 
 
 def test_validate_session_request_rejects_completed_issue(tmp_path: Path):
@@ -317,11 +318,13 @@ def test_reconcile_release_success_selects_next_ready_issue(tmp_path: Path):
     ledger = create_initial_ledger(
         issue_packet=issue_packet,
         checkpoint_path="docs/agents/runtime/context-checkpoint.yaml",
-        root_session_agent="build",
+        root_session_agent="hephaestus",
         updated_at="2026-05-07T17:00:00+08:00",
     )
     ledger["current"] = {"role": "release_worker", "stage": "release_worker_execution", "status": "queued"}
     cast(dict[str, str], ledger["artifacts"])["releaseResultPath"] = "docs/agents/release-results/issue-31-pr-88.yaml"
+    issue_lock_path(tmp_path, "31").parent.mkdir(parents=True, exist_ok=True)
+    issue_lock_path(tmp_path, "31").write_text('{"issueNumber": "31"}\n', encoding="utf-8")
 
     release_path = tmp_path / "docs/agents/release-results/issue-31-pr-88.yaml"
     release_path.parent.mkdir(parents=True, exist_ok=True)
@@ -341,12 +344,13 @@ def test_reconcile_release_success_selects_next_ready_issue(tmp_path: Path):
     updated_checkpoint = checkpoint_path.read_text(encoding="utf-8")
 
     assert issue["number"] == "32"
-    assert automation["rootSessionAgent"] == "build"
+    assert automation["rootSessionAgent"] == "hephaestus"
     assert decision["action"] == "queue_next_issue"
     assert request is not None
     assert request["issueNumber"] == "32"
-    assert request["agent"] == "build"
-    assert 'agent: "build"' in updated_checkpoint
+    assert request["agent"] == "hephaestus"
+    assert 'agent: "hephaestus"' in updated_checkpoint
+    assert not issue_lock_path(tmp_path, "31").exists()
 
 
 def test_reconcile_recovery_runs_issue_intake_when_local_packet_missing(tmp_path: Path):
@@ -445,12 +449,35 @@ implementation_notes:
     assert selected is None
 
 
+def test_select_next_issue_packet_skips_issue_with_execution_lock(tmp_path: Path):
+    packets_dir = tmp_path / "docs/agents/issue-packets"
+    packets_dir.mkdir(parents=True, exist_ok=True)
+    (packets_dir / "issue-30.yaml").write_text(
+        SAMPLE_ISSUE_PACKET.replace('"42"', '"30"').replace('issue-42', 'issue-30').replace('Demo issue', 'Issue 30').replace('agent/issue-42-demo', 'agent/issue-30-demo'),
+        encoding="utf-8",
+    )
+    (packets_dir / "issue-31.yaml").write_text(
+        SAMPLE_ISSUE_PACKET.replace('"42"', '"31"').replace('issue-42', 'issue-31').replace('Demo issue', 'Issue 31').replace('agent/issue-42-demo', 'agent/issue-31-demo'),
+        encoding="utf-8",
+    )
+    issue_lock_path(tmp_path, "31").parent.mkdir(parents=True, exist_ok=True)
+    issue_lock_path(tmp_path, "31").write_text('{"issueNumber": "31"}\n', encoding="utf-8")
+
+    selected = select_next_issue_packet(
+        tmp_path,
+        workflow={"checkpointPath": "docs/agents/runtime/context-checkpoint.yaml"},
+        current_issue={"number": "30", "parentReference": "https://github.com/example/issues/1"},
+    )
+
+    assert selected is None
+
+
 def test_dispatch_session_request_writes_success_result_and_syncs_ledger(tmp_path: Path):
     request_path = tmp_path / ".opencode/runtime/new-session-request.json"
     request = {
         "reason": "orchestrator bootstrap continuation for issue #42",
         "title": "Continue issue #42 on agent/issue-42-demo",
-        "agent": "build",
+        "agent": "hephaestus",
         "prompt": "Bootstrap from checkpoint only.",
         "role": "main_orchestrator",
         "stage": "orchestrator_bootstrap",
@@ -467,8 +494,10 @@ def test_dispatch_session_request_writes_success_result_and_syncs_ledger(tmp_pat
     ledger_path.parent.mkdir(parents=True, exist_ok=True)
     _ = ledger_path.write_text(json.dumps(ledger, indent=2), encoding="utf-8")
     _ = request_path.write_text(json.dumps(request, indent=2), encoding="utf-8")
+    issue_lock_path(tmp_path, "42").parent.mkdir(parents=True, exist_ok=True)
+    issue_lock_path(tmp_path, "42").write_text('{"issueNumber": "42", "sourceSessionID": "ses_source_test", "status": "claimed"}\n', encoding="utf-8")
 
-    with patch(
+    with patch("scripts.orchestrator_supervisor._resolve_opencode_cli", return_value="/usr/bin/opencode"), patch(
         "scripts.orchestrator_supervisor.subprocess.run",
         return_value=CompletedProcess(
             args=["opencode"],
@@ -495,6 +524,7 @@ def test_dispatch_session_request_writes_success_result_and_syncs_ledger(tmp_pat
 
     session_result = cast(dict[str, object], json.loads(session_result_path.read_text(encoding="utf-8")))
     synced_ledger = cast(dict[str, object], json.loads(ledger_path.read_text(encoding="utf-8")))
+    lock_payload = cast(dict[str, object], json.loads(issue_lock_path(tmp_path, "42").read_text(encoding="utf-8")))
 
     mocked_run.assert_called_once()
     assert exit_code == 0
@@ -503,6 +533,55 @@ def test_dispatch_session_request_writes_success_result_and_syncs_ledger(tmp_pat
     assert session_result["sourceSessionID"] == "ses_source_test"
     assert session_result["cliOpenCommand"] == "opencode --session ses_root_test"
     assert cast(dict[str, object], synced_ledger["lastSessionResult"])["rootSessionID"] == "ses_root_test"
+    assert lock_payload["rootSessionID"] == "ses_root_test"
+    assert lock_payload["status"] == "root_session_started"
+
+
+def test_resolve_opencode_cli_prefers_path_binary():
+    with patch("scripts.orchestrator_supervisor.shutil.which", side_effect=["/usr/bin/opencode", None]):
+        assert orchestrator_supervisor._resolve_opencode_cli() == "/usr/bin/opencode"
+
+
+def test_resolve_opencode_cli_falls_back_to_desktop_binary():
+    with patch("scripts.orchestrator_supervisor.shutil.which", side_effect=[None, "/usr/bin/opencode-desktop"]), patch(
+        "scripts.orchestrator_supervisor.Path.home", return_value=Path("/tmp/no-opencode-home")
+    ):
+        assert orchestrator_supervisor._resolve_opencode_cli() == "/usr/bin/opencode-desktop"
+
+
+def test_resolve_opencode_cli_falls_back_to_known_install_path(tmp_path: Path):
+    known_binary = tmp_path / ".opencode/bin/opencode"
+    known_binary.parent.mkdir(parents=True, exist_ok=True)
+    _ = known_binary.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    with patch("scripts.orchestrator_supervisor.shutil.which", side_effect=[None, None]), patch(
+        "scripts.orchestrator_supervisor.Path.home", return_value=tmp_path
+    ):
+        assert orchestrator_supervisor._resolve_opencode_cli() == str(known_binary)
+
+
+def test_dispatch_session_request_reports_missing_opencode_cli():
+    request: orchestrator_supervisor.SessionRequest = {
+        "reason": "orchestrator bootstrap continuation for issue #42",
+        "title": "Continue issue #42 on agent/issue-42-demo",
+        "agent": "hephaestus",
+        "prompt": "Bootstrap from checkpoint only.",
+        "role": "main_orchestrator",
+        "stage": "orchestrator_bootstrap",
+        "issueNumber": "42",
+        "branch": "agent/issue-42-demo",
+    }
+
+    with patch("scripts.orchestrator_supervisor._resolve_opencode_cli", return_value=None):
+        result = orchestrator_supervisor.dispatch_session_request(
+            request,
+            workdir=Path("."),
+            source_session_id="ses_source_test",
+            updated_at="2026-05-07T17:10:00+08:00",
+        )
+
+    assert result.get("status") == "error"
+    assert "OpenCode CLI not found in PATH" in str(result.get("error", ""))
 
 
 def test_dispatch_rejects_completed_issue_without_launching_opencode(tmp_path: Path):

@@ -10,7 +10,7 @@ from pytest import CaptureFixture, MonkeyPatch
 
 import scripts.orchestrator_bootstrap_runner as orchestrator_bootstrap_runner
 from scripts.orchestrator_bootstrap_runner import resolve_issue_packet_path, run_orchestrator_bootstrap
-from scripts.orchestrator_supervisor import parse_issue_packet_text
+from scripts.orchestrator_supervisor import issue_lock_path, parse_issue_packet_text
 
 
 SAMPLE_ISSUE_PACKET = """schema_version: "1.0"
@@ -223,7 +223,7 @@ def test_main_can_dispatch_immediately(tmp_path: Path, capsys: CaptureFixture[st
     _ = issue_packet_path.write_text(SAMPLE_ISSUE_PACKET, encoding="utf-8")
     _ = checkpoint_path.write_text(SAMPLE_CHECKPOINT, encoding="utf-8")
 
-    with patch(
+    with patch("scripts.orchestrator_supervisor._resolve_opencode_cli", return_value="/usr/bin/opencode"), patch(
         "scripts.orchestrator_supervisor.subprocess.run",
         return_value=CompletedProcess(
             args=["opencode"],
@@ -256,3 +256,155 @@ def test_main_can_dispatch_immediately(tmp_path: Path, capsys: CaptureFixture[st
     session_result_path = request_path.parent / "new-session-result.json"
     assert not request_path.exists()
     assert json.loads(session_result_path.read_text(encoding="utf-8"))["rootSessionID"] == "ses_root_test"
+
+
+def test_main_dispatch_reports_error_result_cleanly(tmp_path: Path, capsys: CaptureFixture[str]):
+    issue_packet_path = tmp_path / "issue-42.yaml"
+    checkpoint_path = tmp_path / "context-checkpoint.yaml"
+    ledger_path = tmp_path / ".opencode/runtime/orchestrator-ledger.json"
+    request_path = tmp_path / ".opencode/runtime/new-session-request.json"
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    _ = issue_packet_path.write_text(SAMPLE_ISSUE_PACKET, encoding="utf-8")
+    _ = checkpoint_path.write_text(SAMPLE_CHECKPOINT, encoding="utf-8")
+
+    with patch("scripts.orchestrator_supervisor._resolve_opencode_cli", return_value=None):
+        exit_code = orchestrator_bootstrap_runner.main(
+            [
+                "--issue-packet",
+                str(issue_packet_path),
+                "--checkpoint",
+                str(checkpoint_path),
+                "--ledger",
+                str(ledger_path),
+                "--new-session-request",
+                str(request_path),
+                "--dispatch-now",
+                "--source-session-id",
+                "ses_source_test",
+                "--updated-at",
+                "2026-05-07T17:00:00+08:00",
+            ]
+        )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "orchestrator bootstrap: dispatch recorded error session result" in captured.out
+
+
+def test_run_orchestrator_bootstrap_rejects_duplicate_issue_lock(tmp_path: Path):
+    issue_packet_path = tmp_path / "issue-42.yaml"
+    checkpoint_path = tmp_path / "docs/agents/runtime/context-checkpoint.yaml"
+    ledger_path = tmp_path / ".opencode/runtime/orchestrator-ledger.json"
+    request_path = tmp_path / ".opencode/runtime/new-session-request.json"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    _ = issue_packet_path.write_text(SAMPLE_ISSUE_PACKET, encoding="utf-8")
+    _ = checkpoint_path.write_text(SAMPLE_CHECKPOINT, encoding="utf-8")
+    issue_lock_path(tmp_path, "42").parent.mkdir(parents=True, exist_ok=True)
+    issue_lock_path(tmp_path, "42").write_text('{"sourceSessionID": "ses_existing", "createdAt": "2026-05-07T16:59:00+08:00"}\n', encoding="utf-8")
+
+    with patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+        try:
+            run_orchestrator_bootstrap(
+                issue_packet_path=issue_packet_path,
+                checkpoint_path=checkpoint_path,
+                ledger_path=ledger_path,
+                new_session_request_path=request_path,
+                updated_at="2026-05-07T17:00:00+08:00",
+            )
+        except RuntimeError as error:
+            assert "already in progress" in str(error)
+        else:
+            raise AssertionError("expected duplicate issue lock to be rejected")
+
+
+def test_run_orchestrator_bootstrap_duplicate_issue_lock_reports_resume_command(tmp_path: Path):
+    issue_packet_path = tmp_path / "issue-42.yaml"
+    checkpoint_path = tmp_path / "docs/agents/runtime/context-checkpoint.yaml"
+    ledger_path = tmp_path / ".opencode/runtime/orchestrator-ledger.json"
+    request_path = tmp_path / ".opencode/runtime/new-session-request.json"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    _ = issue_packet_path.write_text(SAMPLE_ISSUE_PACKET, encoding="utf-8")
+    _ = checkpoint_path.write_text(SAMPLE_CHECKPOINT, encoding="utf-8")
+    issue_lock_path(tmp_path, "42").parent.mkdir(parents=True, exist_ok=True)
+    issue_lock_path(tmp_path, "42").write_text(
+        '{"sourceSessionID": "ses_existing", "rootSessionID": "ses_root_active", "createdAt": "2026-05-07T16:59:00+08:00"}\n',
+        encoding="utf-8",
+    )
+
+    with patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+        try:
+            run_orchestrator_bootstrap(
+                issue_packet_path=issue_packet_path,
+                checkpoint_path=checkpoint_path,
+                ledger_path=ledger_path,
+                new_session_request_path=request_path,
+                updated_at="2026-05-07T17:00:00+08:00",
+            )
+        except RuntimeError as error:
+            assert "ses_root_active" in str(error)
+            assert "opencode --session ses_root_active" in str(error)
+        else:
+            raise AssertionError("expected duplicate issue lock to be rejected with resume hint")
+
+
+def test_run_orchestrator_bootstrap_claims_issue_lock(tmp_path: Path):
+    issue_packet_path = tmp_path / "issue-42.yaml"
+    checkpoint_path = tmp_path / "docs/agents/runtime/context-checkpoint.yaml"
+    ledger_path = tmp_path / ".opencode/runtime/orchestrator-ledger.json"
+    request_path = tmp_path / ".opencode/runtime/new-session-request.json"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    _ = issue_packet_path.write_text(SAMPLE_ISSUE_PACKET, encoding="utf-8")
+    _ = checkpoint_path.write_text(SAMPLE_CHECKPOINT, encoding="utf-8")
+
+    with patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+        _ = run_orchestrator_bootstrap(
+            issue_packet_path=issue_packet_path,
+            checkpoint_path=checkpoint_path,
+            ledger_path=ledger_path,
+            new_session_request_path=request_path,
+            updated_at="2026-05-07T17:00:00+08:00",
+        )
+
+    assert issue_lock_path(tmp_path, "42").exists()
+
+
+def test_bootstrap_dispatch_error_releases_issue_lock(tmp_path: Path, capsys: CaptureFixture[str]):
+    issue_packet_path = tmp_path / "issue-42.yaml"
+    checkpoint_path = tmp_path / "docs/agents/runtime/context-checkpoint.yaml"
+    ledger_path = tmp_path / ".opencode/runtime/orchestrator-ledger.json"
+    request_path = tmp_path / ".opencode/runtime/new-session-request.json"
+    config_path = tmp_path / ".autodev.yaml"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    _ = issue_packet_path.write_text(SAMPLE_ISSUE_PACKET, encoding="utf-8")
+    _ = checkpoint_path.write_text(SAMPLE_CHECKPOINT, encoding="utf-8")
+    _ = config_path.write_text('schema_version: "1.0"\nproject:\n  github_repo: example/repo\n', encoding="utf-8")
+
+    with patch("scripts.orchestrator_supervisor.subprocess.run", return_value=CompletedProcess(args=["gh"], returncode=0, stdout="", stderr="")), patch(
+        "scripts.orchestrator_supervisor._resolve_opencode_cli", return_value=None
+    ):
+        exit_code = orchestrator_bootstrap_runner.main(
+            [
+                "--issue-packet",
+                str(issue_packet_path),
+                "--checkpoint",
+                str(checkpoint_path),
+                "--ledger",
+                str(ledger_path),
+                "--new-session-request",
+                str(request_path),
+                "--dispatch-now",
+                "--source-session-id",
+                "ses_source_test",
+                "--updated-at",
+                "2026-05-07T17:00:00+08:00",
+            ]
+        )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "dispatch recorded error session result" in captured.out
+    assert not issue_lock_path(tmp_path, "42").exists()
