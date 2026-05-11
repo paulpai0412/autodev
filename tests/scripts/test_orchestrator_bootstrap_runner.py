@@ -10,6 +10,7 @@ from pytest import CaptureFixture, MonkeyPatch
 
 import scripts.orchestrator_bootstrap_runner as orchestrator_bootstrap_runner
 from scripts.orchestrator_bootstrap_runner import resolve_issue_packet_path, run_orchestrator_bootstrap
+from scripts.control_plane_db import read_github_sync_attempt, read_issue
 from scripts.orchestrator_supervisor import issue_lock_path, parse_issue_packet_text
 
 
@@ -371,6 +372,31 @@ def test_run_orchestrator_bootstrap_claims_issue_lock(tmp_path: Path):
     assert issue_lock_path(tmp_path, "42").exists()
 
 
+def test_run_orchestrator_bootstrap_records_claimed_control_plane_state(tmp_path: Path):
+    issue_packet_path = tmp_path / "issue-42.yaml"
+    checkpoint_path = tmp_path / "docs/agents/runtime/context-checkpoint.yaml"
+    ledger_path = tmp_path / ".opencode/runtime/orchestrator-ledger.json"
+    request_path = tmp_path / ".opencode/runtime/new-session-request.json"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    _ = issue_packet_path.write_text(SAMPLE_ISSUE_PACKET, encoding="utf-8")
+    _ = checkpoint_path.write_text(SAMPLE_CHECKPOINT, encoding="utf-8")
+
+    with patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+        _ = run_orchestrator_bootstrap(
+            issue_packet_path=issue_packet_path,
+            checkpoint_path=checkpoint_path,
+            ledger_path=ledger_path,
+            new_session_request_path=request_path,
+            updated_at="2026-05-07T17:00:00+08:00",
+        )
+
+    issue = read_issue(tmp_path, "42")
+
+    assert issue is not None
+    assert issue["state"] == "claimed"
+
+
 def test_bootstrap_dispatch_error_releases_issue_lock(tmp_path: Path, capsys: CaptureFixture[str]):
     issue_packet_path = tmp_path / "issue-42.yaml"
     checkpoint_path = tmp_path / "docs/agents/runtime/context-checkpoint.yaml"
@@ -408,3 +434,33 @@ def test_bootstrap_dispatch_error_releases_issue_lock(tmp_path: Path, capsys: Ca
     assert exit_code == 0
     assert "dispatch recorded error session result" in captured.out
     assert not issue_lock_path(tmp_path, "42").exists()
+
+
+def test_bootstrap_claim_github_sync_failure_rolls_back_control_plane_state(tmp_path: Path):
+    issue_packet_path = tmp_path / "issue-42.yaml"
+    checkpoint_path = tmp_path / "docs/agents/runtime/context-checkpoint.yaml"
+    ledger_path = tmp_path / ".opencode/runtime/orchestrator-ledger.json"
+    request_path = tmp_path / ".opencode/runtime/new-session-request.json"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    _ = issue_packet_path.write_text(SAMPLE_ISSUE_PACKET, encoding="utf-8")
+    _ = checkpoint_path.write_text(SAMPLE_CHECKPOINT, encoding="utf-8")
+
+    with patch("scripts.orchestrator_supervisor._sync_issue_progress_label", side_effect=lambda **_: "sync failed"):
+        try:
+            run_orchestrator_bootstrap(
+                issue_packet_path=issue_packet_path,
+                checkpoint_path=checkpoint_path,
+                ledger_path=ledger_path,
+                new_session_request_path=request_path,
+                updated_at="2026-05-07T17:00:00+08:00",
+            )
+        except RuntimeError as error:
+            assert "failed to sync GitHub in-progress state" in str(error)
+        else:
+            raise AssertionError("expected bootstrap to fail when GitHub sync fails")
+
+    issue = read_issue(tmp_path, "42")
+
+    assert issue is not None
+    assert issue["state"] == "ready"
