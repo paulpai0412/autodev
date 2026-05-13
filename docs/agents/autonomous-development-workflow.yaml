@@ -117,9 +117,9 @@ skills:
     license: MIT
     install_policy: copied_pure_skill_markdown_only
     installed_paths:
-      - /home/timmypai/.config/opencode/skills/e2e-testing/SKILL.md
-      - /home/timmypai/.config/opencode/skills/browser-qa/SKILL.md
-      - /home/timmypai/.config/opencode/skills/canary-watch/SKILL.md
+      - ~/.config/opencode/skills/e2e-testing/SKILL.md
+      - ~/.config/opencode/skills/browser-qa/SKILL.md
+      - ~/.config/opencode/skills/canary-watch/SKILL.md
     active_session_note: >
       Current OpenCode sessions may not hot-load newly copied skills. Restart
       OpenCode before relying on skill(name="e2e-testing"), skill(name="browser-qa"),

@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Manage autodev consumer project setup, commands, checks, and migration."""
+"""Manage autodev consumer project setup, commands, and checks."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import shutil
+import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.control_plane_db import ensure_control_plane_db
 
@@ -48,43 +52,8 @@ ARTIFACT_DIRS = [
     ".opencode/runtime",
 ]
 
-LEGACY_PATHS = [
-    ".opencode/commands/auto-dev.md",
-    ".opencode/commands/supervisor-reconcile.md",
-    ".opencode/commands/show-last-root-session.md",
-    ".opencode/plugins/session-continuation.ts",
-    ".opencode/plugins/session-continuation-tui.ts",
-    "scripts/orchestrator_bootstrap_runner.py",
-    "scripts/orchestrator_supervisor.py",
-    "scripts/orchestrator_compact_payload.py",
-    "scripts/agent_context_budget_check.py",
-    "tests/scripts/test_orchestrator_bootstrap_runner.py",
-    "tests/scripts/test_orchestrator_supervisor.py",
-    "tests/scripts/test_orchestrator_compact_payload.py",
-    "tests/scripts/test_agent_context_budget_check.py",
-    "tests/opencode/session-continuation.test.js",
-    "tests/opencode/session-continuation-tui.test.js",
-    "docs/agents/autonomous-development-workflow.yaml",
-    "docs/agents/issue-packet-template.yaml",
-    "docs/agents/worker-result-template.yaml",
-    "docs/agents/evidence-packet-template.yaml",
-    "docs/agents/release-result-template.yaml",
-    ".opencode/runtime/orchestrator-ledger.json",
-    ".opencode/runtime/new-session-request.json",
-    ".opencode/runtime/new-session-result.json",
-    ".opencode/runtime/compact-result.json",
-]
-
-HISTORICAL_ARTIFACT_DIRS = [
-    "docs/agents/issue-packets",
-    "docs/agents/handoffs",
-    "docs/agents/worker-results",
-    "docs/agents/evidence",
-    "docs/agents/release-results",
-]
-
 def _command_templates() -> dict[str, str]:
-    autodev_home = str(ROOT)
+    autodev_home = '${AUTODEV_HOME:-$HOME/apps/autodev}'
     return {
         "autodev-start.md": f"""---
 description: Start autodev workflow for the current project and issue number
@@ -95,11 +64,12 @@ subtask: false
 Run autodev for issue number `$ARGUMENTS` in the current project.
 
 1. Execute:
-!`PYTHONPATH="{autodev_home}" python3 "{autodev_home}/scripts/autodev_project.py" start --project-root "$PWD" --issue-number "$1"`
+!`AUTODEV_HOME="{autodev_home}" PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" start --project-root "$PWD" --issue-number "$1"`
 2. Report the checkpoint, ledger, session result, and next action from the command output.
 
 Notes:
 - This is an autodev-owned global command. It discovers the target project from the current directory.
+- Override `AUTODEV_HOME` first if the shared workflow repo is not installed at `~/apps/autodev`.
 - Entrypoint: `scripts/autodev_project.py start`.
 """,
         "autodev-reconcile.md": f"""---
@@ -109,9 +79,11 @@ subtask: false
 ---
 
 Run:
-!`PYTHONPATH="{autodev_home}" python3 "{autodev_home}/scripts/autodev_project.py" reconcile --project-root "$PWD"`
+!`AUTODEV_HOME="{autodev_home}" PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" reconcile --project-root "$PWD"`
 
 Report the supervisor decision and whether it requires a subagent or fresh main orchestrator session.
+
+Set `AUTODEV_HOME` first if the shared workflow repo is not installed at `~/apps/autodev`.
 """,
         "autodev-show-session.md": f"""---
 description: Show the latest autodev root session for the current project
@@ -120,9 +92,11 @@ subtask: false
 ---
 
 Run:
-!`PYTHONPATH="{autodev_home}" python3 "{autodev_home}/scripts/autodev_project.py" show-session --project-root "$PWD"`
+!`AUTODEV_HOME="{autodev_home}" PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" show-session --project-root "$PWD"`
 
 Report how to inspect or resume the latest root session.
+
+Set `AUTODEV_HOME` first if the shared workflow repo is not installed at `~/apps/autodev`.
 """,
         "autodev-doctor.md": f"""---
 description: Check whether the current project is ready for autodev
@@ -131,9 +105,11 @@ subtask: false
 ---
 
 Run:
-!`PYTHONPATH="{autodev_home}" python3 "{autodev_home}/scripts/autodev_project.py" doctor --project-root "$PWD"`
+!`AUTODEV_HOME="{autodev_home}" PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" doctor --project-root "$PWD"`
 
-Report any missing config, legacy residue, or command install problems.
+Report any missing config, runtime state, or command install problems.
+
+Set `AUTODEV_HOME` first if the shared workflow repo is not installed at `~/apps/autodev`.
 """,
     }
 
@@ -151,8 +127,12 @@ def _project_root(path: str | None) -> Path:
     return Path(path or ".").resolve()
 
 
-def _rel(path: Path, root: Path) -> str:
-    return str(path.relative_to(root))
+def _consumer_project_root(path: str | None) -> Path:
+    candidate = _project_root(path)
+    for current in (candidate, *candidate.parents):
+        if (current / ".autodev.yaml").exists():
+            return current
+    return candidate
 
 
 def _write_text(path: Path, text: str) -> None:
@@ -426,14 +406,6 @@ def install_commands(commands_dir: Path, *, dry_run: bool, force: bool) -> Actio
     return report
 
 
-def legacy_paths(root: Path) -> list[Path]:
-    return [root / relative for relative in LEGACY_PATHS if (root / relative).exists()]
-
-
-def historical_dirs(root: Path) -> list[Path]:
-    return [root / relative for relative in HISTORICAL_ARTIFACT_DIRS if (root / relative).exists()]
-
-
 def doctor_project(root: Path) -> ActionReport:
     report = ActionReport(actions=[], findings=[])
     if not (root / ".autodev.yaml").exists():
@@ -449,50 +421,6 @@ def doctor_project(root: Path) -> ActionReport:
             report.findings.append("unbalanced autodev managed markers in AGENTS.md")
     else:
         report.findings.append("missing AGENTS.md")
-    for path in legacy_paths(root):
-        report.findings.append(f"legacy residue: {_rel(path, root)}")
-    return report
-
-
-def _git_status_for(paths: list[Path], root: Path) -> list[str]:
-    if not paths:
-        return []
-    try:
-        result = subprocess.run(
-            ["git", "status", "--porcelain", "--", *[_rel(path, root) for path in paths]],
-            cwd=root,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return ["git status unavailable for legacy file safety check"]
-    return [line for line in result.stdout.splitlines() if line.strip()]
-
-
-def migrate_project(root: Path, *, dry_run: bool, remove_legacy: bool, skip_git_clean_check: bool) -> ActionReport:
-    report = ActionReport(actions=[], findings=[])
-    removable = legacy_paths(root)
-    preserved = historical_dirs(root)
-
-    for path in removable:
-        report.actions.append(f"would remove {_rel(path, root)}" if dry_run or not remove_legacy else f"remove {_rel(path, root)}")
-    for path in preserved:
-        report.actions.append(f"preserve {_rel(path, root)}/")
-
-    if remove_legacy and removable and not skip_git_clean_check:
-        dirty = _git_status_for(removable, root)
-        if dirty:
-            report.findings.append("legacy files are dirty or git status is unavailable; rerun after commit/stash or use --skip-git-clean-check")
-            report.findings.extend(dirty)
-            return report
-
-    if remove_legacy and not dry_run:
-        for path in removable:
-            if path.is_dir():
-                shutil.rmtree(path)
-            else:
-                path.unlink()
     return report
 
 
@@ -511,8 +439,8 @@ def _print_report(report: ActionReport, *, json_output: bool) -> None:
 def _bootstrap_args(project_root: Path, issue_number: str) -> list[str]:
     normalized = issue_number.strip().removeprefix("#").removeprefix("issue-")
     return [
-        "--issue-packet",
-        str(project_root / "docs/agents/issue-packets" / f"issue-{normalized}.yaml"),
+        "--issue-number",
+        normalized,
         "--checkpoint",
         str(project_root / "docs/agents/runtime/context-checkpoint.yaml"),
         "--ledger",
@@ -524,7 +452,20 @@ def _bootstrap_args(project_root: Path, issue_number: str) -> list[str]:
         "--dispatch-now",
         "--source-session-id",
         "autodev-start",
+        "--approval-override-mode",
+        "bypass_approval",
+        "--override-source",
+        "user_requested_autodev_start",
+        "--human-approval-skipped",
     ]
+
+
+def _shared_workflow_env() -> dict[str, str]:
+    env = os.environ.copy()
+    pythonpath = env.get("PYTHONPATH", "")
+    root_str = str(ROOT)
+    env["PYTHONPATH"] = f"{root_str}{os.pathsep}{pythonpath}" if pythonpath else root_str
+    return env
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -548,13 +489,6 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = subparsers.add_parser("doctor", help="Check whether a project is ready for autodev")
     _ = doctor.add_argument("--project-root", default=".")
     _ = doctor.add_argument("--json", action="store_true")
-
-    migrate = subparsers.add_parser("migrate", help="Report or remove legacy local workflow files")
-    _ = migrate.add_argument("--project-root", default=".")
-    _ = migrate.add_argument("--dry-run", action="store_true")
-    _ = migrate.add_argument("--remove-legacy", action="store_true")
-    _ = migrate.add_argument("--skip-git-clean-check", action="store_true")
-    _ = migrate.add_argument("--json", action="store_true")
 
     start = subparsers.add_parser("start", help="Start autodev workflow for a project issue")
     _ = start.add_argument("--project-root", default=".")
@@ -589,33 +523,41 @@ def main(argv: list[str] | None = None) -> int:
         _print_report(report, json_output=json_output)
         return 1 if report.has_findings() else 0
     if command == "doctor":
-        report = doctor_project(_project_root(cast(str, args.project_root)))
-        _print_report(report, json_output=json_output)
-        return 1 if report.has_findings() else 0
-    if command == "migrate":
-        report = migrate_project(
-            _project_root(cast(str, args.project_root)),
-            dry_run=cast(bool, args.dry_run),
-            remove_legacy=cast(bool, args.remove_legacy),
-            skip_git_clean_check=cast(bool, args.skip_git_clean_check),
-        )
+        report = doctor_project(_consumer_project_root(cast(str, args.project_root)))
         _print_report(report, json_output=json_output)
         return 1 if report.has_findings() else 0
     if command == "start":
-        project_root = _project_root(cast(str, args.project_root))
+        project_root = _consumer_project_root(cast(str, args.project_root))
         _ensure_checkpoint_file(project_root)
         return subprocess.run(
-            ["python3", str(ROOT / "scripts/orchestrator_bootstrap_runner.py"), *_bootstrap_args(project_root, cast(str, args.issue_number))],
+            ["python3", "-m", "scripts.orchestrator_bootstrap_runner", *_bootstrap_args(project_root, cast(str, args.issue_number))],
             cwd=project_root,
+            env=_shared_workflow_env(),
         ).returncode
     if command == "reconcile":
-        project_root = _project_root(cast(str, args.project_root))
+        project_root = _consumer_project_root(cast(str, args.project_root))
         return subprocess.run(
-            ["python3", str(ROOT / "scripts/orchestrator_supervisor.py"), "reconcile", "--ledger", ".opencode/runtime/orchestrator-ledger.json", "--source-session-id", "autodev-reconcile"],
+            [
+                "python3",
+                "-m",
+                "scripts.orchestrator_supervisor",
+                "reconcile",
+                "--ledger",
+                ".opencode/runtime/orchestrator-ledger.json",
+                "--request",
+                ".opencode/runtime/new-session-request.json",
+                "--session-result",
+                ".opencode/runtime/new-session-result.json",
+                "--write-request",
+                "--dispatch-now",
+                "--source-session-id",
+                "autodev-reconcile",
+            ],
             cwd=project_root,
+            env=_shared_workflow_env(),
         ).returncode
     if command == "show-session":
-        result_path = _project_root(cast(str, args.project_root)) / ".opencode/runtime/new-session-result.json"
+        result_path = _consumer_project_root(cast(str, args.project_root)) / ".opencode/runtime/new-session-result.json"
         if not result_path.exists():
             print(f"no autodev session result found: {result_path}")
             return 1
