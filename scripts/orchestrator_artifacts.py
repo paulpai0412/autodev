@@ -15,10 +15,12 @@ class IssuePacketRecord:
     title: str
     branch: str
     issue_packet_path: str
+    backing_type: str
     prior_handoff: str
     labels: list[str]
     parent_reference: str
     dependencies: list[str]
+    raw_text: str
 
 
 JsonObject = dict[str, object]
@@ -54,6 +56,20 @@ def _extract_top_level_scalar_optional(text: str, key: str) -> str:
         return _extract_top_level_scalar(text, key)
     except ValueError:
         return ""
+
+
+def _extract_scalar_from_any_block(text: str, key: str, *blocks: str) -> str:
+    top_level = _extract_top_level_scalar_optional(text, key)
+    if top_level:
+        return top_level
+    for block in blocks:
+        nested = _extract_nested_scalar_optional(text, block, key)
+        if nested:
+            return nested
+        mapping = _extract_mapping_value_optional(text, f"{block}:", key)
+        if mapping:
+            return mapping
+    raise ValueError(f"missing scalar {key!r} in top-level or blocks {blocks!r}")
 
 
 def _extract_nested_scalar(text: str, block_name: str, nested_key: str) -> str:
@@ -264,19 +280,23 @@ def _extract_inline_bool_optional(text: str, prefix: str, key: str) -> bool | No
 def parse_issue_packet_text(text: str, issue_packet_path: str) -> IssuePacketRecord:
     issue_number = _extract_nested_scalar(text, "issue", "number")
     title = _extract_nested_scalar_optional(text, "issue", "title")
+    issue_url = _extract_nested_scalar_optional(text, "issue", "url")
     branch = _extract_mapping_value_optional(text, "branch:", "name")
     if not branch:
         raise ValueError("missing 'name' in mapping 'branch:'")
     prior_handoff = _extract_nested_scalar_optional(text, "bootstrap_context", "prior_handoff")
+    backing_type = "github" if issue_url else "local_seeded"
     return IssuePacketRecord(
         issue_number=issue_number,
         title=title,
         branch=branch,
         issue_packet_path=issue_packet_path,
+        backing_type=backing_type,
         prior_handoff="" if prior_handoff == "none" else prior_handoff,
         labels=_extract_issue_labels(text),
         parent_reference=_extract_issue_inline_reference(text, "parent"),
         dependencies=_extract_nested_list(text, "implementation_notes", "dependencies") or _extract_list_block(text, "dependencies"),
+        raw_text=text,
     )
 
 
@@ -286,10 +306,12 @@ def issue_packet_record_to_json(record: IssuePacketRecord) -> JsonObject:
         "title": record.title,
         "branch": record.branch,
         "issue_packet_path": record.issue_packet_path,
+        "backing_type": record.backing_type,
         "prior_handoff": record.prior_handoff,
         "labels": list(record.labels),
         "parent_reference": record.parent_reference,
         "dependencies": list(record.dependencies),
+        "raw_text": record.raw_text,
     }
 
 
@@ -308,10 +330,12 @@ def issue_packet_record_from_json(payload: dict[str, object]) -> IssuePacketReco
         title=str(payload.get("title") or ""),
         branch=branch,
         issue_packet_path=issue_packet_path,
+        backing_type=str(payload.get("backing_type") or "github"),
         prior_handoff=str(payload.get("prior_handoff") or ""),
         labels=labels,
         parent_reference=str(payload.get("parent_reference") or ""),
         dependencies=dependencies,
+        raw_text=str(payload.get("raw_text") or ""),
     )
 
 
@@ -333,7 +357,7 @@ def parse_worker_result_file(path: Path) -> JsonObject:
     return {
         "status": _extract_top_level_scalar(text, "status"),
         "pr_number": _extract_mapping_value_optional(text, "pr:", "number"),
-        "next_recommended_step": _extract_top_level_scalar(text, "next_recommended_step"),
+        "next_recommended_step": _extract_scalar_from_any_block(text, "next_recommended_step", "summary", "compact_summary"),
         "failure_kind": _extract_inline_mapping_value_optional(text, "failure_classification:", "kind"),
         "retryable": _extract_inline_bool_optional(text, "failure_classification:", "retryable"),
         "completed_at": _extract_mapping_value_optional(text, "metadata:", "completed_at") or _extract_nested_scalar_optional(text, "metadata", "completed_at"),
@@ -346,7 +370,7 @@ def parse_evidence_packet_file(path: Path) -> JsonObject:
         "status": _extract_top_level_scalar(text, "status"),
         "pr_number": _extract_mapping_value_optional(text, "subject:", "pr_number") or _extract_nested_scalar_optional(text, "subject", "pr_number"),
         "verifier_session_id": _extract_mapping_value_optional(text, "verifier:", "verifier_session_id") or _extract_nested_scalar_optional(text, "verifier", "verifier_session_id"),
-        "next_recommended_step": _extract_top_level_scalar(text, "next_recommended_step"),
+        "next_recommended_step": _extract_scalar_from_any_block(text, "next_recommended_step", "summary", "compact_summary"),
         "failure_kind": _extract_inline_mapping_value_optional(text, "failure_classification:", "kind"),
         "retryable": _extract_inline_bool_optional(text, "failure_classification:", "retryable"),
     }
@@ -357,7 +381,7 @@ def parse_release_result_file(path: Path) -> JsonObject:
     return {
         "status": _extract_top_level_scalar(text, "status"),
         "blocked_reason": _extract_top_level_scalar_optional(text, "blocked_reason") or "none",
-        "next_recommended_step": _extract_mapping_value_optional(text, "summary:", "next_recommended_step") or _extract_nested_scalar(text, "summary", "next_recommended_step"),
+        "next_recommended_step": _extract_scalar_from_any_block(text, "next_recommended_step", "summary", "compact_summary"),
         "failure_kind": _extract_inline_mapping_value_optional(text, "failure_classification:", "kind"),
         "retryable": _extract_inline_bool_optional(text, "failure_classification:", "retryable"),
     }
