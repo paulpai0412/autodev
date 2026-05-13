@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sync ready-for-agent GitHub issues into compact repo-local issue packets."""
+"""Sync ready-for-agent GitHub issues into compact consumer-project issue packets."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from typing import cast
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REPO = os.environ.get("AUTODEV_GITHUB_REPO", "paulpai0412/wferp")
-DEFAULT_ISSUE_PACKETS_DIR = ROOT / "docs/agents/issue-packets"
+AUTODEV_CONFIG_NAME = ".autodev.yaml"
 
 
 @dataclass
@@ -110,6 +110,18 @@ def fetch_ready_issues(repo: str) -> list[GitHubIssue]:
     return issues
 
 
+def _project_root(path: str | None) -> Path:
+    return Path(path or ".").resolve()
+
+
+def _consumer_project_root(path: str | None) -> Path | None:
+    candidate = _project_root(path)
+    for current in (candidate, *candidate.parents):
+        if (current / AUTODEV_CONFIG_NAME).exists():
+            return current
+    return None
+
+
 def render_issue_packet(issue: GitHubIssue, *, actor: str = "Hephaestus", prepared_at: str | None = None) -> str:
     timestamp = prepared_at or datetime.now().astimezone().isoformat(timespec="seconds")
     branch_name = build_branch_name(issue)
@@ -178,7 +190,7 @@ def render_issue_packet(issue: GitHubIssue, *, actor: str = "Hephaestus", prepar
     return "\n".join(lines) + "\n"
 
 
-def sync_issue_packets(issues: list[GitHubIssue], *, output_dir: Path = DEFAULT_ISSUE_PACKETS_DIR) -> list[Path]:
+def sync_issue_packets(issues: list[GitHubIssue], *, output_dir: Path) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
     for issue in issues:
@@ -192,13 +204,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("--repo", default=DEFAULT_REPO, help="GitHub repo name for gh issue list")
     _ = parser.add_argument("--issues-json", help="Path to a JSON fixture with gh issue list output")
-    _ = parser.add_argument("--output-dir", default=str(DEFAULT_ISSUE_PACKETS_DIR), help="Directory for issue packets")
+    _ = parser.add_argument("--project-root", default=".", help="Consumer project root or a nested path inside it")
+    _ = parser.add_argument("--output-dir", help="Directory for issue packets; overrides consumer project discovery")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    output_dir = Path(cast(str, args.output_dir))
+    output_dir_arg = cast(str | None, args.output_dir)
+    if output_dir_arg:
+        output_dir = Path(output_dir_arg)
+    else:
+        consumer_root = _consumer_project_root(cast(str, args.project_root))
+        if consumer_root is None:
+            message = (
+                "ERROR: could not find .autodev.yaml from --project-root. "
+                "Run intake from a consumer project, pass --project-root <project>, or set --output-dir explicitly."
+            )
+            print(message)
+            return 1
+        output_dir = consumer_root / "docs/agents/issue-packets"
     if cast(str | None, args.issues_json):
         payload = cast(list[dict[str, object]], json.loads(Path(cast(str, args.issues_json)).read_text(encoding="utf-8")))
         issues = [

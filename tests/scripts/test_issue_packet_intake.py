@@ -65,3 +65,57 @@ def test_main_reads_json_fixture(tmp_path: Path, capsys):
     assert exit_code == 0
     assert "issue-42.yaml" in captured.out
     assert (output_dir / "issue-42.yaml").exists()
+
+
+def test_main_discovers_consumer_project_output_dir_from_project_root(tmp_path: Path, capsys):
+    consumer_root = tmp_path / "consumer-project"
+    nested_root = consumer_root / "packages/app"
+    fixture_path = tmp_path / "issues.json"
+    nested_root.mkdir(parents=True)
+    (consumer_root / ".autodev.yaml").write_text('schema_version: "1.0"\nproject:\n  name: demo\n', encoding="utf-8")
+    fixture_path.write_text(
+        json.dumps(
+            [
+                {
+                    "number": 42,
+                    "title": "Add governed SQL traceability",
+                    "body": "- observable behavior",
+                    "url": "https://github.com/paulpai0412/wferp/issues/42",
+                    "labels": ["ready-for-agent"],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(["--issues-json", str(fixture_path), "--project-root", str(nested_root)])
+
+    captured = capsys.readouterr()
+    output_dir = consumer_root / "docs/agents/issue-packets"
+    assert exit_code == 0
+    assert "issue-42.yaml" in captured.out
+    assert (output_dir / "issue-42.yaml").exists()
+
+
+def test_main_requires_consumer_project_or_output_dir(tmp_path: Path, capsys):
+    fixture_path = tmp_path / "issues.json"
+    fixture_path.write_text(
+        json.dumps(
+            [
+                {
+                    "number": 42,
+                    "title": "Add governed SQL traceability",
+                    "body": "- observable behavior",
+                    "url": "https://github.com/paulpai0412/wferp/issues/42",
+                    "labels": ["ready-for-agent"],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(["--issues-json", str(fixture_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "could not find .autodev.yaml" in captured.out

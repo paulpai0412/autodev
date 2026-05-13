@@ -18,10 +18,12 @@ class IssuePacketRecord(Protocol):
     title: str
     branch: str
     issue_packet_path: str
+    backing_type: str
     prior_handoff: str
     labels: list[str]
     parent_reference: str
     dependencies: list[str]
+    raw_text: str
 
 
 DEFAULT_ISSUE_INTAKE_SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts/issue_packet_intake.py"
@@ -76,6 +78,18 @@ def infer_artifact_base_dir(ledger_path: Path, *, root: Path) -> Path:
     return root
 
 
+def _packet_exists_locally(base_dir: Path, packet: IssuePacketRecord) -> bool:
+    path = Path(packet.issue_packet_path)
+    resolved_path = path if path.is_absolute() else base_dir / path
+    if resolved_path.exists():
+        return True
+    if not packet.raw_text:
+        return False
+    resolved_path.parent.mkdir(parents=True, exist_ok=True)
+    _ = resolved_path.write_text(packet.raw_text, encoding="utf-8")
+    return True
+
+
 def completed_issue_numbers_from_control_plane(base_dir: Path, checkpoint_path: str) -> set[str]:
     del checkpoint_path
     return completed_issue_numbers(base_dir)
@@ -127,6 +141,15 @@ def select_next_issue_packet(
     for row in issue_rows_with_packets(base_dir):
         packet = issue_packet_record_from_json(read_issue_packet(base_dir, str(row.get("issue_number") or "")))
         if packet is None:
+            continue
+        if not _packet_exists_locally(base_dir, packet):
+            _ = upsert_issue_ranking(
+                base_dir,
+                issue_number=packet.issue_number,
+                rank_score=-1.0,
+                lane="default",
+                updated_at=now(None),
+            )
             continue
         packet_by_issue_number[packet.issue_number] = packet
         rank_score = -1.0
