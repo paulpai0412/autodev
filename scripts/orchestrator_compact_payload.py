@@ -32,6 +32,8 @@ class CheckpointRecord:
     artifact_bundle: str
     updated_by: str
     completed: list[str]
+    in_progress: list[str]
+    next_steps: list[str]
     blockers: list[str]
     approval_override_mode: str
     default_merge_approval_mode: str
@@ -188,6 +190,8 @@ def parse_checkpoint_text(text: str) -> CheckpointRecord:
         artifact_bundle=refs.get("artifact_bundle", ""),
         updated_by=metadata.get("updated_by", "Build"),
         completed=state.get("completed", []),
+        in_progress=state.get("in_progress", []),
+        next_steps=state.get("next", []),
         blockers=state.get("blockers", []) or ["none"],
         approval_override_mode=runtime_controls.get("approval_override_mode", ""),
         default_merge_approval_mode=runtime_controls.get("default_merge_approval_mode", "human_required"),
@@ -205,10 +209,26 @@ def apply_overrides(
     agent: str | None = None,
     issue_packet: str | None = None,
     handoff: str | None = None,
+    worker_result: str | None = None,
+    evidence_packet: str | None = None,
+    artifact_bundle: str | None = None,
+    completed: list[str] | None = None,
+    in_progress: list[str] | None = None,
+    next_steps: list[str] | None = None,
+    blockers: list[str] | None = None,
     approval_override_mode: str | None = None,
     override_source: str | None = None,
     human_approval_skipped: bool | None = None,
 ) -> CheckpointRecord:
+    target_changed = any(
+        value is not None and value != current
+        for value, current in (
+            (issue_number, record.issue_number),
+            (branch, record.branch),
+            (role, record.role),
+        )
+    )
+    preserve_runtime_state = any(value is not None for value in (in_progress, next_steps, blockers))
     return CheckpointRecord(
         issue_number=issue_number or record.issue_number,
         branch=branch or record.branch,
@@ -216,13 +236,15 @@ def apply_overrides(
         agent=agent or record.agent,
         checkpoint_reason=record.checkpoint_reason,
         issue_packet=issue_packet or record.issue_packet,
-        worker_result=record.worker_result,
-        evidence_packet=record.evidence_packet,
+        worker_result=worker_result if worker_result is not None else record.worker_result,
+        evidence_packet=evidence_packet if evidence_packet is not None else record.evidence_packet,
         handoff=handoff if handoff is not None else record.handoff,
-        artifact_bundle=record.artifact_bundle,
+        artifact_bundle=artifact_bundle if artifact_bundle is not None else record.artifact_bundle,
         updated_by=record.updated_by,
-        completed=list(record.completed),
-        blockers=list(record.blockers) or ["none"],
+        completed=list(record.completed) if completed is None else list(completed),
+        in_progress=(list(record.in_progress) if preserve_runtime_state and not target_changed else []) if in_progress is None else list(in_progress),
+        next_steps=(list(record.next_steps) if preserve_runtime_state and not target_changed else []) if next_steps is None else list(next_steps),
+        blockers=(list(record.blockers) or ["none"]) if preserve_runtime_state and blockers is None else ((list(blockers) or ["none"]) if blockers is not None else ["none"]),
         approval_override_mode=record.approval_override_mode if approval_override_mode is None else approval_override_mode,
         default_merge_approval_mode=record.default_merge_approval_mode,
         override_source=record.override_source if override_source is None else override_source,
@@ -230,13 +252,20 @@ def apply_overrides(
     )
 
 
-def build_orchestrator_state(issue_number: str, completed: list[str], blockers: list[str]) -> StateSnapshot:
-    next_step = f"Continue per_issue_flow for issue #{issue_number} by creating or switching the issue branch."
+def build_orchestrator_state(record: CheckpointRecord) -> StateSnapshot:
+    in_progress = list(record.in_progress)
+    next_steps = list(record.next_steps)
+    if not in_progress:
+        in_progress = [f"Prepare the orchestrator session to enter issue #{record.issue_number} PR flow."]
+    if not next_steps:
+        next_steps = [
+            f"Run supervisor reconcile for issue #{record.issue_number} to persist issue_worker_execution before creating or switching the issue branch and launching the first issue_worker subagent."
+        ]
     return {
-        "completed": list(completed),
-        "in_progress": [f"Prepare the orchestrator session to enter issue #{issue_number} PR flow."],
-        "next": [next_step],
-        "blockers": list(blockers) or ["none"],
+        "completed": list(record.completed),
+        "in_progress": in_progress,
+        "next": next_steps,
+        "blockers": list(record.blockers) or ["none"],
     }
 
 
@@ -245,7 +274,7 @@ def derive_compact_payload(
     *,
     workflow_policy_path: str = DEFAULT_WORKFLOW_POLICY_PATH,
 ) -> CompactPayload:
-    orchestrator_state = build_orchestrator_state(record.issue_number, record.completed, record.blockers)
+    orchestrator_state = build_orchestrator_state(record)
     authoritative_refs = [record.issue_packet]
     if record.handoff:
         authoritative_refs.append(record.handoff)
@@ -323,7 +352,7 @@ def _render_subject_block(record: CheckpointRecord) -> list[str]:
 
 
 def _render_state_block(record: CheckpointRecord) -> list[str]:
-    orchestrator_state = build_orchestrator_state(record.issue_number, record.completed, record.blockers)
+    orchestrator_state = build_orchestrator_state(record)
     lines = ["state:"]
     lines.extend(_render_list_block("completed", orchestrator_state["completed"], indent=2))
     lines.extend(_render_list_block("in_progress", orchestrator_state["in_progress"], indent=2))
@@ -395,6 +424,13 @@ def update_checkpoint_text(
     agent: str | None = None,
     issue_packet: str | None = None,
     handoff: str | None = None,
+    worker_result: str | None = None,
+    evidence_packet: str | None = None,
+    artifact_bundle: str | None = None,
+    completed: list[str] | None = None,
+    in_progress: list[str] | None = None,
+    next_steps: list[str] | None = None,
+    blockers: list[str] | None = None,
     approval_override_mode: str | None = None,
     override_source: str | None = None,
     human_approval_skipped: bool | None = None,
@@ -409,6 +445,13 @@ def update_checkpoint_text(
         agent=agent,
         issue_packet=issue_packet,
         handoff=handoff,
+        worker_result=worker_result,
+        evidence_packet=evidence_packet,
+        artifact_bundle=artifact_bundle,
+        completed=completed,
+        in_progress=in_progress,
+        next_steps=next_steps,
+        blockers=blockers,
         approval_override_mode=approval_override_mode,
         override_source=override_source,
         human_approval_skipped=human_approval_skipped,
@@ -451,6 +494,13 @@ def write_checkpoint_file(
     agent: str | None = None,
     issue_packet: str | None = None,
     handoff: str | None = None,
+    worker_result: str | None = None,
+    evidence_packet: str | None = None,
+    artifact_bundle: str | None = None,
+    completed: list[str] | None = None,
+    in_progress: list[str] | None = None,
+    next_steps: list[str] | None = None,
+    blockers: list[str] | None = None,
     approval_override_mode: str | None = None,
     override_source: str | None = None,
     human_approval_skipped: bool | None = None,
@@ -466,6 +516,13 @@ def write_checkpoint_file(
         agent=agent,
         issue_packet=issue_packet,
         handoff=handoff,
+        worker_result=worker_result,
+        evidence_packet=evidence_packet,
+        artifact_bundle=artifact_bundle,
+        completed=completed,
+        in_progress=in_progress,
+        next_steps=next_steps,
+        blockers=blockers,
         approval_override_mode=approval_override_mode,
         override_source=override_source,
         human_approval_skipped=human_approval_skipped,

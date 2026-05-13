@@ -68,8 +68,8 @@ def test_update_checkpoint_text_inserts_compact_payload_and_standardizes_state()
     assert '  active_target: {issue_number: "42", branch: "agent/issue-42-demo", role: "main_orchestrator", agent: "build", next_flow: "per_issue_flow"}' in updated
     assert '  in_progress:' in updated
     assert '    - "Prepare the orchestrator session to enter issue #42 PR flow."' in updated
-    assert '    - "Continue per_issue_flow for issue #42 by creating or switching the issue branch."' in updated
-    assert '  immediate_next_action: "Continue per_issue_flow for issue #42 by creating or switching the issue branch."' in updated
+    assert '    - "Run supervisor reconcile for issue #42 to persist issue_worker_execution before creating or switching the issue branch and launching the first issue_worker subagent."' in updated
+    assert '  immediate_next_action: "Run supervisor reconcile for issue #42 to persist issue_worker_execution before creating or switching the issue branch and launching the first issue_worker subagent."' in updated
     assert '  updated_at: "2026-05-07T16:30:00+08:00"' in updated
     assert len(updated.splitlines()) <= CHECKPOINT_LINE_CAP
 
@@ -86,6 +86,26 @@ def test_update_checkpoint_text_can_record_workflow_start_approval_override():
     assert '  approval_override_mode: "bypass_approval"' in updated
     assert '  override_source: "user_requested_autodev_start"' in updated
     assert '  human_approval_skipped: true' in updated
+
+
+def test_update_checkpoint_text_preserves_explicit_runtime_state_overrides():
+    updated = update_checkpoint_text(
+        SAMPLE_CHECKPOINT_WITHOUT_PAYLOAD,
+        in_progress=["Continue supervisor recovery for issue #42."],
+        next_steps=["Select the next ready issue packet or remain in orchestrator recovery if none are available."],
+        blockers=["No eligible local issue packet found."],
+        worker_result="docs/agents/worker-results/issue-42.yaml",
+        evidence_packet="docs/agents/evidence/issue-42-pr-88.yaml",
+        artifact_bundle="docs/agents/release-results/issue-42-pr-88.yaml",
+        updated_at="2026-05-07T16:30:00+08:00",
+    )
+
+    assert '    - "Continue supervisor recovery for issue #42."' in updated
+    assert '    - "Select the next ready issue packet or remain in orchestrator recovery if none are available."' in updated
+    assert '    - "No eligible local issue packet found."' in updated
+    assert '  worker_result: "docs/agents/worker-results/issue-42.yaml"' in updated
+    assert '  evidence_packet: "docs/agents/evidence/issue-42-pr-88.yaml"' in updated
+    assert '  artifact_bundle: "docs/agents/release-results/issue-42-pr-88.yaml"' in updated
 
 
 def test_update_checkpoint_text_real_issue20_shape_stays_within_line_cap():
@@ -119,7 +139,7 @@ def test_derive_compact_payload_reads_runtime_checkpoint_contract():
     assert payload["active_target"]["agent"] == "build"
     assert payload["authoritative_refs"][0] == record.issue_packet
     assert payload["authoritative_refs"][-1] == "docs/agents/autonomous-development-workflow.yaml"
-    assert payload["immediate_next_action"].startswith("Continue per_issue_flow")
+    assert payload["immediate_next_action"] == record.next_steps[0]
 
 
 def test_main_prints_compact_payload_for_preview(tmp_path: Path, capsys: CaptureFixture[str]):
