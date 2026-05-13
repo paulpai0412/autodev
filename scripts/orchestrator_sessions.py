@@ -36,16 +36,24 @@ def spawn_detached_opencode_run(command: list[str], *, workdir: Path) -> subproc
     resolved_workdir = workdir.resolve()
     env = os.environ.copy()
     env["PWD"] = str(resolved_workdir)
+    log_dir = resolved_workdir / ".opencode/runtime/session-logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"opencode-run-{int(time.time() * 1000)}.log"
 
-    return subprocess.Popen(
-        command,
-        cwd=str(resolved_workdir),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-        env=env,
-    )
+    log_handle = log_path.open("a", encoding="utf-8")
+    try:
+        return subprocess.Popen(
+            command,
+            cwd=str(resolved_workdir),
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+            close_fds=True,
+            env=env,
+        )
+    finally:
+        log_handle.close()
 
 
 def stream_supports_fileno(stream: IO[str]) -> bool:

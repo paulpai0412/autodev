@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,3 +23,8 @@ def test_spawn_detached_opencode_run_sets_pwd_to_resolved_workdir(tmp_path: Path
     assert kwargs["cwd"] == str(workdir.resolve())
     assert kwargs["env"]["PWD"] == str(workdir.resolve())
     assert kwargs["env"]["PATH"] == "/usr/bin"
+    assert kwargs["stdout"] is not subprocess.PIPE
+    assert kwargs["stderr"] == subprocess.STDOUT
+    assert kwargs["start_new_session"] is True
+    assert kwargs["close_fds"] is True
+    assert (workdir / ".opencode/runtime/session-logs").is_dir()
