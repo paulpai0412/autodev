@@ -271,7 +271,6 @@ def reconcile_issue_worker(
     is_successful_release_status: Callable[[str], bool],
     default_evidence_packet_path: Callable[[str, str], str],
     read_issue: Callable[[Path, str], JsonObject | None],
-    read_issue_worker_abort_summary: Callable[[Path, str], JsonObject | None],
     read_artifact_fact: Callable[[dict[str, object] | None, str], dict[str, object]],
     record_artifact_status: Callable[..., None],
     set_failure_func: Callable[..., None],
@@ -283,33 +282,6 @@ def reconcile_issue_worker(
     worker_result_path = resolve_artifact_path(artifacts["workerResultPath"], base_dir=base_dir)
     if not worker_result_path.exists():
         if current.get("status") == "queued":
-            abort_summary = read_issue_worker_abort_summary(base_dir, issue["number"])
-            if abort_summary is not None:
-                session_id = str(abort_summary.get("session_id") or "unknown session")
-                abort_reason = str(abort_summary.get("abort_reason") or "MessageAbortedError")
-                summary = (
-                    f"Issue worker for issue #{issue['number']} aborted in child session {session_id} before writing "
-                    f"{artifacts['workerResultPath']}. Retry the worker session instead of keeping the queued state. "
-                    f"Abort detail: {abort_reason}."
-                )
-                set_failure_func(ledger, kind="contract_invalid", summary=summary, retryable=True)
-                if attempts["issue_worker"] < limits["issue_worker"]:
-                    decision, request = requeue_issue_worker_func(
-                        ledger,
-                        base_dir=base_dir,
-                        issue_number=issue["number"],
-                        updated_at=updated_at,
-                        summary=summary,
-                        next_stage="issue_worker_repair",
-                    )
-                    return ledger, decision, request
-                return queue_orchestrator_recovery_func(
-                    ledger,
-                    base_dir=base_dir,
-                    updated_at=updated_at,
-                    summary=summary,
-                    final_state="failed",
-                )
             summary = (
                 f"Issue worker for issue #{issue['number']} is queued and has not produced {artifacts['workerResultPath']} yet. "
                 "Keep the queued dispatch state unchanged."

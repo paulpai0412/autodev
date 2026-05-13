@@ -233,26 +233,6 @@ def _load_reconcile_helpers() -> ModuleType:
 _reconcile_helpers = _load_reconcile_helpers()
 
 
-def _load_trace_helpers() -> ModuleType:
-    module_path = Path(__file__).with_name("opencode_session_trace.py")
-    spec = importlib.util.spec_from_file_location("opencode_session_trace", module_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load trace helpers from {module_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-_trace_helpers = _load_trace_helpers()
-_find_latest_child_session_summary = cast(Callable[..., JsonObject | None], _trace_helpers.find_latest_child_session_summary)
-_session_summary_abort_reason = cast(Callable[[JsonObject | None], str], _trace_helpers.session_summary_abort_reason)
-_session_summary_startup_failure_reason = cast(
-    Callable[[JsonObject | None], str],
-    _trace_helpers.session_summary_startup_failure_reason,
-)
-
-
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LEDGER_PATH = ROOT / ".opencode/runtime/orchestrator-ledger.json"
 DEFAULT_REQUEST_PATH = ROOT / ".opencode/runtime/new-session-request.json"
@@ -596,38 +576,6 @@ def _record_current_verifier_session(
         updated_at=updated_at,
         current_verifier_session_id=verifier_session_id,
     )
-
-
-def _read_issue_worker_abort_summary(base_dir: Path, issue_number: str) -> JsonObject | None:
-    runtime_issue = read_issue(base_dir, issue_number)
-    if runtime_issue is None:
-        return None
-    root_session_id = str(runtime_issue.get("current_root_session_id") or "")
-    if not root_session_id:
-        return None
-    directory = str(base_dir.resolve())
-    child_summary = _find_latest_child_session_summary(
-        parent_session_id=root_session_id,
-        title_contains=f"Issue {issue_number} worker",
-        directory=directory,
-    )
-    if child_summary is None:
-        child_summary = _find_latest_child_session_summary(
-            parent_session_id=root_session_id,
-            directory=directory,
-    )
-    abort_reason = _session_summary_abort_reason(child_summary)
-    if not abort_reason:
-        abort_reason = _session_summary_startup_failure_reason(child_summary)
-    if child_summary is None or not abort_reason:
-        return None
-    return {
-        "root_session_id": root_session_id,
-        "session_id": str(child_summary.get("session_id") or ""),
-        "abort_reason": abort_reason,
-        "latest_assistant_status": str(child_summary.get("latest_assistant_status") or ""),
-    }
-
 
 def issue_lock_path(base_dir: Path, issue_number: str) -> Path:
     lock_path = cast(Callable[[Path, str], Path], _lifecycle_helpers.issue_lock_path)
@@ -2188,7 +2136,6 @@ def reconcile_ledger(
                 is_successful_release_status=_is_successful_release_status,
                 default_evidence_packet_path=default_evidence_packet_path,
                 read_issue=read_issue,
-                read_issue_worker_abort_summary=_read_issue_worker_abort_summary,
                 read_artifact_fact=_artifact_fact,
                 record_artifact_status=_record_artifact_status,
                 set_failure_func=_set_failure,
