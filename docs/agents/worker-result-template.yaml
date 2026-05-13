@@ -9,6 +9,7 @@ issue:
   url: "<issue-url>"
 
 branch: "agent/issue-<issue-number>-<slug>"
+# Use status: success only after the branch is pushed, the PR exists, and pr.number plus pr.url are populated below.
 status: "<success|blocked|failed>"
 failure_classification: {kind: "<none|contract_invalid|transient_tool_failure|issue_scope_blocked|verification_failed|spec_drift|dependency_blocked>", retryable: true, routed_to: "<issue_worker|pr_verifier|main_orchestrator>", root_cause_signature: "<stable-signature-or-none>"}
 
@@ -55,7 +56,9 @@ role_boundary:
   verifier_packet_required_for_completion: true
 
 pr:
+  # For status: success, number must be a real PR number, not none/empty.
   number: "<pr-number-or-none>"
+  # For status: success, url must be the created PR URL, not empty.
   url: "<pr-url-or-empty>"
   ready_for_review: false
 

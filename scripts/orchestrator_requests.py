@@ -74,6 +74,8 @@ def build_prompt(
             f"You are the issue_worker subagent for issue #{issue['number']}.",
             f"Read {issue['issuePacketPath']} and implement only that issue scope.",
             f"Write {worker_result_path} using docs/agents/worker-result-template.yaml.",
+            "Do not write status: success until the branch is pushed, the PR exists, and pr.number plus pr.url are populated in the worker_result.",
+            "If implementation is done but push or PR creation has not succeeded yet, write blocked or failed instead of success so reconcile can classify the state honestly.",
             "If the worker is blocked or failed, include failure_classification with kind, retryable, routed_to, and root_cause_signature.",
             "Do not claim final acceptance; that belongs to pr_verifier.",
             "When the worker_result is written, return control to the main_orchestrator root session; do not launch a root session.",

@@ -18,10 +18,12 @@ This repo now has a runtime supervisor layer for the autonomous development work
 1. Orchestrator bootstrap writes the checkpoint, initializes the supervisor ledger, writes the first `new-session-request.json`, and immediately dispatches a fresh `main_orchestrator` root session.
 2. The `main_orchestrator` root session owns the selected issue end-to-end. It delegates `issue_worker`, `pr_verifier`, and `release_worker` work to subagents rather than creating root sessions for those roles.
 3. The root orchestrator launches each worker/verifier/release subagent with `task(..., run_in_background=false)` so the same root session waits for the child reply before moving on.
-4. After each subagent writes its compact artifact, the orchestrator runs `PYTHONPATH=. python3 scripts/orchestrator_supervisor.py reconcile --ledger .opencode/runtime/orchestrator-ledger.json` and uses the returned decision to choose the next subagent or recovery action.
-5. `reconcile --write-request --dispatch-now` is reserved for creating a new `main_orchestrator` root session during orchestrator bootstrap, recovery, or next-issue handoff; it must not be used to launch worker/verifier/release roles as root sessions.
-6. `.opencode/runtime/new-session-result.json` records created root orchestrator sessions so operators can inspect or resume them if needed.
-7. If recovery needs another `ready-for-agent` issue and no suitable local packet exists yet, the supervisor runs `python3 scripts/issue_packet_intake.py --output-dir docs/agents/issue-packets` and retries selection once.
+4. Each worker/verifier/release subagent may execute issue scope inside an issue worktree, but it must write compact artifacts back to the primary workspace's canonical repo paths recorded in the ledger so the supervisor can reconcile them deterministically.
+5. `issue_worker` must not write `status: success` until its branch is pushed and the worker result contains finalized PR metadata (`pr.number` and `pr.url`). If PR creation or push is still incomplete, the worker must emit a blocked/failed artifact instead of an optimistic success result.
+6. After each subagent writes its compact artifact, the orchestrator runs `PYTHONPATH=. python3 scripts/orchestrator_supervisor.py reconcile --ledger .opencode/runtime/orchestrator-ledger.json` and uses the returned decision to choose the next subagent or recovery action.
+7. `reconcile --write-request --dispatch-now` is reserved for creating a new `main_orchestrator` root session during orchestrator bootstrap, recovery, or next-issue handoff; it must not be used to launch worker/verifier/release roles as root sessions.
+8. `.opencode/runtime/new-session-result.json` records created root orchestrator sessions so operators can inspect or resume them if needed.
+9. If recovery needs another `ready-for-agent` issue and no suitable local packet exists yet, the supervisor runs `python3 scripts/issue_packet_intake.py --output-dir docs/agents/issue-packets` and retries selection once.
 
 ## GitHub intake prerequisites
 

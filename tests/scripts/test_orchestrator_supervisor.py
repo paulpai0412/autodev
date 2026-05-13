@@ -239,6 +239,83 @@ metadata:
     assert "persisted worker_result fact is missing" in cast(str, decision["summary"])
 
 
+def test_reconcile_worker_success_without_pr_number_routes_to_recovery(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "issue_worker", "stage": "issue_worker_execution", "status": "queued"}
+    cast(dict[str, int], ledger["attempts"])["issue_worker"] = 1
+
+    worker_result_path = tmp_path / "docs/agents/worker-results/issue-42.yaml"
+    worker_result_path.parent.mkdir(parents=True, exist_ok=True)
+    worker_result_path.write_text(
+        """schema_version: \"1.0\"
+kind: worker_result
+line_cap: 80
+status: \"success\"
+failure_classification: {kind: \"none\", retryable: true, routed_to: \"pr_verifier\", root_cause_signature: \"none\"}
+summary:
+  objective: \"demo\"
+  outcome: \"done\"
+files_changed:
+  - path: \"foo\"
+    summary: \"bar\"
+verification:
+  note: \"n\"
+  gates:
+    tdd_gate: \"pass\"
+    implementation_self_check_gate: \"pass\"
+    git_gate: \"pass\"
+  implementation_self_checks:
+    - command: \"pytest\"
+      result: \"pass\"
+      evidence_ref: \"local\"
+      summary: \"ok\"
+  final_acceptance_claim: false
+evidence_packet_refs:
+  worker_artifact_bundle: \"\"
+  verifier_packet: \"\"
+  raw_evidence_policy: \"stored_outside_main_agent_context\"
+role_boundary:
+  actor_role: \"issue_worker\"
+  may_execute_implementation_self_checks: true
+  may_execute_final_acceptance_qa: false
+  may_emit_final_verification: false
+  verifier_packet_required_for_completion: true
+pr:
+  number: \"\"
+  url: \"\"
+  ready_for_review: true
+blockers:
+  - \"none\"
+next_recommended_step: \"Spawn verifier\"
+metadata:
+  worker: \"w\"
+  worker_session_id: \"ses\"
+  completed_at: \"2026-05-07T17:10:00+08:00\"
+""",
+        encoding="utf-8",
+    )
+    cast(dict[str, str], ledger["artifacts"])["workerResultPath"] = str(worker_result_path.relative_to(tmp_path))
+
+    updated_ledger, decision, request = reconcile_ledger(
+        ledger,
+        session_result_path=tmp_path / "missing.json",
+        artifact_base_dir=tmp_path,
+        updated_at="2026-05-07T17:11:00+08:00",
+    )
+
+    issue = read_issue(tmp_path, "42")
+    artifact_status = _artifact_status(issue)
+
+    assert updated_ledger is not None
+    assert decision["action"] == "queue_next_session"
+    assert request is not None
+    assert cast(dict[str, object], updated_ledger["lastFailure"])["kind"] == "contract_invalid"
+    assert "reported success without a PR number" in cast(str, decision["summary"])
+    assert cast(dict[str, object], artifact_status["worker_result"])["parse_ok"] is True
+    assert cast(dict[str, object], artifact_status["worker_result"])["pr_number"] == ""
+
+
 def test_reconcile_worker_success_refreshes_running_heartbeat_before_stale_quarantine(tmp_path: Path):
     issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")

@@ -137,3 +137,34 @@ def test_build_prompt_for_pr_verifier_requires_evidence_packet_before_completion
 
     assert "Write docs/agents/evidence/issue-8-pr-12.yaml using docs/agents/evidence-packet-template.yaml." in prompt
     assert "Do not stop, summarize, or report verification progress until that evidence packet exists" in prompt
+
+
+def test_build_prompt_for_issue_worker_requires_pr_metadata_before_success() -> None:
+    ledger = cast(dict[str, object], {
+        "automation": {"primaryWorkspaceRoot": "/tmp/project"},
+        "issue": {
+            "number": "18",
+            "branch": "agent/issue-18-demo",
+            "issuePacketPath": "docs/agents/issue-packets/issue-18.yaml",
+        },
+        "workflow": {
+            "checkpointPath": "docs/agents/runtime/context-checkpoint.yaml",
+            "workflowPolicyPath": "docs/agents/autonomous-development-workflow.yaml",
+        },
+        "artifacts": {
+            "workerResultPath": "docs/agents/worker-results/issue-18.yaml",
+        },
+    })
+
+    prompt = orchestrator_requests.build_prompt(
+        ledger,
+        role="issue_worker",
+        stage="issue_worker_execution",
+        decision_summary="implement now",
+        default_supervisor_doc_path="docs/agents/runtime/nonstop-supervisor-loop.md",
+        default_release_result_template_path="docs/agents/release-result-template.yaml",
+    )
+
+    assert "Do not write status: success until the branch is pushed, the PR exists" in prompt
+    assert "pr.number plus pr.url are populated in the worker_result" in prompt
+    assert "write blocked or failed instead of success" in prompt

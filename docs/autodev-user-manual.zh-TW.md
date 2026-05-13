@@ -164,6 +164,9 @@
    - `issue_worker`
    - `pr_verifier`
    - `release_worker`
+   - 以上子任務應以 `task(..., run_in_background=false)` 前景執行，讓同一個 root orchestrator session 逐一等待完成後再繼續
+   - 即使 issue scope 在 issue worktree 內執行，compact artifacts（worker result / evidence packet / release result）仍應回寫到 primary workspace 的 canonical repo 路徑，供 supervisor reconcile 使用
+   - `issue_worker` 只有在 branch push 與 PR 建立都完成，且 worker result 內已填入 `pr.number` / `pr.url` 後，才能寫出 `status: success`；否則必須誠實寫成 blocked / failed，避免 supervisor 過早把 issue 視為成功
 5. 每次有新 artifact 落地後，supervisor 執行 `reconcile`
 6. `reconcile` 會同步 SQLite control plane，判斷下一步是：
    - 繼續派工
