@@ -20,9 +20,9 @@ ISSUE_STATES = (
 _ALLOWED_TRANSITIONS = {
     "ready": {"claimed"},
     "claimed": {"dispatching", "ready"},
-    "dispatching": {"running", "ready"},
+    "dispatching": {"running", "ready", "quarantined"},
     "running": {"verifying", "quarantined"},
-    "verifying": {"running", "completed", "failed"},
+    "verifying": {"running", "completed", "failed", "quarantined"},
     "quarantined": {"claimed", "running", "failed"},
     "completed": set(),
     "failed": set(),
