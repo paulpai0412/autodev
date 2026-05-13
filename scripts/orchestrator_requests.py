@@ -49,7 +49,7 @@ def build_prompt(
             "Do not implement issue scope directly.",
             "You own orchestration for the whole selected issue inside this root session.",
             "Immediately launch the first issue_worker subagent in this same turn after validating the target; do not stop after describing intent or summarizing a plan.",
-            'Run issue_worker, pr_verifier, and release_worker as subagents from this root orchestrator session with task(subagent_type="general", ..., run_in_background=true). After each child completes, collect its result with background_output(...) before continuing.',
+            'Run issue_worker, pr_verifier, and release_worker as subagents from this root orchestrator session with task(subagent_type="general", ..., run_in_background=false). Wait for each child task call to finish in the foreground before continuing.',
             "Choose child load_skills normally for the task at hand.",
             "After each subagent writes its compact artifact, run:",
             "PYTHONPATH=. python3 scripts/orchestrator_supervisor.py reconcile --ledger .opencode/runtime/orchestrator-ledger.json",

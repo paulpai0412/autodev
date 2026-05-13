@@ -5,7 +5,7 @@ from typing import cast
 from scripts import orchestrator_requests
 
 
-def test_build_prompt_for_main_orchestrator_requires_background_child_subagents() -> None:
+def test_build_prompt_for_main_orchestrator_requires_foreground_child_subagents() -> None:
     ledger = cast(dict[str, object], {
         "issue": {
             "number": "6",
@@ -28,8 +28,8 @@ def test_build_prompt_for_main_orchestrator_requires_background_child_subagents(
         default_release_result_template_path="docs/agents/release-result-template.yaml",
     )
 
-    assert 'task(subagent_type="general", ..., run_in_background=true)' in prompt
-    assert "collect its result with background_output(...) before continuing" in prompt
+    assert 'task(subagent_type="general", ..., run_in_background=false)' in prompt
+    assert "Wait for each child task call to finish in the foreground before continuing." in prompt
     assert "Do not include karpathy-guidelines in load_skills for child subagents" not in prompt
 
 

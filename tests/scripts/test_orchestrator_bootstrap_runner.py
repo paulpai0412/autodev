@@ -135,8 +135,8 @@ def test_run_orchestrator_bootstrap_updates_checkpoint_and_returns_next_action(t
     assert '"title": "Continue issue #42 on agent/issue-42-demo"' in request
     assert result.immediate_next_action in request
     assert "Immediately launch the first issue_worker subagent in this same turn" in request
-    assert "run_in_background=true" in request
-    assert "collect its result with background_output(...) before continuing" in request
+    assert "run_in_background=false" in request
+    assert "Wait for each child task call to finish in the foreground before continuing." in request
     assert "Do not include karpathy-guidelines in load_skills for child subagents" not in request
     assert request_payload["requestGeneration"] == 2
     assert request_payload["nonce"]

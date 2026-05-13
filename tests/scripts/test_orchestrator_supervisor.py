@@ -560,14 +560,14 @@ def test_build_orchestrator_request_uses_ledger_shared_doc_paths():
     assert "/shared/docs/agents/autonomous-development-workflow.yaml" in request["prompt"]
 
 
-def test_build_orchestrator_request_requires_background_child_subagents():
+def test_build_orchestrator_request_requires_foreground_child_subagents():
     issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
 
     request = build_orchestrator_request(ledger)
 
-    assert 'task(subagent_type="general", ..., run_in_background=true)' in request["prompt"]
-    assert "collect its result with background_output(...) before continuing" in request["prompt"]
+    assert 'task(subagent_type="general", ..., run_in_background=false)' in request["prompt"]
+    assert "Wait for each child task call to finish in the foreground before continuing." in request["prompt"]
     assert "Do not include karpathy-guidelines in load_skills for child subagents" not in request["prompt"]
 
 
