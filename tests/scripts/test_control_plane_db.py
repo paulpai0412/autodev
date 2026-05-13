@@ -8,6 +8,7 @@ from scripts.control_plane_db import (
     append_issue_history,
     completed_issue_numbers,
     control_plane_db_path,
+    describe_control_plane_schema,
     ensure_control_plane_db,
     ingest_issue_packet,
     issue_rows_with_packets,
@@ -43,6 +44,20 @@ def test_ensure_control_plane_db_creates_required_tables(tmp_path: Path):
 
     assert db_path == control_plane_db_path(tmp_path)
     assert table_names(db_path) == {"issues", "issue_history", "sqlite_sequence"}
+
+
+def test_describe_control_plane_schema_exposes_real_issue_columns(tmp_path: Path):
+    schema = describe_control_plane_schema(tmp_path)
+
+    issue_columns = [column["name"] for column in schema["tables"]["issues"]["columns"]]
+    history_columns = [column["name"] for column in schema["tables"]["issue_history"]["columns"]]
+
+    assert schema["dbPath"] == str(control_plane_db_path(tmp_path))
+    assert "artifact_refs_json" in issue_columns
+    assert "artifact_status_json" in issue_columns
+    assert "issue_packet_json" in issue_columns
+    assert "history_id" in history_columns
+    assert "payload_json" in history_columns
 
 
 def test_transition_issue_state_records_issue_and_history(tmp_path: Path):
@@ -232,6 +247,38 @@ def test_read_latest_rows_return_newest_issue_decision_and_sync(tmp_path: Path):
 
 def test_upsert_issue_ranking_and_ready_selection_sort_by_rank_score(tmp_path: Path):
     ensure_control_plane_db(tmp_path)
+    issue_packets_dir = tmp_path / "docs/agents/issue-packets"
+    issue_packets_dir.mkdir(parents=True, exist_ok=True)
+    (issue_packets_dir / "issue-41.yaml").write_text("issue 41", encoding="utf-8")
+    (issue_packets_dir / "issue-42.yaml").write_text("issue 42", encoding="utf-8")
+    _ = ingest_issue_packet(
+        tmp_path,
+        issue_number="41",
+        issue_packet={
+            "issue_number": "41",
+            "title": "Issue 41",
+            "branch": "agent/issue-41-demo",
+            "issue_packet_path": "docs/agents/issue-packets/issue-41.yaml",
+            "labels": ["ready-for-agent"],
+            "parent_reference": "none",
+            "dependencies": [],
+        },
+        updated_at="2026-05-11T09:59:00+08:00",
+    )
+    _ = ingest_issue_packet(
+        tmp_path,
+        issue_number="42",
+        issue_packet={
+            "issue_number": "42",
+            "title": "Issue 42",
+            "branch": "agent/issue-42-demo",
+            "issue_packet_path": "docs/agents/issue-packets/issue-42.yaml",
+            "labels": ["ready-for-agent"],
+            "parent_reference": "none",
+            "dependencies": [],
+        },
+        updated_at="2026-05-11T09:59:00+08:00",
+    )
     _ = upsert_issue_ranking(
         tmp_path,
         issue_number="41",
@@ -250,6 +297,59 @@ def test_upsert_issue_ranking_and_ready_selection_sort_by_rank_score(tmp_path: P
     rows = ready_issues_for_selection(tmp_path)
 
     assert [row["issue_number"] for row in rows] == ["42", "41"]
+
+
+def test_ready_issues_for_selection_requires_materialized_local_issue_packet(tmp_path: Path):
+    ensure_control_plane_db(tmp_path)
+    issue_packets_dir = tmp_path / "docs/agents/issue-packets"
+    issue_packets_dir.mkdir(parents=True, exist_ok=True)
+    (issue_packets_dir / "issue-42.yaml").write_text("issue 42", encoding="utf-8")
+    _ = ingest_issue_packet(
+        tmp_path,
+        issue_number="41",
+        issue_packet={
+            "issue_number": "41",
+            "title": "Issue 41",
+            "branch": "agent/issue-41-demo",
+            "issue_packet_path": "docs/agents/issue-packets/issue-41.yaml",
+            "labels": ["ready-for-agent"],
+            "parent_reference": "none",
+            "dependencies": [],
+        },
+        updated_at="2026-05-11T10:00:00+08:00",
+    )
+    _ = ingest_issue_packet(
+        tmp_path,
+        issue_number="42",
+        issue_packet={
+            "issue_number": "42",
+            "title": "Issue 42",
+            "branch": "agent/issue-42-demo",
+            "issue_packet_path": "docs/agents/issue-packets/issue-42.yaml",
+            "labels": ["ready-for-agent"],
+            "parent_reference": "none",
+            "dependencies": [],
+        },
+        updated_at="2026-05-11T10:00:00+08:00",
+    )
+    _ = upsert_issue_ranking(
+        tmp_path,
+        issue_number="41",
+        rank_score=100,
+        lane="default",
+        updated_at="2026-05-11T10:01:00+08:00",
+    )
+    _ = upsert_issue_ranking(
+        tmp_path,
+        issue_number="42",
+        rank_score=90,
+        lane="default",
+        updated_at="2026-05-11T10:01:00+08:00",
+    )
+
+    rows = ready_issues_for_selection(tmp_path)
+
+    assert [row["issue_number"] for row in rows] == ["42"]
 
 
 def test_record_admin_decision_persists_latest_decision(tmp_path: Path):

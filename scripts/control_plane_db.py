@@ -73,6 +73,31 @@ def _json_loads_dict(value: Any) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _issue_packet_exists_locally(base_dir: Path, issue_packet: dict[str, Any]) -> bool:
+    issue_packet_path = str(issue_packet.get("issue_packet_path") or "")
+    if not issue_packet_path:
+        return False
+    path = Path(issue_packet_path)
+    if path.is_absolute():
+        if path.exists():
+            return True
+        raw_text = str(issue_packet.get("raw_text") or "")
+        if not raw_text:
+            return False
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(raw_text, encoding="utf-8")
+        return True
+    resolved_path = base_dir / path
+    if resolved_path.exists():
+        return True
+    raw_text = str(issue_packet.get("raw_text") or "")
+    if not raw_text:
+        return False
+    resolved_path.parent.mkdir(parents=True, exist_ok=True)
+    _ = resolved_path.write_text(raw_text, encoding="utf-8")
+    return True
+
+
 def _column_names(connection: sqlite3.Connection, table_name: str) -> set[str]:
     rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
     return {str(row[1]) for row in rows}
@@ -273,6 +298,35 @@ def ensure_control_plane_db(base_dir: Path) -> Path:
     return db_path
 
 
+def describe_control_plane_schema(base_dir: Path) -> dict[str, Any]:
+    db_path = ensure_control_plane_db(base_dir)
+    with _connect(base_dir) as connection:
+        table_rows = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name ASC"
+        ).fetchall()
+        tables = [str(row[0]) for row in table_rows]
+
+        def describe_table(table_name: str) -> dict[str, Any]:
+            column_rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+            return {
+                "columns": [
+                    {
+                        "name": str(row[1]),
+                        "type": str(row[2]),
+                        "notNull": bool(row[3]),
+                        "default": None if row[4] is None else str(row[4]),
+                        "primaryKeyOrdinal": int(row[5]),
+                    }
+                    for row in column_rows
+                ]
+            }
+
+        return {
+            "dbPath": str(db_path),
+            "tables": {table_name: describe_table(table_name) for table_name in tables},
+        }
+
+
 def _read_issue_row(connection: sqlite3.Connection, issue_number: str) -> dict[str, Any] | None:
     row = connection.execute(
         "SELECT * FROM issues WHERE issue_number = ?",
@@ -363,7 +417,14 @@ def ready_issues_for_selection(base_dir: Path) -> list[dict[str, Any]]:
         rows = connection.execute(
             "SELECT * FROM issues WHERE state = 'ready' AND rank_score >= 0 ORDER BY rank_score DESC, issue_number ASC"
         ).fetchall()
-    return [dict(row) for row in rows]
+    ready_rows: list[dict[str, Any]] = []
+    for row in rows:
+        payload = dict(row)
+        issue_packet = _json_loads_dict(payload.get("issue_packet_json"))
+        if not _issue_packet_exists_locally(base_dir, issue_packet):
+            continue
+        ready_rows.append(payload)
+    return ready_rows
 
 
 def sync_issue_runtime_context(
