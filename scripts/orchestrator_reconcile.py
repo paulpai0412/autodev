@@ -11,11 +11,17 @@ JsonObject = dict[str, object]
 ReconcileResult = tuple[JsonObject, JsonObject, JsonObject | None]
 
 
+def _canonical_artifact_path(path_text: str, *, base_dir: Path) -> Path:
+    path = Path(path_text)
+    return path if path.is_absolute() else base_dir / path
+
+
 class IssuePacketRecord(Protocol):
     issue_number: str
     title: str
     branch: str
     issue_packet_path: str
+    backing_type: str
     prior_handoff: str
     labels: list[str]
     parent_reference: str
@@ -205,6 +211,21 @@ def queue_orchestrator_recovery(
             current_issue=cast(dict[str, str], ledger["issue"]),
         )
     if selected_issue is not None:
+        ledger["queuedNextIssue"] = {
+            "selectedAt": updated_at,
+            "reason": summary,
+            "record": {
+                "issue_number": selected_issue.issue_number,
+                "title": selected_issue.title,
+                "branch": selected_issue.branch,
+                "issue_packet_path": selected_issue.issue_packet_path,
+                "backing_type": selected_issue.backing_type,
+                "prior_handoff": selected_issue.prior_handoff,
+                "labels": list(selected_issue.labels),
+                "parent_reference": selected_issue.parent_reference,
+                "dependencies": list(selected_issue.dependencies),
+            },
+        }
         next_summary = f"{summary} Continue automatically with issue #{selected_issue.issue_number} via {selected_issue.issue_packet_path}."
         return handoff_to_selected_issue(
             ledger,
@@ -215,6 +236,7 @@ def queue_orchestrator_recovery(
         )
     attempts = cast(dict[str, int], ledger["attempts"])
     attempts["main_orchestrator"] += 1
+    ledger.pop("queuedNextIssue", None)
     queue_transition_func(
         ledger,
         next_role="main_orchestrator",
@@ -279,7 +301,14 @@ def reconcile_issue_worker(
     queue_transition_func: Callable[..., None],
     subagent_decision_func: Callable[..., JsonObject],
 ) -> ReconcileResult:
-    worker_result_path = resolve_artifact_path(artifacts["workerResultPath"], base_dir=base_dir)
+    automation = cast(dict[str, object], ledger.get("automation", {}))
+    primary_workspace_root = str(automation.get("primaryWorkspaceRoot") or "")
+    worker_artifact_base_dir = Path(primary_workspace_root) if primary_workspace_root else base_dir
+    worker_result_path = (
+        _canonical_artifact_path(artifacts["workerResultPath"], base_dir=worker_artifact_base_dir)
+        if primary_workspace_root
+        else resolve_artifact_path(artifacts["workerResultPath"], base_dir=worker_artifact_base_dir)
+    )
     if not worker_result_path.exists():
         if current.get("status") == "queued":
             summary = (

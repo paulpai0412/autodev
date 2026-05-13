@@ -34,6 +34,12 @@ AGENT_IN_PROGRESS_LABEL = "agent-in-progress"
 QUARANTINED_LABEL = "quarantined"
 
 
+def _issue_backing_type(base_dir: Path, issue_number: str) -> str:
+    issue = read_issue(base_dir, issue_number) or {}
+    issue_packet = cast(dict[str, object], json.loads(str(issue.get("issue_packet_json") or "{}"))) if issue else {}
+    return str(issue_packet.get("backing_type") or "github")
+
+
 def scheduler_id(base_dir: Path) -> str:
     return f"scheduler:{base_dir.resolve()}"
 
@@ -157,6 +163,20 @@ def sync_issue_progress_label(
     command_id: str | None = None,
     updated_at: str | None = None,
 ) -> str:
+    backing_type = _issue_backing_type(base_dir, issue_number)
+    if backing_type == "local_seeded":
+        if command_id:
+            record_github_sync_attempt(
+                base_dir,
+                command_id=command_id,
+                issue_number=issue_number,
+                add_labels=add_labels,
+                remove_labels=remove_labels,
+                status="skipped",
+                updated_at=now(updated_at),
+                last_error="skipped GitHub label sync for local-seeded issue",
+            )
+        return ""
     repo = read_project_github_repo(base_dir)
     if not repo:
         if command_id:
@@ -450,6 +470,10 @@ def quarantine_issue_execution(
 ) -> None:
     timestamp = now(updated_at)
     ensure_control_plane_db(base_dir)
+    issue = read_issue(base_dir, issue_number) or {}
+    from_state = str(issue.get("state") or "running")
+    if from_state not in {"running", "dispatching", "verifying"}:
+        raise ValueError(f"cannot quarantine issue #{issue_number} from {from_state!r}")
     transition_state(
         base_dir=base_dir,
         issue_number=issue_number,
@@ -457,7 +481,7 @@ def quarantine_issue_execution(
         command_id=uuid4().hex,
         updated_at=timestamp,
         reason=reason,
-        from_state="running",
+        from_state=from_state,
     )
     _ = sync_progress_label(
         base_dir=base_dir,

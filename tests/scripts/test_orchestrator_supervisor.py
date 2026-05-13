@@ -19,6 +19,7 @@ def _artifact_status(issue: dict[str, object] | None) -> dict[str, object]:
     payload = json.loads(raw)
     return payload if isinstance(payload, dict) else {}
 from scripts.orchestrator_supervisor import (
+    build_session_request,
     build_orchestrator_request,
     create_initial_ledger,
     issue_lock_path,
@@ -27,6 +28,7 @@ from scripts.orchestrator_supervisor import (
     run_issue_packet_intake,
     select_next_issue_packet,
     validate_session_request_for_dispatch,
+    write_ledger_file,
 )
 
 
@@ -86,9 +88,55 @@ def test_reconcile_bootstrap_queues_issue_worker(tmp_path: Path):
     assert request is None
 
 
-def test_reconcile_worker_success_queues_pr_verifier(tmp_path: Path):
+def test_parse_issue_packet_text_marks_missing_issue_url_as_local_seeded() -> None:
+    packet = parse_issue_packet_text(
+        """schema_version: \"1.0\"
+kind: issue_packet
+line_cap: 80
+
+issue:
+  number: \"31\"
+  title: \"Local seeded issue\"
+  labels: [ready-for-agent]
+  parent: {type: \"github-issue\", reference: \"none\"}
+
+branch: {name: \"agent/issue-31-demo\", base: \"main\"}
+
+bootstrap_context:
+  required_reads: [\"AGENTS.md\"]
+  context_budget: {checkpoint_warning_at_percent: 45, stop_and_rotate_at_percent: 50}
+  relevant_paths: [\"scripts\"]
+  prior_handoff: \"none\"
+""",
+        "docs/agents/issue-packets/issue-31.yaml",
+    )
+
+    assert packet.backing_type == "local_seeded"
+
+
+def test_create_initial_ledger_persists_issue_backing_type() -> None:
     issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+
+    issue = cast(dict[str, object], ledger["issue"])
+
+    assert issue["backingType"] == "github"
+
+
+def test_reconcile_worker_success_queues_pr_verifier(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    checkpoint_path = tmp_path / "docs/agents/runtime/context-checkpoint.yaml"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_path.write_text(
+        'schema_version: "1.0"\nkind: context_checkpoint\nline_cap: 80\n\nsubject:\n  issue_number: "42"\n  branch: "agent/issue-42-demo"\n  role: "main_orchestrator"\n  checkpoint_reason: "selected_afk_issue"\n\ncontext_budget:\n  warning_at_percent: 45\n  stop_and_rotate_at_percent: 50\n  measured_percent_used: "unknown"\n  must_rotate_now: false\n\nresume_policy:\n  checkpoint_only_cross_session_resume: true\n  do_not_import_full_prior_transcript: true\n  raw_evidence_policy: "index_only"\n\nstate:\n  completed: []\n  in_progress: []\n  next: []\n  blockers:\n    - "none"\n\nrefs:\n  issue_packet: "docs/agents/issue-packets/issue-42.yaml"\n  worker_result: ""\n  evidence_packet: ""\n  handoff: "docs/agents/handoffs/issue-41.yaml"\n  artifact_bundle: ""\n\nmetadata:\n  updated_by: "Build"\n  updated_at: "2026-05-07T17:00:00+08:00"\n',
+        encoding="utf-8",
+    )
+    ledger = create_initial_ledger(
+        issue_packet=issue_packet,
+        checkpoint_path="docs/agents/runtime/context-checkpoint.yaml",
+        primary_workspace_root=str(tmp_path),
+        updated_at="2026-05-07T17:00:00+08:00",
+    )
     ledger["current"] = {"role": "issue_worker", "stage": "issue_worker_execution", "status": "queued"}
     cast(dict[str, int], ledger["attempts"])["issue_worker"] = 1
 
@@ -152,6 +200,7 @@ metadata:
     )
     current = cast(dict[str, object], updated_ledger["current"])
     artifacts = cast(dict[str, object], updated_ledger["artifacts"])
+    updated_checkpoint = checkpoint_path.read_text(encoding="utf-8")
 
     assert current["role"] == "pr_verifier"
     assert artifacts["evidencePacketPath"] == "docs/agents/evidence/issue-42-pr-77.yaml"
@@ -159,11 +208,90 @@ metadata:
     assert decision["next_role"] == "pr_verifier"
     assert "pr_verifier subagent" in cast(str, decision.get("subagent_prompt", ""))
     assert request is None
+    assert '    - "PR verifier is validating issue #42."' in updated_checkpoint
+    assert '    - "Wait for docs/agents/evidence/issue-42-pr-77.yaml before routing to release_worker."' in updated_checkpoint
+    assert '  evidence_packet: "docs/agents/evidence/issue-42-pr-77.yaml"' in updated_checkpoint
     issue = read_issue(tmp_path, "42")
     artifact_status = _artifact_status(issue)
     assert cast(dict[str, object], artifact_status["worker_result"])["parse_ok"] is True
     assert cast(dict[str, object], artifact_status["worker_result"])["status"] == "success"
     assert cast(dict[str, object], artifact_status["worker_result"])["pr_number"] == "77"
+
+
+def test_reconcile_stale_bootstrap_with_existing_worker_artifact_self_heals_to_issue_worker(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(
+        issue_packet=issue_packet,
+        checkpoint_path="docs/agents/runtime/context-checkpoint.yaml",
+        primary_workspace_root=str(tmp_path),
+        updated_at="2026-05-07T17:00:00+08:00",
+    )
+
+    worker_result_path = tmp_path / "docs/agents/worker-results/issue-42.yaml"
+    worker_result_path.parent.mkdir(parents=True, exist_ok=True)
+    worker_result_path.write_text(
+        """schema_version: \"1.0\"
+kind: worker_result
+line_cap: 80
+status: \"success\"
+failure_classification: {kind: \"none\", retryable: true, routed_to: \"pr_verifier\", root_cause_signature: \"none\"}
+summary:
+  objective: \"demo\"
+  outcome: \"done\"
+files_changed:
+  - path: \"foo\"
+    summary: \"bar\"
+verification:
+  note: \"n\"
+  gates:
+    tdd_gate: \"pass\"
+    implementation_self_check_gate: \"pass\"
+    git_gate: \"pass\"
+  implementation_self_checks:
+    - command: \"pytest\"
+      result: \"pass\"
+      evidence_ref: \"local\"
+      summary: \"ok\"
+  final_acceptance_claim: false
+evidence_packet_refs:
+  worker_artifact_bundle: \"\"
+  verifier_packet: \"docs/agents/evidence/issue-42-pr-77.yaml\"
+  raw_evidence_policy: \"stored_outside_main_agent_context\"
+role_boundary:
+  actor_role: \"issue_worker\"
+  may_execute_implementation_self_checks: true
+  may_execute_final_acceptance_qa: false
+  may_emit_final_verification: false
+  verifier_packet_required_for_completion: true
+pr:
+  number: \"77\"
+  url: \"https://example/pr/77\"
+  ready_for_review: true
+blockers:
+  - \"none\"
+next_recommended_step: \"Spawn verifier\"
+metadata:
+  worker: \"w\"
+  worker_session_id: \"ses\"
+  completed_at: \"2026-05-07T17:10:00+08:00\"
+""",
+        encoding="utf-8",
+    )
+
+    updated_ledger, decision, request = reconcile_ledger(
+        ledger,
+        session_result_path=tmp_path / "missing.json",
+        artifact_base_dir=tmp_path,
+        updated_at="2026-05-07T17:11:00+08:00",
+    )
+
+    current = cast(dict[str, object], updated_ledger["current"])
+
+    assert current["role"] == "pr_verifier"
+    assert current["stage"] == "pr_verifier_execution"
+    assert decision["action"] == "delegate_subagent"
+    assert decision["next_role"] == "pr_verifier"
+    assert request is None
 
 
 def test_reconcile_worker_success_requires_persisted_worker_fact(tmp_path: Path):
@@ -237,6 +365,85 @@ metadata:
     assert request is not None
     assert cast(dict[str, object], updated_ledger["lastFailure"])["kind"] == "contract_invalid"
     assert "persisted worker_result fact is missing" in cast(str, decision["summary"])
+
+
+def test_reconcile_worker_success_requires_canonical_primary_workspace_artifact(tmp_path: Path):
+    primary_root = tmp_path / "primary-workspace"
+    worktree_root = tmp_path / "worker-worktree"
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(
+        issue_packet=issue_packet,
+        primary_workspace_root=str(primary_root),
+        updated_at="2026-05-07T17:00:00+08:00",
+    )
+    ledger["current"] = {"role": "issue_worker", "stage": "issue_worker_execution", "status": "done"}
+    cast(dict[str, int], ledger["attempts"])["issue_worker"] = 1
+
+    worktree_result_path = worktree_root / "docs/agents/worker-results/issue-42.yaml"
+    worktree_result_path.parent.mkdir(parents=True, exist_ok=True)
+    worktree_result_path.write_text(
+        """schema_version: \"1.0\"
+kind: worker_result
+line_cap: 80
+status: \"success\"
+failure_classification: {kind: \"none\", retryable: true, routed_to: \"pr_verifier\", root_cause_signature: \"none\"}
+summary:
+  objective: \"demo\"
+  outcome: \"done\"
+files_changed:
+  - path: \"foo\"
+    summary: \"bar\"
+verification:
+  note: \"n\"
+  gates:
+    tdd_gate: \"pass\"
+    implementation_self_check_gate: \"pass\"
+    git_gate: \"pass\"
+  implementation_self_checks:
+    - command: \"pytest\"
+      result: \"pass\"
+      evidence_ref: \"local\"
+      summary: \"ok\"
+  final_acceptance_claim: false
+evidence_packet_refs:
+  worker_artifact_bundle: \"\"
+  verifier_packet: \"docs/agents/evidence/issue-42-pr-77.yaml\"
+  raw_evidence_policy: \"stored_outside_main_agent_context\"
+role_boundary:
+  actor_role: \"issue_worker\"
+  may_execute_implementation_self_checks: true
+  may_execute_final_acceptance_qa: false
+  may_emit_final_verification: false
+  verifier_packet_required_for_completion: true
+pr:
+  number: \"77\"
+  url: \"https://example/pr/77\"
+  ready_for_review: true
+blockers:
+  - \"none\"
+next_recommended_step: \"Spawn verifier\"
+metadata:
+  worker: \"w\"
+  worker_session_id: \"ses\"
+  completed_at: \"2026-05-07T17:10:00+08:00\"
+""",
+        encoding="utf-8",
+    )
+    cast(dict[str, str], ledger["artifacts"])["workerResultPath"] = "docs/agents/worker-results/issue-42.yaml"
+
+    updated_ledger, decision, request = reconcile_ledger(
+        ledger,
+        session_result_path=tmp_path / "missing.json",
+        artifact_base_dir=worktree_root,
+        updated_at="2026-05-07T17:11:00+08:00",
+    )
+
+    assert updated_ledger is not None
+    assert decision["action"] == "delegate_subagent"
+    assert decision["next_role"] == "issue_worker"
+    assert request is None
+    assert cast(dict[str, object], updated_ledger["lastFailure"])["kind"] == "contract_invalid"
+    assert "ended without writing docs/agents/worker-results/issue-42.yaml" in cast(str, decision["summary"])
 
 
 def test_reconcile_worker_success_without_pr_number_routes_to_recovery(tmp_path: Path):
@@ -547,6 +754,8 @@ def test_build_orchestrator_request_uses_ledger_shared_doc_paths():
 
     assert "/shared/docs/agents/runtime/nonstop-supervisor-loop.md" in request["prompt"]
     assert "/shared/docs/agents/autonomous-development-workflow.yaml" in request["prompt"]
+    assert 'PYTHONPATH="/shared" python3 "/shared/scripts/orchestrator_supervisor.py" reconcile --ledger .opencode/runtime/orchestrator-ledger.json' in request["prompt"]
+    assert 'PYTHONPATH="/shared" python3 "/shared/scripts/orchestrator_supervisor.py" advance-child --ledger .opencode/runtime/orchestrator-ledger.json' in request["prompt"]
 
 
 def test_build_orchestrator_request_requires_foreground_child_subagents():
@@ -596,6 +805,66 @@ def test_validate_session_request_rejects_stale_revision(tmp_path: Path):
     error = validate_session_request_for_dispatch(request, ledger, base_dir=tmp_path)
 
     assert "stale request revision" in error
+
+
+def test_validate_session_request_allows_recovery_request_with_selected_next_issue(tmp_path: Path):
+    issue_packets_dir = tmp_path / "docs/agents/issue-packets"
+    issue_packets_dir.mkdir(parents=True, exist_ok=True)
+    issue_31 = issue_packets_dir / "issue-31.yaml"
+    issue_32 = issue_packets_dir / "issue-32.yaml"
+    issue_31.write_text(
+        SAMPLE_ISSUE_PACKET.replace('"42"', '"31"').replace('issue-42', 'issue-31').replace('Demo issue', 'Issue 31').replace('agent/issue-42-demo', 'agent/issue-31-demo'),
+        encoding="utf-8",
+    )
+    issue_32.write_text(
+        SAMPLE_ISSUE_PACKET.replace('"42"', '"32"').replace('issue-42', 'issue-32').replace('Demo issue', 'Issue 32').replace('agent/issue-42-demo', 'agent/issue-32-demo'),
+        encoding="utf-8",
+    )
+    checkpoint_path = tmp_path / "docs/agents/runtime/context-checkpoint.yaml"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_path.write_text(
+        'schema_version: "1.0"\nkind: context_checkpoint\nline_cap: 80\n\nsubject:\n  issue_number: "31"\n  branch: "agent/issue-31-demo"\n  role: "main_orchestrator"\n  checkpoint_reason: "selected_afk_issue"\n\ncontext_budget:\n  warning_at_percent: 45\n  stop_and_rotate_at_percent: 50\n  measured_percent_used: "unknown"\n  must_rotate_now: false\n\nresume_policy:\n  checkpoint_only_cross_session_resume: true\n  do_not_import_full_prior_transcript: true\n  raw_evidence_policy: "index_only"\n\nstate:\n  completed:\n    - "Issue #31 released."\n  in_progress: []\n  next: []\n  blockers: []\n\nrefs:\n  issue_packet: "docs/agents/issue-packets/issue-31.yaml"\n  worker_result: ""\n  evidence_packet: ""\n  handoff: "docs/agents/handoffs/issue-31.yaml"\n  artifact_bundle: ""\n\nmetadata:\n  updated_by: "Build"\n  updated_at: "2026-05-07T17:00:00+08:00"\n',
+        encoding="utf-8",
+    )
+
+    issue_packet = parse_issue_packet_text(issue_31.read_text(encoding="utf-8"), "docs/agents/issue-packets/issue-31.yaml")
+    next_issue_packet = parse_issue_packet_text(issue_32.read_text(encoding="utf-8"), "docs/agents/issue-packets/issue-32.yaml")
+    ledger = create_initial_ledger(
+        issue_packet=issue_packet,
+        checkpoint_path="docs/agents/runtime/context-checkpoint.yaml",
+        updated_at="2026-05-07T17:00:00+08:00",
+    )
+    ledger["current"] = {"role": "main_orchestrator", "stage": "issue_selection_or_recovery", "status": "queued"}
+    ledger["queuedNextIssue"] = {
+        "selectedAt": "2026-05-07T17:20:00+08:00",
+        "reason": "Release worker completed issue #31.",
+        "record": {
+            "issue_number": next_issue_packet.issue_number,
+            "title": next_issue_packet.title,
+            "branch": next_issue_packet.branch,
+            "issue_packet_path": next_issue_packet.issue_packet_path,
+            "backing_type": next_issue_packet.backing_type,
+            "prior_handoff": next_issue_packet.prior_handoff,
+            "labels": list(next_issue_packet.labels),
+            "parent_reference": next_issue_packet.parent_reference,
+            "dependencies": list(next_issue_packet.dependencies),
+        },
+    }
+    request = build_session_request(
+        ledger,
+        role="main_orchestrator",
+        stage="issue_selection_or_recovery",
+        reason="main_orchestrator recovery for issue #31",
+        title="Recover or continue after issue #31",
+        decision_summary="Consume preselected issue #32.",
+    )
+
+    error = validate_session_request_for_dispatch(request, ledger, base_dir=tmp_path)
+
+    assert error == ""
+    assert request.get("selectedIssueNumber") == "32"
+    assert request.get("selectedIssueBranch") == "agent/issue-32-demo"
+    assert request.get("selectedIssuePacketPath") == "docs/agents/issue-packets/issue-32.yaml"
 
 
 def test_reconcile_verifier_fail_routes_back_to_issue_worker(tmp_path: Path):
@@ -767,6 +1036,63 @@ def test_reconcile_release_success_selects_next_ready_issue(tmp_path: Path):
     assert read_issue(tmp_path, "31") is not None
 
 
+def test_reconcile_release_success_syncs_control_plane_runtime_phase_after_handoff(tmp_path: Path):
+    issue_packets_dir = tmp_path / "docs/agents/issue-packets"
+    issue_packets_dir.mkdir(parents=True, exist_ok=True)
+    issue_31 = issue_packets_dir / "issue-31.yaml"
+    issue_32 = issue_packets_dir / "issue-32.yaml"
+    issue_31.write_text(SAMPLE_ISSUE_PACKET.replace('"42"', '"31"').replace('issue-42', 'issue-31').replace('Demo issue', 'Issue 31').replace('agent/issue-42-demo', 'agent/issue-31-demo'), encoding="utf-8")
+    issue_32.write_text(
+        SAMPLE_ISSUE_PACKET.replace('"42"', '"32"')
+        .replace('issue-42', 'issue-32')
+        .replace('Demo issue', 'Issue 32')
+        .replace('agent/issue-42-demo', 'agent/issue-32-demo')
+        .replace('prior_handoff: "docs/agents/handoffs/issue-41.yaml"', 'prior_handoff: "docs/agents/handoffs/issue-31.yaml"'),
+        encoding="utf-8",
+    )
+
+    checkpoint_path = tmp_path / "docs/agents/runtime/context-checkpoint.yaml"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_path.write_text(
+        'schema_version: "1.0"\nkind: context_checkpoint\nline_cap: 80\n\nsubject:\n  issue_number: "31"\n  branch: "agent/issue-31-demo"\n  role: "main_orchestrator"\n  checkpoint_reason: "selected_afk_issue"\n\ncontext_budget:\n  warning_at_percent: 45\n  stop_and_rotate_at_percent: 50\n  measured_percent_used: "unknown"\n  must_rotate_now: false\n\nresume_policy:\n  checkpoint_only_cross_session_resume: true\n  do_not_import_full_prior_transcript: true\n  raw_evidence_policy: "index_only"\n\nstate:\n  completed:\n    - "Issue #31 released."\n  in_progress: []\n  next: []\n  blockers: []\n\nrefs:\n  issue_packet: "docs/agents/issue-packets/issue-31.yaml"\n  worker_result: ""\n  evidence_packet: ""\n  handoff: "docs/agents/handoffs/issue-31.yaml"\n  artifact_bundle: ""\n\nmetadata:\n  updated_by: "Build"\n  updated_at: "2026-05-07T17:00:00+08:00"\n',
+        encoding="utf-8",
+    )
+
+    issue_packet = parse_issue_packet_text(issue_31.read_text(encoding="utf-8"), "docs/agents/issue-packets/issue-31.yaml")
+    ledger = create_initial_ledger(
+        issue_packet=issue_packet,
+        checkpoint_path="docs/agents/runtime/context-checkpoint.yaml",
+        root_session_agent="build",
+        updated_at="2026-05-07T17:00:00+08:00",
+    )
+    ledger["current"] = {"role": "release_worker", "stage": "release_worker_execution", "status": "queued"}
+    cast(dict[str, str], ledger["artifacts"])["releaseResultPath"] = "docs/agents/release-results/issue-31-pr-88.yaml"
+
+    release_path = tmp_path / "docs/agents/release-results/issue-31-pr-88.yaml"
+    release_path.parent.mkdir(parents=True, exist_ok=True)
+    release_path.write_text(
+        'schema_version: "1.0"\nkind: release_result\nline_cap: 60\nraw_evidence_policy: index_only_refs_no_raw_logs_or_transcripts\nsubject:\n  issue_number: "31"\n  pr_number: "88"\n  branch: "agent/issue-31-demo"\nstatus: "success"\nblocked_reason: "none"\nsummary:\n  outcome: "merged"\n  next_recommended_step: "continue"\nfailure_classification: {kind: "none", retryable: true, routed_to: "main_orchestrator", root_cause_signature: "none"}\nmerge:\n  attempted: true\n  merged: true\n  merged_sha: "abc"\nrole_boundary:\n  actor_role: "release_worker"\n  may_run_final_acceptance_qa: false\n  may_merge_only_after_verifier_pass: true\nmetadata:\n  worker: "r"\n  worker_session_id: "ses-r"\n  completed_at: "2026-05-07T17:20:00+08:00"\n',
+        encoding="utf-8",
+    )
+
+    updated_ledger, decision, request = reconcile_ledger(
+        ledger,
+        session_result_path=tmp_path / "missing.json",
+        artifact_base_dir=tmp_path,
+        updated_at="2026-05-07T17:21:00+08:00",
+    )
+
+    next_issue = read_issue(tmp_path, "32")
+
+    assert decision["action"] == "queue_next_issue"
+    assert request is not None
+    assert cast(dict[str, object], updated_ledger["current"])["role"] == "main_orchestrator"
+    assert next_issue is not None
+    assert next_issue["current_role"] == "main_orchestrator"
+    assert next_issue["current_stage"] == "orchestrator_bootstrap"
+    assert next_issue["current_status"] == "queued"
+
+
 def test_reconcile_recovery_runs_issue_intake_when_local_packet_missing(tmp_path: Path):
     checkpoint_path = tmp_path / "docs/agents/runtime/context-checkpoint.yaml"
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -815,6 +1141,55 @@ def test_reconcile_recovery_runs_issue_intake_when_local_packet_missing(tmp_path
     assert decision["action"] == "queue_next_issue"
     assert request is not None
     assert request["issueNumber"] == "32"
+
+
+def test_queue_orchestrator_recovery_rewrites_checkpoint_for_recovery_stage(tmp_path: Path):
+    checkpoint_path = tmp_path / "docs/agents/runtime/context-checkpoint.yaml"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_path.write_text(
+        'schema_version: "1.0"\nkind: context_checkpoint\nline_cap: 80\n\nsubject:\n  issue_number: "31"\n  branch: "agent/issue-31-demo"\n  role: "main_orchestrator"\n  checkpoint_reason: "selected_afk_issue"\n\ncontext_budget:\n  warning_at_percent: 45\n  stop_and_rotate_at_percent: 50\n  measured_percent_used: "unknown"\n  must_rotate_now: false\n\nresume_policy:\n  checkpoint_only_cross_session_resume: true\n  do_not_import_full_prior_transcript: true\n  raw_evidence_policy: "index_only"\n\nstate:\n  completed:\n    - "Issue #29 released."\n  in_progress:\n    - "Prepare the orchestrator session to enter issue #31 PR flow."\n  next:\n    - "Continue per_issue_flow for issue #31 by creating or switching the issue branch."\n  blockers:\n    - "none"\n\nrefs:\n  issue_packet: "docs/agents/issue-packets/issue-31.yaml"\n  worker_result: ""\n  evidence_packet: ""\n  handoff: ""\n  artifact_bundle: ""\n\nmetadata:\n  updated_by: "Build"\n  updated_at: "2026-05-07T17:00:00+08:00"\n',
+        encoding="utf-8",
+    )
+    current_packet = tmp_path / "docs/agents/issue-packets/issue-31.yaml"
+    current_packet.parent.mkdir(parents=True, exist_ok=True)
+    current_packet.write_text(
+        SAMPLE_ISSUE_PACKET.replace('"42"', '"31"').replace('issue-42', 'issue-31').replace('Demo issue', 'Issue 31').replace('agent/issue-42-demo', 'agent/issue-31-demo'),
+        encoding="utf-8",
+    )
+
+    issue_packet = parse_issue_packet_text(current_packet.read_text(encoding="utf-8"), "docs/agents/issue-packets/issue-31.yaml")
+    ledger = create_initial_ledger(
+        issue_packet=issue_packet,
+        checkpoint_path="docs/agents/runtime/context-checkpoint.yaml",
+        updated_at="2026-05-07T17:00:00+08:00",
+    )
+    ledger["current"] = {"role": "release_worker", "stage": "release_worker_execution", "status": "queued"}
+    cast(dict[str, str], ledger["artifacts"])["releaseResultPath"] = "docs/agents/release-results/issue-31-pr-88.yaml"
+
+    release_path = tmp_path / "docs/agents/release-results/issue-31-pr-88.yaml"
+    release_path.parent.mkdir(parents=True, exist_ok=True)
+    release_path.write_text(
+        'schema_version: "1.0"\nkind: release_result\nline_cap: 60\nraw_evidence_policy: index_only_refs_no_raw_logs_or_transcripts\nsubject:\n  issue_number: "31"\n  pr_number: "88"\n  branch: "agent/issue-31-demo"\nstatus: "success"\nblocked_reason: "none"\nsummary:\n  outcome: "merged"\n  next_recommended_step: "continue"\nfailure_classification: {kind: "none", retryable: true, routed_to: "main_orchestrator", root_cause_signature: "none"}\nmerge:\n  attempted: true\n  merged: true\n  merged_sha: "abc"\nrole_boundary:\n  actor_role: "release_worker"\n  may_run_final_acceptance_qa: false\n  may_merge_only_after_verifier_pass: true\nmetadata:\n  worker: "r"\n  worker_session_id: "ses-r"\n  completed_at: "2026-05-07T17:20:00+08:00"\n',
+        encoding="utf-8",
+    )
+
+    with patch("scripts.orchestrator_supervisor.run_issue_packet_intake", return_value=False):
+        updated_ledger, decision, request = reconcile_ledger(
+            ledger,
+            session_result_path=tmp_path / "missing.json",
+            artifact_base_dir=tmp_path,
+            updated_at="2026-05-07T17:21:00+08:00",
+        )
+
+    updated_checkpoint = checkpoint_path.read_text(encoding="utf-8")
+
+    assert updated_ledger is not None
+    assert decision["action"] == "queue_next_session"
+    assert request is not None
+    assert '  role: "main_orchestrator"' in updated_checkpoint
+    assert '    - "Continue supervisor recovery for issue #31."' in updated_checkpoint
+    assert '    - "Select the next ready issue packet or remain in orchestrator recovery if none are available."' in updated_checkpoint
+    assert '  artifact_bundle: "docs/agents/release-results/issue-31-pr-88.yaml"' in updated_checkpoint
 
 
 def test_select_next_issue_packet_skips_unreleased_dependencies(tmp_path: Path):
@@ -998,6 +1373,45 @@ def test_select_next_issue_packet_downgrades_stale_db_rank_for_now_ineligible_is
 
     assert selected is not None
     assert selected.issue_number == "31"
+
+
+def test_select_next_issue_packet_skips_db_packet_when_local_file_is_missing(tmp_path: Path):
+    packets_dir = tmp_path / "docs/agents/issue-packets"
+    packets_dir.mkdir(parents=True, exist_ok=True)
+    packet_30 = packets_dir / "issue-30.yaml"
+    packet_31 = packets_dir / "issue-31.yaml"
+    packet_30.write_text(
+        SAMPLE_ISSUE_PACKET.replace('"42"', '"30"').replace('issue-42', 'issue-30').replace('Demo issue', 'Issue 30').replace('agent/issue-42-demo', 'agent/issue-30-demo'),
+        encoding="utf-8",
+    )
+    packet_31.write_text(
+        SAMPLE_ISSUE_PACKET.replace('"42"', '"31"').replace('issue-42', 'issue-31').replace('Demo issue', 'Issue 31').replace('agent/issue-42-demo', 'agent/issue-31-demo'),
+        encoding="utf-8",
+    )
+
+    selected = select_next_issue_packet(
+        tmp_path,
+        workflow={"checkpointPath": "docs/agents/runtime/context-checkpoint.yaml"},
+        current_issue={"number": "30", "parentReference": "https://github.com/example/issues/1"},
+    )
+
+    assert selected is not None
+    assert selected.issue_number == "31"
+
+    packet_31.unlink()
+
+    selected_after_delete = select_next_issue_packet(
+        tmp_path,
+        workflow={"checkpointPath": "docs/agents/runtime/context-checkpoint.yaml"},
+        current_issue={"number": "30", "parentReference": "https://github.com/example/issues/1"},
+    )
+    issue_31 = orchestrator_supervisor.read_issue(tmp_path, "31")
+
+    assert selected_after_delete is not None
+    assert selected_after_delete.issue_number == "31"
+    assert issue_31 is not None
+    assert issue_31["rank_score"] > 0
+    assert packet_31.exists()
 
 
 def test_run_issue_packet_intake_uses_consumer_project_github_repo(tmp_path: Path):
@@ -1854,6 +2268,123 @@ def test_reconcile_with_dispatch_now_does_not_create_root_session_for_subagent_r
     assert not session_result_path.exists()
 
 
+def test_advance_child_rejects_bootstrap_ledger(tmp_path: Path, capsys) -> None:
+    issue_packet_path = tmp_path / "docs/agents/issue-packets/issue-42.yaml"
+    issue_packet_path.parent.mkdir(parents=True, exist_ok=True)
+    issue_packet_path.write_text(SAMPLE_ISSUE_PACKET, encoding="utf-8")
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger_path = tmp_path / ".opencode/runtime/orchestrator-ledger.json"
+    request_path = tmp_path / ".opencode/runtime/new-session-request.json"
+    session_result_path = tmp_path / ".opencode/runtime/new-session-result.json"
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    _ = ledger_path.write_text(json.dumps(ledger, indent=2), encoding="utf-8")
+
+    exit_code = orchestrator_supervisor.main(
+        [
+            "advance-child",
+            "--ledger",
+            str(ledger_path),
+            "--request",
+            str(request_path),
+            "--session-result",
+            str(session_result_path),
+            "--updated-at",
+            "2026-05-07T17:10:00+08:00",
+        ]
+    )
+
+    captured = capsys.readouterr()
+
+    assert exit_code == 2
+    assert "advance-child requires the on-disk ledger to already be queued on a child role" in captured.err
+    assert not request_path.exists()
+    assert not session_result_path.exists()
+
+
+def test_advance_child_accepts_issue_worker_and_advances_to_verifier(tmp_path: Path) -> None:
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(
+        issue_packet=issue_packet,
+        checkpoint_path="docs/agents/runtime/context-checkpoint.yaml",
+        primary_workspace_root=str(tmp_path),
+        updated_at="2026-05-07T17:00:00+08:00",
+    )
+    ledger["current"] = {"role": "issue_worker", "stage": "issue_worker_execution", "status": "queued"}
+    cast(dict[str, int], ledger["attempts"])["issue_worker"] = 1
+    ledger_path = tmp_path / ".opencode/runtime/orchestrator-ledger.json"
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    write_ledger_file(ledger_path, ledger)
+
+    worker_result_path = tmp_path / "docs/agents/worker-results/issue-42.yaml"
+    worker_result_path.parent.mkdir(parents=True, exist_ok=True)
+    worker_result_path.write_text(
+        """schema_version: \"1.0\"
+kind: worker_result
+line_cap: 80
+status: \"success\"
+failure_classification: {kind: \"none\", retryable: true, routed_to: \"pr_verifier\", root_cause_signature: \"none\"}
+summary:
+  objective: \"demo\"
+  outcome: \"done\"
+files_changed:
+  - path: \"foo\"
+    summary: \"bar\"
+verification:
+  note: \"n\"
+  gates:
+    tdd_gate: \"pass\"
+    implementation_self_check_gate: \"pass\"
+    git_gate: \"pass\"
+  implementation_self_checks:
+    - command: \"pytest\"
+      result: \"pass\"
+      evidence_ref: \"local\"
+      summary: \"ok\"
+  final_acceptance_claim: false
+evidence_packet_refs:
+  worker_artifact_bundle: \"\"
+  verifier_packet: \"docs/agents/evidence/issue-42-pr-77.yaml\"
+  raw_evidence_policy: \"stored_outside_main_agent_context\"
+role_boundary:
+  actor_role: \"issue_worker\"
+  may_execute_implementation_self_checks: true
+  may_execute_final_acceptance_qa: false
+  may_emit_final_verification: false
+  verifier_packet_required_for_completion: true
+pr:
+  number: \"77\"
+  url: \"https://example/pr/77\"
+  ready_for_review: true
+blockers:
+  - \"none\"
+next_recommended_step: \"Spawn verifier\"
+metadata:
+  worker: \"w\"
+  worker_session_id: \"ses\"
+  completed_at: \"2026-05-07T17:10:00+08:00\"
+""",
+        encoding="utf-8",
+    )
+
+    exit_code = orchestrator_supervisor.main(
+        [
+            "advance-child",
+            "--ledger",
+            str(ledger_path),
+            "--updated-at",
+            "2026-05-07T17:11:00+08:00",
+        ]
+    )
+
+    reconciled_ledger = cast(dict[str, object], json.loads(ledger_path.read_text(encoding="utf-8")))
+    current = cast(dict[str, object], reconciled_ledger["current"])
+
+    assert exit_code == 0
+    assert current["role"] == "pr_verifier"
+    assert current["stage"] == "pr_verifier_execution"
+
+
 def test_reconcile_verifier_marks_issue_verifying(tmp_path: Path):
     issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
@@ -2497,6 +3028,115 @@ def test_reconcile_issue_worker_without_root_session_evidence_keeps_dispatching_
     assert issue["state"] == "dispatching"
 
 
+def test_reconcile_quarantines_stale_dispatching_issue_worker_without_root_session_evidence(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "issue_worker", "stage": "issue_worker_execution", "status": "queued"}
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="dispatching",
+        command_id="cmd-dispatching",
+        updated_at="2026-05-07T17:00:00+08:00",
+    )
+
+    with patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+        updated_ledger, decision, request = reconcile_ledger(
+            ledger,
+            session_result_path=tmp_path / "missing.json",
+            artifact_base_dir=tmp_path,
+            updated_at="2026-05-07T17:16:00+08:00",
+        )
+
+    issue = read_issue(tmp_path, "42")
+
+    assert updated_ledger is ledger
+    assert decision["action"] == "hold_quarantined_issue"
+    assert request is None
+    assert issue is not None
+    assert issue["state"] == "quarantined"
+
+
+def test_reconcile_quarantines_stale_queued_pr_verifier_with_stale_root_heartbeat(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "pr_verifier", "stage": "pr_verifier_execution", "status": "queued"}
+    cast(dict[str, str], ledger["artifacts"])["evidencePacketPath"] = "docs/agents/evidence/issue-42-pr-77.yaml"
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="verifying",
+        command_id="cmd-verifying",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_root_session_id="ses-root-42",
+    )
+    connection = sqlite3.connect(tmp_path / ".opencode/runtime/control-plane.sqlite3")
+    try:
+        _ = connection.execute(
+            "UPDATE issues SET last_event_at = ? WHERE issue_number = ?",
+            ("2026-05-07T17:00:00+08:00", "42"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+        updated_ledger, decision, request = reconcile_ledger(
+            ledger,
+            session_result_path=tmp_path / "missing.json",
+            artifact_base_dir=tmp_path,
+            updated_at="2026-05-07T17:16:00+08:00",
+        )
+
+    issue = read_issue(tmp_path, "42")
+
+    assert updated_ledger is ledger
+    assert decision["action"] == "hold_quarantined_issue"
+    assert request is None
+    assert issue is not None
+    assert issue["state"] == "quarantined"
+
+
+def test_reconcile_quarantines_stale_queued_release_worker_with_stale_root_heartbeat(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "release_worker", "stage": "release_worker_execution", "status": "queued"}
+    cast(dict[str, str], ledger["artifacts"])["releaseResultPath"] = "docs/agents/release-results/issue-42-pr-77.yaml"
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="verifying",
+        command_id="cmd-verifying",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_root_session_id="ses-root-42",
+    )
+    connection = sqlite3.connect(tmp_path / ".opencode/runtime/control-plane.sqlite3")
+    try:
+        _ = connection.execute(
+            "UPDATE issues SET last_event_at = ? WHERE issue_number = ?",
+            ("2026-05-07T17:00:00+08:00", "42"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+        updated_ledger, decision, request = reconcile_ledger(
+            ledger,
+            session_result_path=tmp_path / "missing.json",
+            artifact_base_dir=tmp_path,
+            updated_at="2026-05-07T17:16:00+08:00",
+        )
+
+    issue = read_issue(tmp_path, "42")
+
+    assert updated_ledger is ledger
+    assert decision["action"] == "hold_quarantined_issue"
+    assert request is None
+    assert issue is not None
+    assert issue["state"] == "quarantined"
+
+
 def test_reconcile_release_success_keeps_issue_completed(tmp_path: Path):
     issue_packets_dir = tmp_path / "docs/agents/issue-packets"
     issue_packets_dir.mkdir(parents=True, exist_ok=True)
@@ -2636,6 +3276,296 @@ def test_reconcile_ignores_stale_session_result_for_different_issue_after_queue_
     assert next_decision["next_role"] == "issue_worker"
     assert next_request is None
     assert cast(dict[str, object], next_ledger.get("lastSessionResult", {})) == {}
+
+
+def test_reconcile_recovery_consumes_persisted_selected_next_issue_before_reselecting(tmp_path: Path):
+    issue_packets_dir = tmp_path / "docs/agents/issue-packets"
+    issue_packets_dir.mkdir(parents=True, exist_ok=True)
+    issue_31 = issue_packets_dir / "issue-31.yaml"
+    issue_32 = issue_packets_dir / "issue-32.yaml"
+    issue_33 = issue_packets_dir / "issue-33.yaml"
+    issue_31.write_text(
+        SAMPLE_ISSUE_PACKET.replace('"42"', '"31"').replace('issue-42', 'issue-31').replace('Demo issue', 'Issue 31').replace('agent/issue-42-demo', 'agent/issue-31-demo'),
+        encoding="utf-8",
+    )
+    issue_32.write_text(
+        SAMPLE_ISSUE_PACKET.replace('"42"', '"32"').replace('issue-42', 'issue-32').replace('Demo issue', 'Issue 32').replace('agent/issue-42-demo', 'agent/issue-32-demo'),
+        encoding="utf-8",
+    )
+    issue_33.write_text(
+        SAMPLE_ISSUE_PACKET.replace('"42"', '"33"').replace('issue-42', 'issue-33').replace('Demo issue', 'Issue 33').replace('agent/issue-42-demo', 'agent/issue-33-demo'),
+        encoding="utf-8",
+    )
+    checkpoint_path = tmp_path / "docs/agents/runtime/context-checkpoint.yaml"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_path.write_text(
+        'schema_version: "1.0"\nkind: context_checkpoint\nline_cap: 80\n\nsubject:\n  issue_number: "31"\n  branch: "agent/issue-31-demo"\n  role: "main_orchestrator"\n  checkpoint_reason: "selected_afk_issue"\n\ncontext_budget:\n  warning_at_percent: 45\n  stop_and_rotate_at_percent: 50\n  measured_percent_used: "unknown"\n  must_rotate_now: false\n\nresume_policy:\n  checkpoint_only_cross_session_resume: true\n  do_not_import_full_prior_transcript: true\n  raw_evidence_policy: "index_only"\n\nstate:\n  completed:\n    - "Issue #31 released."\n  in_progress: []\n  next: []\n  blockers: []\n\nrefs:\n  issue_packet: "docs/agents/issue-packets/issue-31.yaml"\n  worker_result: ""\n  evidence_packet: ""\n  handoff: "docs/agents/handoffs/issue-31.yaml"\n  artifact_bundle: ""\n\nmetadata:\n  updated_by: "Build"\n  updated_at: "2026-05-07T17:00:00+08:00"\n',
+        encoding="utf-8",
+    )
+
+    issue_packet = parse_issue_packet_text(issue_31.read_text(encoding="utf-8"), "docs/agents/issue-packets/issue-31.yaml")
+    selected_issue_packet = parse_issue_packet_text(issue_32.read_text(encoding="utf-8"), "docs/agents/issue-packets/issue-32.yaml")
+    ledger = create_initial_ledger(
+        issue_packet=issue_packet,
+        checkpoint_path="docs/agents/runtime/context-checkpoint.yaml",
+        updated_at="2026-05-07T17:00:00+08:00",
+    )
+    ledger["current"] = {"role": "main_orchestrator", "stage": "issue_selection_or_recovery", "status": "queued"}
+    ledger["queuedNextIssue"] = {
+        "selectedAt": "2026-05-07T17:20:00+08:00",
+        "reason": "Release worker completed issue #31.",
+        "record": {
+            "issue_number": selected_issue_packet.issue_number,
+            "title": selected_issue_packet.title,
+            "branch": selected_issue_packet.branch,
+            "issue_packet_path": selected_issue_packet.issue_packet_path,
+            "backing_type": selected_issue_packet.backing_type,
+            "prior_handoff": selected_issue_packet.prior_handoff,
+            "labels": list(selected_issue_packet.labels),
+            "parent_reference": selected_issue_packet.parent_reference,
+            "dependencies": list(selected_issue_packet.dependencies),
+        },
+    }
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="31",
+        state="completed",
+        command_id="cmd-completed",
+        updated_at="2026-05-07T17:21:00+08:00",
+    )
+    session_result_path = tmp_path / ".opencode/runtime/new-session-result.json"
+    session_result_path.parent.mkdir(parents=True, exist_ok=True)
+    session_result_path.write_text(
+        json.dumps(
+            {
+                "status": "success",
+                "sourceSessionID": "supervisor-recovery",
+                "rootSessionID": "ses-root-31-recovery",
+                "issueNumber": "31",
+                "branch": "agent/issue-31-demo",
+                "role": "main_orchestrator",
+                "stage": "issue_selection_or_recovery",
+                "recordedAt": "2026-05-07T17:21:30+08:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    next_ledger, next_decision, next_request = reconcile_ledger(
+        ledger,
+        session_result_path=session_result_path,
+        artifact_base_dir=tmp_path,
+        updated_at="2026-05-07T17:22:00+08:00",
+    )
+
+    next_issue = cast(dict[str, object], next_ledger["issue"])
+
+    assert next_issue["number"] == "32"
+    assert next_decision["action"] == "queue_next_issue"
+    assert next_request is not None
+    assert next_request["issueNumber"] == "32"
+    assert next_ledger.get("queuedNextIssue") is None
+
+
+def test_reconcile_recovery_discards_persisted_selected_issue_when_it_is_no_longer_ready(tmp_path: Path):
+    issue_packets_dir = tmp_path / "docs/agents/issue-packets"
+    issue_packets_dir.mkdir(parents=True, exist_ok=True)
+    issue_31 = issue_packets_dir / "issue-31.yaml"
+    issue_32 = issue_packets_dir / "issue-32.yaml"
+    issue_33 = issue_packets_dir / "issue-33.yaml"
+    issue_31.write_text(
+        SAMPLE_ISSUE_PACKET.replace('"42"', '"31"').replace('issue-42', 'issue-31').replace('Demo issue', 'Issue 31').replace('agent/issue-42-demo', 'agent/issue-31-demo'),
+        encoding="utf-8",
+    )
+    issue_32.write_text(
+        SAMPLE_ISSUE_PACKET.replace('"42"', '"32"')
+        .replace('issue-42', 'issue-32')
+        .replace('Demo issue', 'Issue 32')
+        .replace('agent/issue-42-demo', 'agent/issue-32-demo')
+        .replace('labels: [ready-for-agent]', 'labels: [agent-in-progress]'),
+        encoding="utf-8",
+    )
+    issue_33.write_text(
+        SAMPLE_ISSUE_PACKET.replace('"42"', '"33"').replace('issue-42', 'issue-33').replace('Demo issue', 'Issue 33').replace('agent/issue-42-demo', 'agent/issue-33-demo'),
+        encoding="utf-8",
+    )
+    checkpoint_path = tmp_path / "docs/agents/runtime/context-checkpoint.yaml"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_path.write_text(
+        'schema_version: "1.0"\nkind: context_checkpoint\nline_cap: 80\n\nsubject:\n  issue_number: "31"\n  branch: "agent/issue-31-demo"\n  role: "main_orchestrator"\n  checkpoint_reason: "selected_afk_issue"\n\ncontext_budget:\n  warning_at_percent: 45\n  stop_and_rotate_at_percent: 50\n  measured_percent_used: "unknown"\n  must_rotate_now: false\n\nresume_policy:\n  checkpoint_only_cross_session_resume: true\n  do_not_import_full_prior_transcript: true\n  raw_evidence_policy: "index_only"\n\nstate:\n  completed:\n    - "Issue #31 released."\n  in_progress: []\n  next: []\n  blockers: []\n\nrefs:\n  issue_packet: "docs/agents/issue-packets/issue-31.yaml"\n  worker_result: ""\n  evidence_packet: ""\n  handoff: "docs/agents/handoffs/issue-31.yaml"\n  artifact_bundle: ""\n\nmetadata:\n  updated_by: "Build"\n  updated_at: "2026-05-07T17:00:00+08:00"\n',
+        encoding="utf-8",
+    )
+
+    issue_packet = parse_issue_packet_text(issue_31.read_text(encoding="utf-8"), "docs/agents/issue-packets/issue-31.yaml")
+    stale_selected_issue_packet = parse_issue_packet_text(issue_32.read_text(encoding="utf-8"), "docs/agents/issue-packets/issue-32.yaml")
+    ledger = create_initial_ledger(
+        issue_packet=issue_packet,
+        checkpoint_path="docs/agents/runtime/context-checkpoint.yaml",
+        updated_at="2026-05-07T17:00:00+08:00",
+    )
+    ledger["current"] = {"role": "main_orchestrator", "stage": "issue_selection_or_recovery", "status": "queued"}
+    ledger["queuedNextIssue"] = {
+        "selectedAt": "2026-05-07T17:20:00+08:00",
+        "reason": "Release worker completed issue #31.",
+        "record": {
+            "issue_number": stale_selected_issue_packet.issue_number,
+            "title": stale_selected_issue_packet.title,
+            "branch": stale_selected_issue_packet.branch,
+            "issue_packet_path": stale_selected_issue_packet.issue_packet_path,
+            "backing_type": stale_selected_issue_packet.backing_type,
+            "prior_handoff": stale_selected_issue_packet.prior_handoff,
+            "labels": list(stale_selected_issue_packet.labels),
+            "parent_reference": stale_selected_issue_packet.parent_reference,
+            "dependencies": list(stale_selected_issue_packet.dependencies),
+        },
+    }
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="31",
+        state="completed",
+        command_id="cmd-completed",
+        updated_at="2026-05-07T17:21:00+08:00",
+    )
+    session_result_path = tmp_path / ".opencode/runtime/new-session-result.json"
+    session_result_path.parent.mkdir(parents=True, exist_ok=True)
+    session_result_path.write_text(
+        json.dumps(
+            {
+                "status": "success",
+                "sourceSessionID": "supervisor-recovery",
+                "rootSessionID": "ses-root-31-recovery",
+                "issueNumber": "31",
+                "branch": "agent/issue-31-demo",
+                "role": "main_orchestrator",
+                "stage": "issue_selection_or_recovery",
+                "recordedAt": "2026-05-07T17:21:30+08:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    next_ledger, next_decision, next_request = reconcile_ledger(
+        ledger,
+        session_result_path=session_result_path,
+        artifact_base_dir=tmp_path,
+        updated_at="2026-05-07T17:22:00+08:00",
+    )
+
+    next_issue = cast(dict[str, object], next_ledger["issue"])
+
+    assert next_issue["number"] == "33"
+    assert next_decision["action"] == "queue_next_issue"
+    assert next_request is not None
+    assert next_request["issueNumber"] == "33"
+    assert next_ledger.get("queuedNextIssue") is None
+
+
+def test_reconcile_skips_runtime_phase_rebuild_for_completed_issue(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-31.yaml")
+    ledger = create_initial_ledger(
+        issue_packet=issue_packet,
+        checkpoint_path="docs/agents/runtime/context-checkpoint.yaml",
+        updated_at="2026-05-07T17:00:00+08:00",
+    )
+    ledger["current"] = {"role": "pr_verifier", "stage": "pr_verifier_execution", "status": "pass"}
+    cast(dict[str, str], ledger["artifacts"])["evidencePacketPath"] = "docs/agents/evidence/issue-31-pr-88.yaml"
+
+    checkpoint_path = tmp_path / "docs/agents/runtime/context-checkpoint.yaml"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_path.write_text(
+        'schema_version: "1.0"\nkind: context_checkpoint\nline_cap: 80\n\nsubject:\n  issue_number: "31"\n  branch: "agent/issue-31-demo"\n  role: "main_orchestrator"\n  checkpoint_reason: "selected_afk_issue"\n\ncontext_budget:\n  warning_at_percent: 45\n  stop_and_rotate_at_percent: 50\n  measured_percent_used: "unknown"\n  must_rotate_now: false\n\nresume_policy:\n  checkpoint_only_cross_session_resume: true\n  do_not_import_full_prior_transcript: true\n  raw_evidence_policy: "index_only"\n\nstate:\n  completed:\n    - "Issue #31 released."\n  in_progress: []\n  next: []\n  blockers: []\n\nrefs:\n  issue_packet: "docs/agents/issue-packets/issue-31.yaml"\n  worker_result: ""\n  evidence_packet: ""\n  handoff: "docs/agents/handoffs/issue-31.yaml"\n  artifact_bundle: ""\n\nmetadata:\n  updated_by: "Build"\n  updated_at: "2026-05-07T17:00:00+08:00"\n',
+        encoding="utf-8",
+    )
+
+    evidence_path = tmp_path / "docs/agents/evidence/issue-31-pr-88.yaml"
+    evidence_path.parent.mkdir(parents=True, exist_ok=True)
+    evidence_path.write_text(
+        'schema_version: "1.0"\nkind: evidence_packet\nline_cap: 60\nraw_evidence_policy: index_only_manifest_no_raw_logs_or_traces\n\nsubject:\n  type: "issue_pr"\n  issue_number: "31"\n  pr_number: "88"\n  phase: "verification"\n  branch: "agent/issue-31-demo"\n  sha: "abc"\n\nverifier:\n  actor: "OpenCode pr_verifier"\n  actor_role: "pr_verifier"\n  verifier_session_id: "ses-v"\n  started_at: "2026-05-07T17:10:00+08:00"\n  completed_at: "2026-05-07T17:20:00+08:00"\n\nproof_of_separation:\n  worker_result_ref: "docs/agents/worker-results/issue-31.yaml"\n  worker_actor: "OpenCode issue_worker"\n  worker_session_id: "ses-w"\n  verifier_actor: "OpenCode pr_verifier"\n  verifier_session_id: "ses-v"\n  verifier_is_distinct_from_worker: true\n  verifier_read_worker_result_only: false\n\nstatus: "pass"\nfailure_classification: {kind: "none", retryable: true, routed_to: "none", root_cause_signature: "none"}\n\ntest_case_verification: {applies: false, test_case_id: "", target_case: "n/a", regression_bucket: "n/a", failure_signature: "none", artifact_manifest_ref: ""}\n\nacceptance_criteria_matrix:\n  - {ac_id: "AC1", status: "pass", evidence_ref: "docs/agents/issue-tracker.md:1", note: "ok"}\n\ngates:\n  diagnostics_and_build_gate: {status: "pass", evidence_ref: "npm test", note: "ok"}\n  surface_qa_gate: {status: "pass", evidence_ref: "tracker", note: "ok"}\n  review_gate: {status: "pass", evidence_ref: "gh pr view", note: "ok"}\n\nrole_boundary:\n  acceptance_qa_owner: "pr_verifier"\n  main_agent_ran_issue_qa: false\n  worker_self_checks_are_not_final_acceptance: true\n\nartifact_manifest:\n  bundle_ref: "docs/agents/evidence/issue-31-pr-88.yaml"\n  retention: "repo artifact retained with PR evidence"\n  items: []\n\ncompact_summary:\n  outcome: "ok"\n  automated_checks: "ok"\n  manual_qa: "ok"\n  risks_or_limitations: ["none"]\n\npr:\n  number: "88"\n  url: "https://example.invalid/pr/88"\n\nnext_recommended_step: "Continue to release_worker."\n',
+        encoding="utf-8",
+    )
+
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="31",
+        state="completed",
+        command_id="cmd-completed",
+        updated_at="2026-05-07T17:19:00+08:00",
+        current_verifier_session_id="ses-v",
+    )
+
+    updated_ledger, decision, request = reconcile_ledger(
+        ledger,
+        session_result_path=tmp_path / "missing.json",
+        artifact_base_dir=tmp_path,
+        updated_at="2026-05-07T17:21:00+08:00",
+    )
+
+    issue = read_issue(tmp_path, "31")
+
+    assert updated_ledger is not None
+    assert decision["action"] == "delegate_subagent"
+    assert decision["next_role"] == "release_worker"
+    assert request is None
+    assert issue is not None
+    assert issue["state"] == "completed"
+
+
+def test_reconcile_pr_verifier_accepts_nested_compact_summary_next_step(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "pr_verifier", "stage": "pr_verifier_execution", "status": "queued"}
+    cast(dict[str, str], ledger["artifacts"])["workerResultPath"] = "docs/agents/worker-results/issue-42.yaml"
+    cast(dict[str, str], ledger["artifacts"])["evidencePacketPath"] = "docs/agents/evidence/issue-42-pr-77.yaml"
+
+    worker_result_path = tmp_path / "docs/agents/worker-results/issue-42.yaml"
+    worker_result_path.parent.mkdir(parents=True, exist_ok=True)
+    worker_result_path.write_text(
+        """schema_version: "1.0"
+kind: worker_result
+line_cap: 80
+status: "success"
+next_recommended_step: "Run verifier"
+pr:
+  number: "77"
+failure_classification: {kind: "none", retryable: true, routed_to: "pr_verifier", root_cause_signature: "none"}
+metadata:
+  completed_at: "2026-05-07T17:10:00+08:00"
+""",
+        encoding="utf-8",
+    )
+    evidence_path = tmp_path / "docs/agents/evidence/issue-42-pr-77.yaml"
+    evidence_path.parent.mkdir(parents=True, exist_ok=True)
+    evidence_path.write_text(
+        """schema_version: "1.0"
+kind: evidence_packet
+line_cap: 60
+status: "pass"
+subject:
+  issue_number: "42"
+  pr_number: "77"
+verifier:
+  verifier_session_id: "ses-v"
+compact_summary:
+  outcome: "ok"
+  next_recommended_step: "Advance to release"
+failure_classification: {kind: "none", retryable: true, routed_to: "none", root_cause_signature: "none"}
+""",
+        encoding="utf-8",
+    )
+
+    updated_ledger, decision, request = reconcile_ledger(
+        ledger,
+        session_result_path=tmp_path / "missing.json",
+        artifact_base_dir=tmp_path,
+        updated_at="2026-05-07T17:11:00+08:00",
+    )
+
+    artifacts = cast(dict[str, object], updated_ledger["artifacts"])
+
+    assert decision["action"] == "delegate_subagent"
+    assert decision["next_role"] == "release_worker"
+    assert request is None
+    assert artifacts["releaseResultPath"] == "docs/agents/release-results/issue-42-pr-77.yaml"
 
 
 def test_reconcile_release_blocked_exhaustion_marks_issue_failed(tmp_path: Path):
@@ -2940,9 +3870,18 @@ def test_inspect_command_prints_control_plane_snapshot(tmp_path: Path):
         ])
 
     payload = cast(dict[str, object], json.loads(output.getvalue()))
+    schema = cast(dict[str, object], payload["schema"])
+    tables = cast(dict[str, object], schema["tables"])
+    issue_table = cast(dict[str, object], tables["issues"])
+    issue_columns = cast(list[dict[str, object]], issue_table["columns"])
+    issue_column_names = [str(column["name"]) for column in issue_columns]
 
     assert exit_code == 0
-    assert set(payload) == {"issue", "latestDecision", "latestGitHubSyncAttempt"}
+    assert set(payload) == {"schema", "issue", "latestDecision", "latestGitHubSyncAttempt"}
+    assert schema["dbPath"] == str(tmp_path / ".opencode/runtime/control-plane.sqlite3")
+    assert "artifact_refs_json" in issue_column_names
+    assert "artifact_status_json" in issue_column_names
+    assert "issue_packet_json" in issue_column_names
     assert cast(dict[str, object], payload["issue"])["issue_number"] == "42"
     assert cast(dict[str, object], payload["latestDecision"])["command_id"] == "cmd-claim"
     assert cast(dict[str, object], payload["latestGitHubSyncAttempt"])["command_id"] == "cmd-gh"

@@ -21,6 +21,7 @@ from scripts.control_plane_db import (
     append_issue_event,
     append_issue_history,
     completed_issue_numbers,
+    describe_control_plane_schema,
     ensure_control_plane_db,
     ensure_issue_row,
     ingest_issue_packet,
@@ -50,10 +51,12 @@ class IssuePacketRecord(Protocol):
     title: str
     branch: str
     issue_packet_path: str
+    backing_type: str
     prior_handoff: str
     labels: list[str]
     parent_reference: str
     dependencies: list[str]
+    raw_text: str
 
 
 def _load_artifact_helpers() -> ModuleType:
@@ -301,6 +304,9 @@ class SessionRequest(TypedDict):
     stage: str
     issueNumber: str
     branch: str
+    selectedIssueNumber: NotRequired[str]
+    selectedIssueBranch: NotRequired[str]
+    selectedIssuePacketPath: NotRequired[str]
 
 
 class SessionResult(TypedDict, total=False):
@@ -511,6 +517,80 @@ def _quarantine_running_issue_without_root_session(
         reason=(
             f"Issue #{issue['number']} is marked running without a recorded root session id; "
             "treat it as an orphaned dispatch and require fenced resume or terminal failure."
+        ),
+        updated_at=updated_at,
+    )
+    return True
+
+
+def _quarantine_stale_dispatching_issue_without_root_session(
+    *,
+    base_dir: Path,
+    ledger: JsonObject,
+    current: dict[str, str],
+    runtime_issue: dict[str, object],
+    updated_at: str,
+) -> bool:
+    if current.get("role") != "issue_worker" or current.get("status") != "queued":
+        return False
+    if str(runtime_issue.get("state") or "") != "dispatching":
+        return False
+    if str(runtime_issue.get("current_root_session_id") or ""):
+        return False
+
+    dispatching_at = str(runtime_issue.get("dispatching_at") or runtime_issue.get("updated_at") or "")
+    current_time = _parse_iso8601(updated_at)
+    dispatching_time = _parse_iso8601(dispatching_at)
+    if current_time is None or dispatching_time is None:
+        return False
+    if current_time - dispatching_time <= timedelta(seconds=ROOT_HEARTBEAT_TIMEOUT_SECONDS):
+        return False
+
+    issue = cast(dict[str, str], ledger["issue"])
+    quarantine_issue_execution(
+        base_dir=base_dir,
+        issue_number=issue["number"],
+        reason=(
+            f"Issue #{issue['number']} stayed in dispatching without a recorded root session id since {dispatching_at}; "
+            "treat it as an orphaned queued issue_worker dispatch and quarantine before redispatch."
+        ),
+        updated_at=updated_at,
+    )
+    return True
+
+
+def _quarantine_stale_queued_subagent_with_stale_root(
+    *,
+    base_dir: Path,
+    ledger: JsonObject,
+    current: dict[str, str],
+    runtime_issue: dict[str, object],
+    updated_at: str,
+) -> bool:
+    if current.get("status") != "queued":
+        return False
+    if current.get("role") not in {"issue_worker", "pr_verifier", "release_worker"}:
+        return False
+    if str(runtime_issue.get("state") or "") not in {"running", "verifying"}:
+        return False
+    root_session_id = str(runtime_issue.get("current_root_session_id") or "")
+    last_event_at = str(runtime_issue.get("last_event_at") or "")
+    if not root_session_id or not last_event_at:
+        return False
+    current_time = _parse_iso8601(updated_at)
+    last_event_time = _parse_iso8601(last_event_at)
+    if current_time is None or last_event_time is None:
+        return False
+    if current_time - last_event_time <= timedelta(seconds=ROOT_HEARTBEAT_TIMEOUT_SECONDS):
+        return False
+
+    issue = cast(dict[str, str], ledger["issue"])
+    quarantine_issue_execution(
+        base_dir=base_dir,
+        issue_number=issue["number"],
+        reason=(
+            f"Queued {current['role']} for issue #{issue['number']} outlived root session heartbeat {root_session_id} after last event at {last_event_at}; "
+            "treat it as an orphaned queued subagent and quarantine before redispatch."
         ),
         updated_at=updated_at,
     )
@@ -864,7 +944,7 @@ def _sync_runtime_phase_to_control_plane_state(
     current_root_session_id = str(runtime_issue.get("current_root_session_id") or "") if runtime_issue else ""
     last_session_result = cast(JsonObject, ledger.get("lastSessionResult", {}))
     session_result_root_session_id = str(last_session_result.get("rootSessionID") or "")
-    if current_state == "quarantined":
+    if current_state in {"quarantined", "completed", "failed"}:
         return
     if current_state == desired_state:
         return
@@ -876,6 +956,90 @@ def _sync_runtime_phase_to_control_plane_state(
         desired_state=desired_state,
         updated_at=updated_at,
     )
+
+
+def _sync_runtime_phase_metadata(
+    *,
+    base_dir: Path,
+    issue_number: str,
+    current: dict[str, str],
+    attempts: dict[str, int],
+    limits: dict[str, int],
+    last_failure: dict[str, object],
+    workflow: dict[str, object],
+    automation: dict[str, object],
+    artifacts: dict[str, object],
+    updated_at: str,
+) -> None:
+    _ = sync_issue_runtime_context(
+        base_dir,
+        issue_number=issue_number,
+        updated_at=updated_at,
+        current_role=current.get("role", ""),
+        current_stage=current.get("stage", ""),
+        current_status=current.get("status", ""),
+        attempts=attempts,
+        limits=limits,
+        last_failure=last_failure,
+        resume_snapshot=workflow,
+        automation_flags=automation,
+        artifact_refs=artifacts,
+    )
+
+
+def _recover_stale_bootstrap_with_worker_artifact(
+    *,
+    ledger: JsonObject,
+    base_dir: Path,
+    updated_at: str,
+) -> bool:
+    current = cast(dict[str, str], ledger.get("current", {}))
+    if current.get("role") != "main_orchestrator" or current.get("stage") != "orchestrator_bootstrap":
+        return False
+    issue = cast(dict[str, str], ledger.get("issue", {}))
+    artifacts = cast(dict[str, str], ledger.get("artifacts", {}))
+    worker_result_ref = str(artifacts.get("workerResultPath") or "")
+    if not worker_result_ref:
+        return False
+    automation = cast(dict[str, object], ledger.get("automation", {}))
+    primary_workspace_root = str(automation.get("primaryWorkspaceRoot") or "")
+    worker_artifact_base_dir = Path(primary_workspace_root) if primary_workspace_root else base_dir
+    worker_result_path = (
+        Path(worker_result_ref)
+        if Path(worker_result_ref).is_absolute()
+        else worker_artifact_base_dir / worker_result_ref
+    )
+    if not worker_result_path.exists():
+        return False
+
+    history = cast(list[JsonObject], ledger.get("history", []))
+    history.append(
+        {
+            "recordedAt": updated_at,
+            "fromRole": current.get("role", "main_orchestrator"),
+            "fromStage": current.get("stage", "orchestrator_bootstrap"),
+            "toRole": "issue_worker",
+            "toStage": "issue_worker_execution",
+            "reason": (
+                f"Recovered stale bootstrap ledger for issue #{issue.get('number', '')} after detecting an existing worker_result artifact."
+            ),
+        }
+    )
+    ledger["current"] = {
+        "role": "issue_worker",
+        "stage": "issue_worker_execution",
+        "status": "queued",
+    }
+    attempts = cast(dict[str, int], ledger.get("attempts", {}))
+    attempts["issue_worker"] = max(int(attempts.get("issue_worker", 0)), 1)
+    _bump_ledger_revision(ledger, updated_at)
+    ledger["updatedAt"] = updated_at
+    return True
+
+
+def _ledger_issue_number(ledger: JsonObject, fallback_issue_number: str) -> str:
+    issue = cast(dict[str, str], ledger.get("issue", {}))
+    return issue.get("number", "") or fallback_issue_number
 
 
 def _sync_issue_packet_to_db(base_dir: Path, packet: IssuePacketRecord, *, updated_at: str | None = None) -> None:
@@ -1100,6 +1264,7 @@ def create_initial_ledger(
             "title": issue_packet.title,
             "branch": issue_packet.branch,
             "issuePacketPath": issue_packet.issue_packet_path,
+            "backingType": issue_packet.backing_type,
             "priorHandoffPath": issue_packet.prior_handoff,
             "parentReference": issue_packet.parent_reference,
         },
@@ -1192,6 +1357,11 @@ def validate_session_request_for_dispatch(
     base_dir: Path,
 ) -> str:
     issue = cast(dict[str, str], ledger["issue"])
+    queued_next_issue = cast(dict[str, object], ledger.get("queuedNextIssue", {}))
+    queued_next_issue_record = cast(dict[str, object], queued_next_issue.get("record", {}))
+    selected_issue_number = str(request.get("selectedIssueNumber") or "")
+    selected_issue_branch = str(request.get("selectedIssueBranch") or "")
+    selected_issue_packet_path = str(request.get("selectedIssuePacketPath") or "")
     if request["issueNumber"] != issue.get("number"):
         return f"stale request issue #{request['issueNumber']} does not match ledger issue #{issue.get('number', '')}"
     if request["branch"] != issue.get("branch"):
@@ -1202,8 +1372,29 @@ def validate_session_request_for_dispatch(
     if request_revision and ledger_revision and request_revision != ledger_revision:
         return f"stale request revision {request_revision} does not match ledger revision {ledger_revision}"
 
+    queued_issue_number = str(queued_next_issue_record.get("issue_number") or "")
+    queued_issue_branch = str(queued_next_issue_record.get("branch") or "")
+    queued_issue_packet_path = str(queued_next_issue_record.get("issue_packet_path") or "")
+    if selected_issue_number or selected_issue_branch or selected_issue_packet_path:
+        if not queued_issue_number or not queued_issue_packet_path:
+            return "stale selected issue request no longer matches queued next issue state"
+        if selected_issue_number != queued_issue_number:
+            return f"stale selected issue #{selected_issue_number} does not match queued next issue #{queued_issue_number}"
+        if selected_issue_branch and selected_issue_branch != queued_issue_branch:
+            return f"stale selected issue branch {selected_issue_branch} does not match queued next issue branch {queued_issue_branch}"
+        if selected_issue_packet_path != queued_issue_packet_path:
+            return (
+                f"stale selected issue packet {selected_issue_packet_path} does not match queued next issue packet {queued_issue_packet_path}"
+            )
+
     completed = _completed_issue_numbers(base_dir, cast(dict[str, str], ledger["workflow"])["checkpointPath"])
-    if request["issueNumber"] in completed:
+    is_selected_issue_recovery_request = (
+        request.get("role") == "main_orchestrator"
+        and request.get("stage") == "issue_selection_or_recovery"
+        and bool(selected_issue_number)
+        and bool(selected_issue_packet_path)
+    )
+    if request["issueNumber"] in completed and not is_selected_issue_recovery_request:
         return f"issue #{request['issueNumber']} is already completed or released; refusing to dispatch stale request"
 
     packet = _load_issue_packet_from_db(base_dir, request["issueNumber"])
@@ -1502,6 +1693,7 @@ def inspect_control_plane(
 ) -> JsonObject:
     ensure_control_plane_db(base_dir)
     return {
+        "schema": describe_control_plane_schema(base_dir),
         "issue": read_issue(base_dir, issue_number) or {},
         "latestDecision": read_latest_decision(base_dir, issue_number) or {},
         "latestGitHubSyncAttempt": read_latest_github_sync_attempt(base_dir, issue_number) or {},
@@ -1915,6 +2107,51 @@ def _queue_transition(
         updated_at=updated_at,
         bump_ledger_revision=_bump_ledger_revision,
     )
+    workflow = cast(dict[str, str], ledger["workflow"])
+    automation = cast(dict[str, object], ledger.get("automation", {}))
+    primary_workspace_root = str(automation.get("primaryWorkspaceRoot") or "")
+    checkpoint_base_dir = Path(primary_workspace_root) if primary_workspace_root else ROOT
+    checkpoint_path = _resolve_artifact_path(workflow["checkpointPath"], base_dir=checkpoint_base_dir)
+    issue = cast(dict[str, str], ledger["issue"])
+    current = cast(dict[str, str], ledger["current"])
+    artifacts = cast(dict[str, str], ledger.get("artifacts", {}))
+    role = current.get("role", "")
+    stage = current.get("stage", "")
+    in_progress: list[str] | None = None
+    next_steps: list[str] | None = None
+    if role == "issue_worker":
+        in_progress = [f"Issue worker is executing issue #{issue.get('number', '')}." ]
+        next_steps = [f"Wait for docs/agents/worker-results/issue-{issue.get('number', '')}.yaml before routing to verification."]
+    elif role == "pr_verifier":
+        in_progress = [f"PR verifier is validating issue #{issue.get('number', '')}." ]
+        next_steps = [f"Wait for {artifacts.get('evidencePacketPath') or 'the evidence packet'} before routing to release_worker."]
+    elif role == "release_worker":
+        in_progress = [f"Release worker is finalizing issue #{issue.get('number', '')}." ]
+        next_steps = [f"Wait for {artifacts.get('releaseResultPath') or 'the release result'} before selecting the next issue."]
+    elif role == "main_orchestrator" and stage == "issue_selection_or_recovery":
+        in_progress = [f"Continue supervisor recovery for issue #{issue.get('number', '')}." ]
+        next_steps = ["Select the next ready issue packet or remain in orchestrator recovery if none are available."]
+    _ = write_checkpoint_file(
+        checkpoint_path,
+        issue_number=issue.get("number") or None,
+        branch=issue.get("branch") or None,
+        role=role or None,
+        agent=_root_session_agent(ledger),
+        issue_packet=issue.get("issuePacketPath") or None,
+        handoff=issue.get("priorHandoffPath") if "priorHandoffPath" in issue else None,
+        worker_result=artifacts.get("workerResultPath"),
+        evidence_packet=artifacts.get("evidencePacketPath"),
+        artifact_bundle=artifacts.get("releaseResultPath"),
+        in_progress=in_progress,
+        next_steps=next_steps,
+        blockers=(
+            [str(cast(dict[str, object], ledger.get("lastFailure", {})).get("summary") or "none")]
+            if cast(dict[str, object], ledger.get("lastFailure", {})).get("summary")
+            else None
+        ),
+        workflow_policy_path=workflow["workflowPolicyPath"],
+        updated_at=updated_at,
+    )
 
 
 def _set_failure(ledger: JsonObject, *, kind: str, summary: str, retryable: bool) -> None:
@@ -1999,11 +2236,97 @@ def _queue_orchestrator_recovery(
         queue_transition_func=_queue_transition,
         final_state=final_state,
     )
+    workflow = cast(dict[str, str], next_ledger["workflow"])
+    checkpoint_path = _resolve_artifact_path(workflow["checkpointPath"], base_dir=base_dir)
+    current = cast(dict[str, str], next_ledger["current"])
+    issue = cast(dict[str, str], next_ledger["issue"])
+    artifacts = cast(dict[str, str], next_ledger.get("artifacts", {}))
+    _ = write_checkpoint_file(
+        checkpoint_path,
+        issue_number=issue.get("number") or None,
+        branch=issue.get("branch") or None,
+        role=current.get("role") or None,
+        agent=_root_session_agent(next_ledger),
+        issue_packet=issue.get("issuePacketPath") or None,
+        handoff=issue.get("priorHandoffPath") if "priorHandoffPath" in issue else None,
+        worker_result=artifacts.get("workerResultPath"),
+        evidence_packet=artifacts.get("evidencePacketPath"),
+        artifact_bundle=artifacts.get("releaseResultPath"),
+        completed=[summary] if final_state == "completed" else None,
+        in_progress=(
+            [f"Continue supervisor recovery for issue #{issue.get('number', '')}."]
+            if current.get("role") == "main_orchestrator" and current.get("stage") == "issue_selection_or_recovery"
+            else None
+        ),
+        next_steps=(
+            ["Select the next ready issue packet or remain in orchestrator recovery if none are available."]
+            if current.get("role") == "main_orchestrator" and current.get("stage") == "issue_selection_or_recovery"
+            else None
+        ),
+        blockers=(
+            [str(cast(dict[str, object], next_ledger.get("lastFailure", {})).get("summary") or "none")]
+            if cast(dict[str, object], next_ledger.get("lastFailure", {})).get("summary")
+            else None
+        ),
+        workflow_policy_path=workflow["workflowPolicyPath"],
+        updated_at=updated_at,
+    )
     return (
         next_ledger,
         cast(SupervisorDecision, cast(object, decision)),
         cast(SessionRequest, cast(object, request)),
     )
+
+
+def _consume_queued_next_issue(
+    ledger: JsonObject,
+    *,
+    base_dir: Path,
+    updated_at: str,
+    summary: str,
+) -> tuple[JsonObject, SupervisorDecision, SessionRequest] | None:
+    queued_next_issue = cast(dict[str, object], ledger.get("queuedNextIssue", {}))
+    queued_next_issue_record = cast(dict[str, object], queued_next_issue.get("record", {}))
+    issue_number = str(queued_next_issue_record.get("issue_number") or "")
+    issue_packet_path = str(queued_next_issue_record.get("issue_packet_path") or "")
+    if not issue_number or not issue_packet_path:
+        return None
+    selected_issue = issue_packet_record_from_json(cast(dict[str, object], queued_next_issue_record))
+    if selected_issue is None:
+        return None
+    issue_packet_file = _resolve_artifact_path(selected_issue.issue_packet_path, base_dir=base_dir)
+    if not issue_packet_file.exists():
+        return None
+    if issue_number in _completed_issue_numbers(base_dir, cast(dict[str, str], ledger["workflow"])["checkpointPath"]):
+        return None
+    revalidated_issue = select_next_issue_packet(
+        base_dir,
+        workflow=cast(dict[str, str], ledger["workflow"]),
+        current_issue=cast(dict[str, str], ledger["issue"]),
+    )
+    if revalidated_issue is None:
+        ledger.pop("queuedNextIssue", None)
+        return None
+    if revalidated_issue.issue_number != selected_issue.issue_number:
+        ledger.pop("queuedNextIssue", None)
+        next_ledger, decision, request = _handoff_to_selected_issue(
+            ledger,
+            selected_issue=revalidated_issue,
+            base_dir=base_dir,
+            updated_at=updated_at,
+            summary=(
+                f"Queued next issue #{selected_issue.issue_number} is no longer ready. Continue automatically with revalidated issue #{revalidated_issue.issue_number}."
+            ),
+        )
+        return next_ledger, decision, request
+    next_ledger, decision, request = _handoff_to_selected_issue(
+        ledger,
+        selected_issue=selected_issue,
+        base_dir=base_dir,
+        updated_at=updated_at,
+        summary=summary,
+    )
+    return next_ledger, decision, request
 
 
 def _quarantine_decision(ledger: JsonObject, *, summary: str) -> tuple[JsonObject, SupervisorDecision, None]:
@@ -2025,23 +2348,27 @@ def reconcile_ledger(
     ensure_control_plane_db(base_dir)
     issue = cast(dict[str, str], ledger["issue"])
     ensure_issue_row(base_dir, issue_number=issue["number"], updated_at=timestamp)
-    _ = sync_issue_runtime_context(
-        base_dir,
+    _sync_runtime_phase_metadata(
+        base_dir=base_dir,
         issue_number=issue["number"],
-        updated_at=timestamp,
-        current_role=cast(dict[str, str], ledger["current"]).get("role", ""),
-        current_stage=cast(dict[str, str], ledger["current"]).get("stage", ""),
-        current_status=cast(dict[str, str], ledger["current"]).get("status", ""),
-        attempts=cast(dict[str, object], ledger.get("attempts", {})),
-        limits=cast(dict[str, object], ledger.get("limits", {})),
+        current=cast(dict[str, str], ledger["current"]),
+        attempts=cast(dict[str, int], ledger.get("attempts", {})),
+        limits=cast(dict[str, int], ledger.get("limits", {})),
         last_failure=cast(dict[str, object], ledger.get("lastFailure", {})),
-        resume_snapshot=cast(dict[str, object], ledger.get("workflow", {})),
-        automation_flags=cast(dict[str, object], ledger.get("automation", {})),
-        artifact_refs=cast(dict[str, object], ledger.get("artifacts", {})),
+        workflow=cast(dict[str, object], ledger.get("workflow", {})),
+        automation=cast(dict[str, object], ledger.get("automation", {})),
+        artifacts=cast(dict[str, object], ledger.get("artifacts", {})),
+        updated_at=timestamp,
     )
     _sync_root_issue_event_from_session_result(ledger, base_dir=base_dir)
     pre_sync_runtime_issue = read_issue(base_dir, issue["number"])
     current = cast(dict[str, str], ledger["current"])
+    if _recover_stale_bootstrap_with_worker_artifact(
+        ledger=ledger,
+        base_dir=base_dir,
+        updated_at=timestamp,
+    ):
+        current = cast(dict[str, str], ledger["current"])
     if pre_sync_runtime_issue and str(pre_sync_runtime_issue.get("state") or "") == "running" and current["role"] in {"pr_verifier", "release_worker"}:
         _append_root_terminal_event_for_verifier_handoff(
             base_dir=base_dir,
@@ -2069,6 +2396,15 @@ def reconcile_ledger(
         ):
             runtime_issue = read_issue(base_dir, issue["number"])
 
+        if runtime_issue and _quarantine_stale_dispatching_issue_without_root_session(
+            base_dir=base_dir,
+            ledger=ledger,
+            current=current,
+            runtime_issue=cast(dict[str, object], runtime_issue),
+            updated_at=timestamp,
+        ):
+            runtime_issue = read_issue(base_dir, issue["number"])
+
         if (
             runtime_issue
             and current["role"] == "issue_worker"
@@ -2085,6 +2421,15 @@ def reconcile_ledger(
         if runtime_issue and _quarantine_stale_running_issue(
             base_dir=base_dir,
             ledger=ledger,
+            runtime_issue=cast(dict[str, object], runtime_issue),
+            updated_at=timestamp,
+        ):
+            runtime_issue = read_issue(base_dir, issue["number"])
+
+        if runtime_issue and _quarantine_stale_queued_subagent_with_stale_root(
+            base_dir=base_dir,
+            ledger=ledger,
+            current=current,
             runtime_issue=cast(dict[str, object], runtime_issue),
             updated_at=timestamp,
         ):
@@ -2118,6 +2463,18 @@ def reconcile_ledger(
                 queue_transition_func=_queue_transition,
                 subagent_decision_func=_subagent_decision,
             )
+            _sync_runtime_phase_metadata(
+                base_dir=base_dir,
+                issue_number=_ledger_issue_number(next_ledger, issue["number"]),
+                current=cast(dict[str, str], next_ledger["current"]),
+                attempts=cast(dict[str, int], next_ledger.get("attempts", {})),
+                limits=cast(dict[str, int], next_ledger.get("limits", {})),
+                last_failure=cast(dict[str, object], next_ledger.get("lastFailure", {})),
+                workflow=cast(dict[str, object], next_ledger.get("workflow", {})),
+                automation=cast(dict[str, object], next_ledger.get("automation", {})),
+                artifacts=cast(dict[str, object], next_ledger.get("artifacts", {})),
+                updated_at=timestamp,
+            )
             return next_ledger, cast(SupervisorDecision, cast(object, decision)), cast(SessionRequest | None, cast(object, request))
 
         if current["role"] == "issue_worker":
@@ -2143,6 +2500,18 @@ def reconcile_ledger(
                 queue_orchestrator_recovery_func=_queue_orchestrator_recovery,
                 queue_transition_func=_queue_transition,
                 subagent_decision_func=_subagent_decision,
+            )
+            _sync_runtime_phase_metadata(
+                base_dir=base_dir,
+                issue_number=_ledger_issue_number(next_ledger, issue["number"]),
+                current=cast(dict[str, str], next_ledger["current"]),
+                attempts=cast(dict[str, int], next_ledger.get("attempts", {})),
+                limits=cast(dict[str, int], next_ledger.get("limits", {})),
+                last_failure=cast(dict[str, object], next_ledger.get("lastFailure", {})),
+                workflow=cast(dict[str, object], next_ledger.get("workflow", {})),
+                automation=cast(dict[str, object], next_ledger.get("automation", {})),
+                artifacts=cast(dict[str, object], next_ledger.get("artifacts", {})),
+                updated_at=timestamp,
             )
             return next_ledger, cast(SupervisorDecision, cast(object, decision)), cast(SessionRequest | None, cast(object, request))
 
@@ -2170,6 +2539,18 @@ def reconcile_ledger(
                 queue_transition_func=_queue_transition,
                 subagent_decision_func=_subagent_decision,
             )
+            _sync_runtime_phase_metadata(
+                base_dir=base_dir,
+                issue_number=_ledger_issue_number(next_ledger, issue["number"]),
+                current=cast(dict[str, str], next_ledger["current"]),
+                attempts=cast(dict[str, int], next_ledger.get("attempts", {})),
+                limits=cast(dict[str, int], next_ledger.get("limits", {})),
+                last_failure=cast(dict[str, object], next_ledger.get("lastFailure", {})),
+                workflow=cast(dict[str, object], next_ledger.get("workflow", {})),
+                automation=cast(dict[str, object], next_ledger.get("automation", {})),
+                artifacts=cast(dict[str, object], next_ledger.get("artifacts", {})),
+                updated_at=timestamp,
+            )
             return next_ledger, cast(SupervisorDecision, cast(object, decision)), cast(SessionRequest | None, cast(object, request))
 
         if current["role"] == "release_worker":
@@ -2194,9 +2575,44 @@ def reconcile_ledger(
                 queue_transition_func=_queue_transition,
                 subagent_decision_func=_subagent_decision,
             )
+            _sync_runtime_phase_metadata(
+                base_dir=base_dir,
+                issue_number=_ledger_issue_number(next_ledger, issue["number"]),
+                current=cast(dict[str, str], next_ledger["current"]),
+                attempts=cast(dict[str, int], next_ledger.get("attempts", {})),
+                limits=cast(dict[str, int], next_ledger.get("limits", {})),
+                last_failure=cast(dict[str, object], next_ledger.get("lastFailure", {})),
+                workflow=cast(dict[str, object], next_ledger.get("workflow", {})),
+                automation=cast(dict[str, object], next_ledger.get("automation", {})),
+                artifacts=cast(dict[str, object], next_ledger.get("artifacts", {})),
+                updated_at=timestamp,
+            )
             return next_ledger, cast(SupervisorDecision, cast(object, decision)), cast(SessionRequest | None, cast(object, request))
 
         if current["role"] == "main_orchestrator" and current["stage"] == "issue_selection_or_recovery":
+            queued_next_issue_result = _consume_queued_next_issue(
+                ledger,
+                base_dir=base_dir,
+                updated_at=timestamp,
+                summary=(
+                    f"Resume deterministic next-issue handoff selected earlier for issue #{issue['number']}."
+                ),
+            )
+            if queued_next_issue_result is not None:
+                next_ledger, decision, request = queued_next_issue_result
+                _sync_runtime_phase_metadata(
+                    base_dir=base_dir,
+                    issue_number=_ledger_issue_number(next_ledger, issue["number"]),
+                    current=cast(dict[str, str], next_ledger["current"]),
+                    attempts=cast(dict[str, int], next_ledger.get("attempts", {})),
+                    limits=cast(dict[str, int], next_ledger.get("limits", {})),
+                    last_failure=cast(dict[str, object], next_ledger.get("lastFailure", {})),
+                    workflow=cast(dict[str, object], next_ledger.get("workflow", {})),
+                    automation=cast(dict[str, object], next_ledger.get("automation", {})),
+                    artifacts=cast(dict[str, object], next_ledger.get("artifacts", {})),
+                    updated_at=timestamp,
+                )
+                return next_ledger, cast(SupervisorDecision, cast(object, decision)), cast(SessionRequest | None, cast(object, request))
             reconcile_issue_selection_or_recovery = cast(Callable[..., tuple[JsonObject, JsonObject, JsonObject | None] | None], _reconcile_helpers.reconcile_issue_selection_or_recovery)
             recovery_result = reconcile_issue_selection_or_recovery(
                 ledger,
@@ -2215,6 +2631,18 @@ def reconcile_ledger(
             )
             if recovery_result is not None:
                 next_ledger, decision, request = recovery_result
+                _sync_runtime_phase_metadata(
+                    base_dir=base_dir,
+                    issue_number=_ledger_issue_number(next_ledger, issue["number"]),
+                    current=cast(dict[str, str], next_ledger["current"]),
+                    attempts=cast(dict[str, int], next_ledger.get("attempts", {})),
+                    limits=cast(dict[str, int], next_ledger.get("limits", {})),
+                    last_failure=cast(dict[str, object], next_ledger.get("lastFailure", {})),
+                    workflow=cast(dict[str, object], next_ledger.get("workflow", {})),
+                    automation=cast(dict[str, object], next_ledger.get("automation", {})),
+                    artifacts=cast(dict[str, object], next_ledger.get("artifacts", {})),
+                    updated_at=timestamp,
+                )
                 return next_ledger, cast(SupervisorDecision, cast(object, decision)), cast(SessionRequest | None, cast(object, request))
 
         no_change_decision = cast(Callable[..., tuple[JsonObject, JsonObject, JsonObject | None]], _reconcile_helpers.no_change_decision)
@@ -2224,9 +2652,65 @@ def reconcile_ledger(
             updated_at=timestamp,
             bump_ledger_revision=_bump_ledger_revision,
         )
+        _sync_runtime_phase_metadata(
+            base_dir=base_dir,
+            issue_number=_ledger_issue_number(next_ledger, issue["number"]),
+            current=cast(dict[str, str], next_ledger["current"]),
+            attempts=cast(dict[str, int], next_ledger.get("attempts", {})),
+            limits=cast(dict[str, int], next_ledger.get("limits", {})),
+            last_failure=cast(dict[str, object], next_ledger.get("lastFailure", {})),
+            workflow=cast(dict[str, object], next_ledger.get("workflow", {})),
+            automation=cast(dict[str, object], next_ledger.get("automation", {})),
+            artifacts=cast(dict[str, object], next_ledger.get("artifacts", {})),
+            updated_at=timestamp,
+        )
         return next_ledger, cast(SupervisorDecision, cast(object, decision)), cast(SessionRequest | None, cast(object, request))
     finally:
         pass
+
+
+def _run_reconcile_cli(
+    *,
+    ledger_path: Path,
+    request_path: Path,
+    session_result_path: Path,
+    updated_at: str | None,
+    write_request: bool,
+    dispatch_now: bool,
+    source_session_id: str,
+    child_only: bool,
+) -> int:
+    ledger = _read_json(ledger_path)
+    if child_only:
+        current = cast(dict[str, object], ledger.get("current", {}))
+        current_role = str(current.get("role") or "")
+        if current_role not in {"issue_worker", "pr_verifier", "release_worker"}:
+            print(
+                f"advance-child requires the on-disk ledger to already be queued on a child role (found {current_role or 'unknown'}).",
+                file=sys.stderr,
+            )
+            return 2
+    updated_ledger, decision, request = reconcile_ledger(
+        ledger,
+        session_result_path=session_result_path,
+        artifact_base_dir=_infer_artifact_base_dir(ledger_path),
+        updated_at=updated_at,
+    )
+    write_ledger_file(ledger_path, updated_ledger)
+    if write_request and request is not None:
+        write_session_request(request_path, request)
+        print(f"wrote session request {request_path}")
+        if dispatch_now:
+            _ = _dispatch_consumed_request(
+                request_path,
+                ledger_path=ledger_path,
+                session_result_path=session_result_path,
+                source_session_id=source_session_id,
+                updated_at=updated_at,
+            )
+            print(f"wrote session result {session_result_path}")
+    print(json.dumps(decision, indent=2, ensure_ascii=False))
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2252,6 +2736,18 @@ def build_parser() -> argparse.ArgumentParser:
     _ = reconcile_parser.add_argument("--dispatch-now", action="store_true", help="Immediately launch the fresh session after writing the request")
     _ = reconcile_parser.add_argument("--source-session-id", default="supervisor_reconcile", help="Source session id to record when dispatching immediately")
     _ = reconcile_parser.add_argument("--updated-at")
+
+    advance_child_parser = subparsers.add_parser(
+        "advance-child",
+        help="Advance a queued child role after its compact artifact has been written",
+    )
+    _ = advance_child_parser.add_argument("--ledger", default=str(DEFAULT_LEDGER_PATH), help="Path to orchestrator-ledger.json")
+    _ = advance_child_parser.add_argument("--request", default=str(DEFAULT_REQUEST_PATH), help="Path to new-session-request.json")
+    _ = advance_child_parser.add_argument("--session-result", default=str(DEFAULT_SESSION_RESULT_PATH), help="Path to new-session-result.json")
+    _ = advance_child_parser.add_argument("--write-request", action="store_true", help="Persist the computed next-session request when child advancement queues a new root session")
+    _ = advance_child_parser.add_argument("--dispatch-now", action="store_true", help="Immediately launch the fresh root session after writing the request")
+    _ = advance_child_parser.add_argument("--source-session-id", default="supervisor_advance_child", help="Source session id to record when dispatching immediately")
+    _ = advance_child_parser.add_argument("--updated-at")
 
     dispatch_parser = subparsers.add_parser("dispatch", help="Launch the next session explicitly without relying on session.idle plugins")
     _ = dispatch_parser.add_argument("--request", default=str(DEFAULT_REQUEST_PATH), help="Path to new-session-request.json")
@@ -2465,28 +2961,16 @@ def main(argv: list[str] | None = None) -> int:
         request_path=request_path,
         raw_session_result_path=cast(str, args.session_result),
     )
-    ledger = _read_json(ledger_path)
-    updated_ledger, decision, request = reconcile_ledger(
-        ledger,
+    return _run_reconcile_cli(
+        ledger_path=ledger_path,
+        request_path=request_path,
         session_result_path=session_result_path,
-        artifact_base_dir=_infer_artifact_base_dir(ledger_path),
         updated_at=cast(str | None, args.updated_at),
+        write_request=cast(bool, args.write_request),
+        dispatch_now=cast(bool, args.dispatch_now),
+        source_session_id=cast(str, args.source_session_id),
+        child_only=cast(str, args.command) == "advance-child",
     )
-    write_ledger_file(ledger_path, updated_ledger)
-    if cast(bool, args.write_request) and request is not None:
-        write_session_request(request_path, request)
-        print(f"wrote session request {request_path}")
-        if cast(bool, args.dispatch_now):
-            _ = _dispatch_consumed_request(
-                request_path,
-                ledger_path=ledger_path,
-                session_result_path=session_result_path,
-                source_session_id=cast(str, args.source_session_id),
-                updated_at=cast(str | None, args.updated_at),
-            )
-            print(f"wrote session result {session_result_path}")
-    print(json.dumps(decision, indent=2, ensure_ascii=False))
-    return 0
 
 
 if __name__ == "__main__":

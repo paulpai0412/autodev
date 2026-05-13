@@ -126,7 +126,7 @@ def test_run_orchestrator_bootstrap_updates_checkpoint_and_returns_next_action(t
     assert result.branch == "agent/issue-42-demo"
     assert result.ledger_path == ledger_path
     assert result.new_session_request_path == request_path
-    assert result.immediate_next_action.startswith("Continue per_issue_flow for issue #42")
+    assert result.immediate_next_action.startswith("Run supervisor reconcile for issue #42")
     assert 'issue_number: "42"' in updated
     assert 'branch: "agent/issue-42-demo"' in updated
     assert 'handoff: "docs/agents/handoffs/issue-41.yaml"' in updated
@@ -134,7 +134,7 @@ def test_run_orchestrator_bootstrap_updates_checkpoint_and_returns_next_action(t
     assert '"reason": "orchestrator bootstrap continuation for issue #42"' in request
     assert '"title": "Continue issue #42 on agent/issue-42-demo"' in request
     assert result.immediate_next_action in request
-    assert "Immediately launch the first issue_worker subagent in this same turn" in request
+    assert "Before launching the first child subagent, run the supervisor reconcile command once" in request
     assert "run_in_background=false" in request
     assert "Wait for each child task call to finish in the foreground before continuing." in request
     assert "Do not include karpathy-guidelines in load_skills for child subagents" not in request
