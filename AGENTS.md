@@ -17,9 +17,9 @@
 - Resume a quarantined issue: `PYTHONPATH=. python3 scripts/orchestrator_supervisor.py resume-quarantined --ledger .opencode/runtime/orchestrator-ledger.json --reason <why>`
 - Fail a quarantined issue: `PYTHONPATH=. python3 scripts/orchestrator_supervisor.py fail-quarantined --ledger .opencode/runtime/orchestrator-ledger.json --reason <why>`
 - Retry a failed GitHub sync attempt: `PYTHONPATH=. python3 scripts/orchestrator_supervisor.py retry-github-sync --ledger .opencode/runtime/orchestrator-ledger.json --command-id <id>`
-- Materialize ready GitHub issues into local packets: `AUTODEV_GITHUB_REPO=<owner/repo> PYTHONPATH=. python3 scripts/issue_packet_intake.py`
-- Broad local regression sweep for this repo: `pytest tests/scripts -q`
-- Focused regression: `pytest tests/scripts/test_<script_name>.py -q`
+- Materialize ready GitHub issues into a consumer project's local packets: `AUTODEV_GITHUB_REPO=<owner/repo> PYTHONPATH=. python3 scripts/issue_packet_intake.py --project-root <project>`
+- Broad local regression sweep for this repo: `python3 -m pytest tests/scripts -q`
+- Focused regression: `python3 -m pytest tests/scripts/test_<script_name>.py -q`
 
 ## Workflow rules agents are likely to miss
 - `main_orchestrator` is orchestration-only. It validates contracts and routes work; it does **not** implement issue scope or perform final issue QA itself.

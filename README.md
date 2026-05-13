@@ -44,8 +44,8 @@ PYTHONPATH=. python3 scripts/orchestrator_bootstrap_runner.py --issue-number 32 
 
 ## Tracker repo
 
-GitHub intake defaults to `paulpai0412/wferp`. Override it when needed:
+GitHub intake defaults to `paulpai0412/wferp`. Point it at the consumer project so packets land in that project's `docs/agents/issue-packets/`:
 
 ```bash
-AUTODEV_GITHUB_REPO=<owner/repo> PYTHONPATH=. python3 scripts/issue_packet_intake.py
+AUTODEV_GITHUB_REPO=<owner/repo> PYTHONPATH=. python3 scripts/issue_packet_intake.py --project-root /path/to/project
 ```

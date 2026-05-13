@@ -160,15 +160,16 @@
 1. GitHub 上標記為 `ready-for-agent` 的 issue 被 materialize 成本地 `issue-<n>.yaml`
 2. bootstrap runner 針對指定 issue 建立 checkpoint、ledger 與新 root session request
 3. `main_orchestrator` 被 dispatch
-4. `main_orchestrator` 依序委派：
+4. fresh `main_orchestrator` 進入 issue flow 後，必須先跑一次 `orchestrator_supervisor.py reconcile --ledger ...`，把 bootstrap → `issue_worker_execution` transition 寫回 on-disk ledger，再開始派出第一個 `issue_worker`
+5. `main_orchestrator` 依序委派：
    - `issue_worker`
    - `pr_verifier`
    - `release_worker`
    - 以上子任務應以 `task(..., run_in_background=false)` 前景執行，讓同一個 root orchestrator session 逐一等待完成後再繼續
    - 即使 issue scope 在 issue worktree 內執行，compact artifacts（worker result / evidence packet / release result）仍應回寫到 primary workspace 的 canonical repo 路徑，供 supervisor reconcile 使用
    - `issue_worker` 只有在 branch push 與 PR 建立都完成，且 worker result 內已填入 `pr.number` / `pr.url` 後，才能寫出 `status: success`；否則必須誠實寫成 blocked / failed，避免 supervisor 過早把 issue 視為成功
-5. 每次有新 artifact 落地後，supervisor 執行 `reconcile`
-6. `reconcile` 會同步 SQLite control plane，判斷下一步是：
+6. 每次有新 artifact 落地後，supervisor 執行 `reconcile`
+7. `reconcile` 會同步 SQLite control plane，判斷下一步是：
    - 繼續派工
    - recovery
    - quarantine
@@ -346,10 +347,10 @@ autodev project: no changes needed
 
 ### 5.1 同步 GitHub issue packets
 
-預設 tracker repo 是 `paulpai0412/wferp`。若要指定其他 repo：
+預設 tracker repo 是 `paulpai0412/wferp`。請把 intake 指到 consumer project，這樣 packet 會寫進該專案的 `docs/agents/issue-packets/`。若要指定其他 repo：
 
 ```bash
-AUTODEV_GITHUB_REPO=<owner/repo> PYTHONPATH=. python3 scripts/issue_packet_intake.py
+AUTODEV_GITHUB_REPO=<owner/repo> PYTHONPATH=. python3 scripts/issue_packet_intake.py --project-root <project>
 ```
 
 若要用 fixture JSON 做本地測試：
@@ -636,7 +637,7 @@ PYTHONPATH=. python3 scripts/autodev_project.py doctor --project-root <project>
 ### 步驟 3：同步 GitHub issues 成 issue packets
 
 ```bash
-AUTODEV_GITHUB_REPO=<owner/repo> PYTHONPATH=. python3 scripts/issue_packet_intake.py
+AUTODEV_GITHUB_REPO=<owner/repo> PYTHONPATH=. python3 scripts/issue_packet_intake.py --project-root <project>
 ```
 
 ### 步驟 4：啟動指定 issue
@@ -665,13 +666,13 @@ PYTHONPATH=. python3 scripts/orchestrator_supervisor.py inspect --ledger .openco
 ### 10.1 全量 regression
 
 ```bash
-pytest tests/scripts -q
+python3 -m pytest tests/scripts -q
 ```
 
 ### 10.2 單一腳本 focused regression
 
 ```bash
-pytest tests/scripts/test_<script_name>.py -q
+python3 -m pytest tests/scripts/test_<script_name>.py -q
 ```
 
 ### 10.3 建議優先檢查的面向
