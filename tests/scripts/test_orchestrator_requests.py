@@ -7,6 +7,7 @@ from scripts import orchestrator_requests
 
 def test_build_prompt_for_main_orchestrator_requires_foreground_child_subagents() -> None:
     ledger = cast(dict[str, object], {
+        "automation": {"primaryWorkspaceRoot": "/tmp/project"},
         "issue": {
             "number": "6",
             "branch": "agent/issue-6-demo",
@@ -31,6 +32,48 @@ def test_build_prompt_for_main_orchestrator_requires_foreground_child_subagents(
     assert 'task(subagent_type="general", ..., run_in_background=false)' in prompt
     assert "Wait for each child task call to finish in the foreground before continuing." in prompt
     assert "Do not include karpathy-guidelines in load_skills for child subagents" not in prompt
+
+
+def test_build_prompt_uses_primary_workspace_absolute_artifact_paths() -> None:
+    ledger = cast(dict[str, object], {
+        "automation": {"primaryWorkspaceRoot": "/tmp/project"},
+        "issue": {
+            "number": "8",
+            "branch": "agent/issue-8-demo",
+            "issuePacketPath": "docs/agents/issue-packets/issue-8.yaml",
+        },
+        "workflow": {
+            "checkpointPath": "docs/agents/runtime/context-checkpoint.yaml",
+            "workflowPolicyPath": "docs/agents/autonomous-development-workflow.yaml",
+        },
+        "artifacts": {
+            "workerResultPath": "docs/agents/worker-results/issue-8.yaml",
+            "evidencePacketPath": "docs/agents/evidence/issue-8-pr-12.yaml",
+            "releaseResultPath": "docs/agents/release-results/issue-8-pr-12.yaml",
+        },
+    })
+
+    verifier_prompt = orchestrator_requests.build_prompt(
+        ledger,
+        role="pr_verifier",
+        stage="pr_verifier_execution",
+        decision_summary="verify now",
+        default_supervisor_doc_path="docs/agents/runtime/nonstop-supervisor-loop.md",
+        default_release_result_template_path="docs/agents/release-result-template.yaml",
+    )
+    release_prompt = orchestrator_requests.build_prompt(
+        ledger,
+        role="release_worker",
+        stage="release_worker_execution",
+        decision_summary="release now",
+        default_supervisor_doc_path="docs/agents/runtime/nonstop-supervisor-loop.md",
+        default_release_result_template_path="docs/agents/release-result-template.yaml",
+    )
+
+    assert "/tmp/project/docs/agents/worker-results/issue-8.yaml" in verifier_prompt
+    assert "/tmp/project/docs/agents/evidence/issue-8-pr-12.yaml" in verifier_prompt
+    assert "/tmp/project/docs/agents/evidence/issue-8-pr-12.yaml" in release_prompt
+    assert "/tmp/project/docs/agents/release-results/issue-8-pr-12.yaml" in release_prompt
 
 
 def test_build_prompt_for_release_worker_mentions_workflow_start_approval_override() -> None:

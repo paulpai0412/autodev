@@ -143,6 +143,7 @@ def run_orchestrator_bootstrap(
         issue_packet=issue_packet,
         checkpoint_path=str(checkpoint_path),
         workflow_policy_path=workflow_policy_path,
+        primary_workspace_root=str(base_dir),
         root_session_agent=DEFAULT_ROOT_SESSION_AGENT,
         updated_at=updated_at,
     )

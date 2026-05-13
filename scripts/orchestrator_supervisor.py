@@ -1133,6 +1133,7 @@ def create_initial_ledger(
     issue_packet: IssuePacketRecord,
     checkpoint_path: str = DEFAULT_CHECKPOINT_PATH,
     workflow_policy_path: str = DEFAULT_WORKFLOW_POLICY_PATH,
+    primary_workspace_root: str | None = None,
     root_session_agent: str = DEFAULT_ROOT_SESSION_AGENT,
     updated_at: str | None = None,
 ) -> JsonObject:
@@ -1142,6 +1143,7 @@ def create_initial_ledger(
         "automation": {
             "continueWithoutHuman": True,
             "queueNextSessionOnIdle": True,
+            "primaryWorkspaceRoot": primary_workspace_root or "",
             "rootSessionAgent": root_session_agent,
             "supervisorDocPath": DEFAULT_SUPERVISOR_DOC_PATH,
         },
@@ -1466,6 +1468,7 @@ def _handoff_to_selected_issue(
         issue_packet=selected_issue,
         checkpoint_path=workflow["checkpointPath"],
         workflow_policy_path=workflow["workflowPolicyPath"],
+        primary_workspace_root=str(base_dir),
         root_session_agent=_root_session_agent(current_ledger),
         updated_at=updated_at,
     )
@@ -2378,6 +2381,7 @@ def main(argv: list[str] | None = None) -> int:
             issue_packet=record,
             checkpoint_path=cast(str, args.checkpoint_path),
             workflow_policy_path=cast(str, args.workflow_policy_path),
+            primary_workspace_root=str(_infer_artifact_base_dir(ledger_path)),
             updated_at=cast(str | None, args.updated_at),
         )
         write_ledger_file(ledger_path, ledger)

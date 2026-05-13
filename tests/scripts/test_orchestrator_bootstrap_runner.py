@@ -148,6 +148,7 @@ def test_run_orchestrator_bootstrap_updates_checkpoint_and_returns_next_action(t
     workflow = cast(dict[str, object], ledger["workflow"])
     assert issue_state["number"] == "42"
     assert current_state["stage"] == "orchestrator_bootstrap"
+    assert automation["primaryWorkspaceRoot"] == str(tmp_path)
     assert str(automation["supervisorDocPath"]).endswith("docs/agents/runtime/nonstop-supervisor-loop.md")
     assert str(workflow["workflowPolicyPath"]).endswith("docs/agents/autonomous-development-workflow.yaml")
     assert str(workflow["releaseResultTemplatePath"]).endswith("docs/agents/release-result-template.yaml")

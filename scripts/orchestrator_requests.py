@@ -40,6 +40,20 @@ def build_prompt(
 ) -> str:
     issue = cast(dict[str, str], ledger["issue"])
     artifacts = cast(dict[str, str], ledger["artifacts"])
+    automation = cast(dict[str, object], ledger.get("automation", {}))
+    primary_workspace_root = str(automation.get("primaryWorkspaceRoot") or "")
+
+    def canonical_artifact_path(path_text: str) -> str:
+        if not path_text:
+            return path_text
+        path = Path(path_text)
+        if path.is_absolute() or not primary_workspace_root:
+            return path_text
+        return str(Path(primary_workspace_root) / path)
+
+    worker_result_path = canonical_artifact_path(artifacts.get("workerResultPath", ""))
+    evidence_packet_path = canonical_artifact_path(artifacts.get("evidencePacketPath", ""))
+    release_result_path = canonical_artifact_path(artifacts.get("releaseResultPath", ""))
     common = build_common_prompt_lines(ledger, default_supervisor_doc_path=default_supervisor_doc_path)
     if role == "main_orchestrator" and stage == "orchestrator_bootstrap":
         lines = common + [
@@ -59,7 +73,7 @@ def build_prompt(
         lines = common + [
             f"You are the issue_worker subagent for issue #{issue['number']}.",
             f"Read {issue['issuePacketPath']} and implement only that issue scope.",
-            f"Write {artifacts['workerResultPath']} using docs/agents/worker-result-template.yaml.",
+            f"Write {worker_result_path} using docs/agents/worker-result-template.yaml.",
             "If the worker is blocked or failed, include failure_classification with kind, retryable, routed_to, and root_cause_signature.",
             "Do not claim final acceptance; that belongs to pr_verifier.",
             "When the worker_result is written, return control to the main_orchestrator root session; do not launch a root session.",
@@ -67,8 +81,8 @@ def build_prompt(
     elif role == "pr_verifier":
         lines = common + [
             f"You are the pr_verifier subagent for issue #{issue['number']}.",
-            f"Read {issue['issuePacketPath']} and {artifacts['workerResultPath']} before touching anything else.",
-            f"Write {artifacts['evidencePacketPath']} using docs/agents/evidence-packet-template.yaml.",
+            f"Read {issue['issuePacketPath']} and {worker_result_path} before touching anything else.",
+            f"Write {evidence_packet_path} using docs/agents/evidence-packet-template.yaml.",
             "Do not stop, summarize, or report verification progress until that evidence packet exists at the exact path above.",
             "If verification is blocked or fails, include failure_classification with kind, retryable, routed_to, and root_cause_signature.",
             "Final acceptance belongs to this verifier role; keep raw logs outside repo docs.",
@@ -77,11 +91,11 @@ def build_prompt(
     elif role == "release_worker":
         lines = common + [
             f"You are the release_worker subagent for issue #{issue['number']}.",
-            f"Read {artifacts['evidencePacketPath']} before evaluating merge or release decisions.",
+            f"Read {evidence_packet_path} before evaluating merge or release decisions.",
             "Read the runtime_controls block in the checkpoint and treat it as the workflow-start source of truth for merge approval override.",
             'If `approval_override_mode` is `"bypass_approval"`, skip only the human approval requirement while still enforcing verifier pass, required checks, PR mergeability, review gate, diagnostics/build gate, surface QA gate, and workspace hygiene.',
             'When bypassing approval, record `merge_approval_mode`, `human_approval_skipped`, `override_source`, and `override_scope` in the release result summary or metadata fields.',
-            f"Write {artifacts['releaseResultPath']} using {default_release_result_template_path}.",
+            f"Write {release_result_path} using {default_release_result_template_path}.",
             "If release is blocked or fails, include failure_classification with kind, retryable, routed_to, and root_cause_signature.",
             "Respect required checks, mergeability, approval policy, and workspace hygiene.",
             "When the release_result is written, return control to the main_orchestrator root session; do not launch a root session.",
