@@ -1,0 +1,53 @@
+schema_version: "1.0"
+kind: issue_packet
+line_cap: 80
+raw_evidence_policy: index_only_refs_no_raw_logs_or_transcripts
+
+issue:
+  number: "16"
+  title: "Add compact operator note for resuming the latest autodev root session"
+  url: "https://github.com/paulpai0412/autodev-demo-todo/issues/16"
+  labels: ["documentation", "ready-for-agent"]
+  parent: {type: "github-issue", reference: "#1"}
+
+branch: {name: "agent/issue-16-add-compact-operator-note-for-resuming-the-lates", base: "main"}
+objective: "## Summary"
+
+acceptance_criteria:
+  - {id: "AC1", text: "A compact repo doc tells the operator where to read the latest root-session metadata.", evidence_hint: "Verifier confirms observable outcome from issue scope."}
+  - {id: "AC2", text: "The doc names the exact command to reopen a root session from .", evidence_hint: "Verifier confirms observable outcome from issue scope."}
+  - {id: "AC3", text: "The doc stays compact and does not add raw logs or transcripts.", evidence_hint: "Verifier confirms observable outcome from issue scope."}
+  - {id: "AC4", text: "Existing workflow artifact refs remain the primary replay surface.", evidence_hint: "Verifier confirms observable outcome from issue scope."}
+  - {id: "AC5", text: "README and/or compact operator-facing doc updates", evidence_hint: "Verifier confirms observable outcome from issue scope."}
+test_case:
+  applies: false
+  id: ""
+  source: {type: "none", ref: ""}
+  surface: "none"
+  scenario: ""
+  expected_outcome: ""
+  regression_bucket: []
+scope:
+  in: ["<fill-from-issue-or-worker-discovery>"]
+  out: ["Human-only scope decisions", "Raw logs in repo docs"]
+bootstrap_context:
+  required_reads: ["AGENTS.md", "docs/agents/autonomous-development-workflow.yaml", "docs/agents/issue-tracker.md"]
+  relevant_paths: ["<fill-from-issue-or-worker-discovery>"]
+  prior_handoff: "none"
+  context_budget: {checkpoint_warning_at_percent: 45, stop_and_rotate_at_percent: 50}
+implementation_notes:
+  constraints: ["Keep artifacts compact and index-only."]
+  risks: ["Issue body requires worker verification for exact scope."]
+  dependencies: ["none"]
+verification_plan:
+  worker_self_checks:
+    - {command: "<worker fills this after reading scope>", purpose: "implementation feedback only; not final acceptance QA", success_criteria: "Focused issue checks pass before worker returns."}
+  verifier_acceptance_checks:
+    required_gates: ["diagnostics_and_build_gate", "surface_qa_gate", "review_gate"]
+    automated_checks:
+      - {command: "<verifier fills this from issue scope>", success_criteria: "Verifier confirms acceptance criteria through observable behavior."}
+  verifier_manual_qa: {owner: "pr_verifier", surface: "cli|api|browser|library|sql|static-html", happy_path: "Exercise the issue's primary user path.", refusal_or_error_path: "Confirm one refusal, edge, or blocked path when applicable."}
+handoff_contract: {repo_path: "docs/agents/handoffs/issue-16.yaml", github_summary_required: true}
+result_contract: {template_path: "docs/agents/worker-result-template.yaml", verifier_template_path: "docs/agents/evidence-packet-template.yaml", allowed_statuses: [success, blocked, failed]}
+role_boundary: {orchestrator_may_validate_contract_only: true, worker_may_emit_final_acceptance: false, verifier_packet_required_for_completion: true}
+prepared_by: {actor: "Hephaestus", prepared_at: "2026-05-13T10:41:51+08:00"}

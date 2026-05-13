@@ -3,8 +3,8 @@ kind: context_checkpoint
 line_cap: 80
 
 subject:
-  issue_number: "0"
-  branch: "agent/issue-0-bootstrap"
+  issue_number: "42"
+  branch: "agent/issue-42-demo"
   role: "main_orchestrator"
   checkpoint_reason: "standalone_autodev_bootstrap"
 
@@ -31,31 +31,32 @@ runtime_controls:
   human_approval_skipped: false
 
 state:
-  completed: []
+  completed:
+    - "Late successful release result for issue #42 arrived after failure recovery. Reconcile the control plane into completed and continue issue selection."
   in_progress:
-    - "Select a ready issue and bootstrap the standalone orchestrator session."
+    - "Continue supervisor recovery for issue #42."
   next:
-    - "Run scripts/orchestrator_bootstrap_runner.py for the next AFK issue."
+    - "Select the next ready issue packet or remain in orchestrator recovery if none are available."
   blockers:
-    - "none"
+    - "Obtain required human approval, then rerun release_worker."
 
 refs:
-  issue_packet: ""
-  worker_result: ""
+  issue_packet: "docs/agents/issue-packets/issue-42.yaml"
+  worker_result: "docs/agents/worker-results/issue-42.yaml"
   evidence_packet: ""
-  handoff: ""
-  artifact_bundle: ""
+  handoff: "docs/agents/handoffs/issue-41.yaml"
+  artifact_bundle: "docs/agents/release-results/issue-42-pr-88.yaml"
 
 compact_payload:
-  active_target: {issue_number: "0", branch: "agent/issue-0-bootstrap", role: "main_orchestrator", agent: "build", next_flow: "per_issue_flow"}
-  authoritative_refs: ["docs/agents/autonomous-development-workflow.yaml"]
+  active_target: {issue_number: "42", branch: "agent/issue-42-demo", role: "main_orchestrator", agent: "build", next_flow: "per_issue_flow"}
+  authoritative_refs: ["docs/agents/issue-packets/issue-42.yaml", "docs/agents/handoffs/issue-41.yaml", "/home/timmypai/apps/autodev/docs/agents/autonomous-development-workflow.yaml"]
   state_snapshot:
-    completed: []
-    in_progress: ["Select a ready issue and bootstrap the standalone orchestrator session."]
-    next: ["Run scripts/orchestrator_bootstrap_runner.py for the next AFK issue."]
-    blockers: ["none"]
+    completed: ["Late successful release result for issue #42 arrived after failure recovery. Reconcile the control plane into completed and continue issue selection."]
+    in_progress: ["Continue supervisor recovery for issue #42."]
+    next: ["Select the next ready issue packet or remain in orchestrator recovery if none are available."]
+    blockers: ["Obtain required human approval, then rerun release_worker."]
   resume_rules: ["Resume from checkpoint and compact payload, not full chat history.", "Keep raw evidence as refs only; do not inline logs or traces."]
-  immediate_next_action: "Run scripts/orchestrator_bootstrap_runner.py for the next AFK issue."
+  immediate_next_action: "Select the next ready issue packet or remain in orchestrator recovery if none are available."
 
 post_merge_workspace_hygiene:
   primary_workspace_branch_before: "main"
@@ -70,4 +71,4 @@ post_merge_workspace_hygiene:
 
 metadata:
   updated_by: "Build"
-  updated_at: "2026-05-10T00:00:00+08:00"
+  updated_at: "2026-05-07T17:23:00+08:00"
