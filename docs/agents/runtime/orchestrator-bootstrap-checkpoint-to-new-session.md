@@ -78,8 +78,8 @@ Do not trigger from branch changes, git hooks, PR webhooks, or generic session e
 8. Continue `per_issue_flow` in the fresh session in this order:
    - `create_or_switch_issue_branch`
    - validate the selected local issue packet
-   - delegate the first `issue_worker` as a subagent from the root orchestrator
-   - delegate remaining verifier/release roles as subagents from the same root orchestrator
+   - delegate the first `issue_worker` as a subagent from the root orchestrator with `task(..., run_in_background=false)`
+   - delegate remaining verifier/release roles as subagents from the same root orchestrator with `task(..., run_in_background=false)`
 
 If any step before request generation fails, stop and report blocked; do not start worker execution.
 

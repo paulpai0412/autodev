@@ -2,101 +2,86 @@
 
 ## Status
 
-- Status: draft
-- Scope: autodev runtime / scheduler / supervisor
-- Intent: implementation-ready control-plane contract for centralized issue scheduling
+- Status: active
+- Scope: autodev runtime / supervisor / control plane
+- Intent: implementation-ready contract for the shipped SQLite-only control plane
 
 ## Problem
 
-The current autodev runtime prevents duplicate starts per issue with repo-local locks and the GitHub `agent-in-progress` label, but the broader orchestrator control plane is still implicit in code and runtime artifacts. We need one explicit spec for scheduler ownership, DB truth, issue state transitions, GitHub sync rules, event ingestion, verification handoff, and cutover behavior.
+The original autodev runtime mixed truth across GitHub labels, runtime JSON files, repo-local locks, and multiple SQLite append tables. That made recovery and duplicate-start prevention harder to reason about because different surfaces could disagree about what was actually true.
+
+The current design resolves that by keeping **SQLite as the only control-plane source of truth** for lifecycle decisions while leaving runtime files in place only as projections, evidence, or dispatch handoff artifacts.
 
 ## Goal
 
-Define a centralized control plane that:
+Define the control-plane contract that the current runtime must satisfy:
 
-1. Gives one scheduler the final authority over issue lifecycle decisions.
-2. Prevents duplicate dispatch across sessions and worktrees.
-3. Keeps runtime truth in a DB-backed state machine instead of scattered local files.
-4. Preserves the existing worker / verifier role separation.
-5. Makes retries, recovery, audit, and reconciliation deterministic.
+1. Keep canonical issue truth in SQLite.
+2. Prevent duplicate starts across sessions and retries.
+3. Preserve worker / verifier / release role separation.
+4. Make recovery, retries, audit, and reconciliation deterministic.
+5. Keep GitHub as a coordination surface, not the source of truth.
 
 ## Non-goals
 
-- Do not let root sessions directly decide global issue state.
+- Do not let root sessions directly decide global issue lifecycle state.
 - Do not use GitHub as the primary source of truth.
-- Do not support long-lived dual control planes during cutover.
-- Do not introduce multi-layer issue/root leases in the first final design.
+- Do not require long-lived dual control planes.
 - Do not weaken verifier-owned acceptance gates.
 
 ## Final design decisions
 
 ### Control-plane ownership
 
-- A **single active scheduler instance** owns global dispatch decisions.
-- The scheduler runs as a **short-lived reconcile loop**, not a long-lived memory-heavy chat session.
-- The central source of truth is a **DB**, not GitHub and not repo-local runtime JSON.
-- Root orchestrators may emit **facts/events only**. They do not own lifecycle decisions.
+- The runtime operates in a **single-writer supervisor model** per workspace.
+- The supervisor runs as a **short-lived reconcile loop**, not a long-lived memory-heavy chat session.
+- The central source of truth is **SQLite**, not GitHub and not repo-local JSON/YAML artifacts.
+- Root orchestrators and subagents may emit **facts, results, and evidence only**. They do not own lifecycle decisions.
 
-### Lease and failover
+### Fencing and duplicate-start prevention
 
-- Fencing is applied **only at the scheduler instance layer**.
-- The active scheduler holds a lease with heartbeat and TTL.
-- If the lease TTL expires, a new scheduler may **take over immediately**.
-- No issue-level lease and no root-session lease are part of the initial final design.
-
-### Cutover strategy
-
-- Rollout mode is **big bang**.
-- There is **no kill switch** back to the old mode.
-- Before cutover, existing old-model root sessions must **drain to zero**.
-- The new control plane must not intentionally operate in a prolonged dual-control-plane mode.
+- Canonical in-flight fencing lives in SQLite issue state: `claimed`, `dispatching`, `running`, `verifying`, and `quarantined` all block duplicate starts.
+- `.opencode/runtime/issue-locks/issue-<n>.json` is retained only as a **projection/safety artifact** for operator UX and duplicate-start messaging.
+- If a live root session is known, duplicate-start rejection should include a resume hint such as `opencode --session <rootSessionID>`.
 
 ### Dispatch and issue claiming
 
-- An issue selected by the scheduler enters a **pre-dispatch state** before the root session starts.
-- The pre-dispatch state is represented as **`claimed` / `dispatching`** in the DB.
-- GitHub must also show this state via a **distinct label**, not by reusing `agent-in-progress`.
-- GitHub remains a required coordination surface for operator visibility and manual start prevention.
+- An issue selected by the supervisor enters a **pre-dispatch state** before the root session starts.
+- The pre-dispatch states are `claimed` and `dispatching`.
+- GitHub shows this state with `agent-dispatching`; it must not reuse `agent-in-progress`.
+- Claim projections must be cleaned up if claim-time sync fails or dispatch is rejected before a root session exists.
+- Once a root session is successfully created, the issue stays fenced as `running` even if a later GitHub label sync fails. A live root session must not be silently forgotten.
 
 ### GitHub synchronization
 
 - GitHub state synchronization uses **labels only**.
-- If a DB state transition succeeds but the matching GitHub label update fails, the scheduler must **roll back the DB transition**.
-- In this design, GitHub synchronization for dispatch-critical states is **strongly coupled** to state transitions, not best-effort.
+- GitHub remains a required coordination surface for operator visibility and manual-start prevention, but it is not canonical truth.
+- If a DB transition succeeds but a **claim-time / pre-root** GitHub sync fails, the supervisor must roll the issue back and release the claim projection.
+- If a **post-root-start** GitHub sync fails, the supervisor keeps SQLite truth aligned with the live root session and records the sync failure for retry/recovery instead of rolling the issue back to `ready`.
 
 ### Idempotency and auditability
 
-- Every scheduler decision produces a unique **command / decision ID**.
-- The same command ID is attached to:
-  - the DB transition
-  - the GitHub sync attempt
-  - the decision log entry
-- Retries must be idempotent by command ID.
+- Every state-changing supervisor action produces a unique command / decision ID.
+- The same command ID is attached to the SQLite transition and the relevant `issue_history` entries.
+- GitHub sync attempts are recorded in `issue_history(entry_type = "github_sync")`.
+- Retries must be idempotent by command ID or unique history key.
 
 ### Root event ingestion
 
-- Root sessions write **directly to the DB**.
-- Root sessions may **append facts/events only**.
-- Root sessions must not directly update issue lifecycle state, lease ownership, ranking fields, or scheduler decisions.
-- Events use **`event_id` + `session_seq`** for dedupe and per-session ordering.
+- Root sessions and runtime helpers append facts into SQLite.
+- Facts are stored in `issue_history`, not a separate append table.
+- Root sessions must not directly update issue lifecycle state, ranking fields, or admin decisions.
+- Root-session events use stable unique keys and per-session ordering.
 
 ### Completion and verification
 
 - A root terminal event alone does **not** complete an issue.
-- The scheduler moves an issue from `running` to **`verifying`** after a terminal root event.
-- Final completion requires:
-  - a root terminal event
-  - required artifacts/evidence for the issue lane
-- Verification is owned by a **fresh verifier worker**, not the root and not the scheduler directly.
-- An issue in `verifying` still counts as **occupying the same capacity slot** until verification passes or fails.
+- The supervisor moves an issue from `running` to `verifying` after the relevant root/runtime evidence is ingested.
+- Final completion requires verifier / release evidence, not only worker self-report.
+- Verification is owned by `pr_verifier` / `release_worker`, not by the root session and not by ad-hoc operator edits.
+- An issue in `verifying` still counts as occupying the same capacity slot until it reaches `completed` or `failed`.
 
 ## Runtime state model
-
-### Scheduler state
-
-- `active`
-- `expired`
-- `replaced`
 
 ### Issue lifecycle state
 
@@ -114,7 +99,7 @@ Required canonical states:
 ### Required state transition rules
 
 - `ready -> claimed`
-  - scheduler selects issue
+  - supervisor selects issue
   - command ID created
   - GitHub `ready-for-agent` removed
   - GitHub `agent-dispatching` added
@@ -125,38 +110,37 @@ Required canonical states:
 
 - `dispatching -> running`
   - root session successfully created and acknowledged
-  - GitHub `agent-dispatching` removed
-  - GitHub `agent-in-progress` added
+  - `current_root_session_id` recorded in SQLite
+  - GitHub should move from `agent-dispatching` to `agent-in-progress`
 
 - `dispatching -> ready`
-  - root session creation fails before start
-  - dispatch-critical GitHub sync restored
-  - claim released
+  - root session creation fails before start or request is rejected before any live root session exists
+  - claim projection released
+  - GitHub dispatch-critical labels restored
 
 - `running -> verifying`
-  - root sends terminal event
-  - verifier work is required
+  - root/runtime evidence shows implementation finished and verifier work is next
 
 - `running -> quarantined`
-  - timeout, heartbeat failure, or non-classifiable runtime inconsistency
+  - timeout, heartbeat inconsistency, orphaned execution, or other runtime inconsistency that needs fenced recovery
 
 - `verifying -> completed`
-  - verifier evidence passes
-  - lane-specific required artifacts exist
+  - verifier / release evidence passes
+  - required artifacts exist
   - completion decision recorded
 
 - `verifying -> failed`
-  - verifier evidence fails or required artifacts are missing beyond retry policy
+  - verifier / release evidence fails or required artifacts are missing beyond retry policy
 
 - `quarantined -> running`
-  - fenced resume authorized by scheduler decision
+  - fenced resume authorized by explicit operator/supervisor decision
 
 - `quarantined -> failed`
   - recovery policy exhausted or quarantine resolves to terminal failure
 
 ## GitHub label mapping
 
-This spec requires the following coordination labels:
+Required coordination labels:
 
 - `ready-for-agent`
 - `agent-dispatching`
@@ -166,22 +150,22 @@ This spec requires the following coordination labels:
 ### Label rules
 
 - `ready-for-agent`
-  - issue is eligible for scheduler selection
+  - issue is eligible for supervisor selection
 
 - `agent-dispatching`
-  - scheduler has claimed the issue and root startup is in progress
+  - supervisor has claimed the issue and root startup is in progress
 
 - `agent-in-progress`
-  - root session exists and the issue is actively in-flight
+  - root session exists and the issue is actively in flight
 
 - `quarantined`
   - the issue or root session requires controlled recovery and must not be treated as normally runnable
 
-Only the scheduler may apply or remove runtime coordination labels.
+Only the supervisor/operator control-plane commands may apply or remove runtime coordination labels.
 
 ## Capacity model
 
-- Capacity is **bounded**, not unbounded.
+- Capacity is bounded.
 - Capacity is counted per in-flight issue.
 - One issue occupies one slot across:
   - `claimed`
@@ -192,106 +176,108 @@ Only the scheduler may apply or remove runtime coordination labels.
   - `completed`
   - `failed`
 
-This keeps verification debt from silently overfilling the system.
-
 ## DB model
 
-The exact schema may vary, but the control plane must support these logical tables.
-
-### `scheduler_leases`
-
-Tracks active scheduler ownership.
-
-Minimum fields:
-
-- `scheduler_id`
-- `lease_token`
-- `heartbeat_at`
-- `expires_at`
-- `created_at`
-- `replaced_by_scheduler_id`
+The canonical schema is intentionally simplified.
 
 ### `issues`
 
-Tracks canonical issue lifecycle state.
+Tracks current truth for each issue.
 
-Minimum fields:
+Important fields:
 
 - `issue_number`
 - `state`
 - `rank_score`
 - `lane`
+- `current_role`
+- `current_stage`
+- `current_status`
 - `current_root_session_id`
 - `current_verifier_session_id`
+- `last_history_id`
 - `last_command_id`
+- `last_event_at`
+- `updated_at`
 - `claimed_at`
+- `dispatching_at`
 - `running_at`
 - `verifying_at`
 - `completed_at`
 - `failed_at`
 - `quarantined_at`
-- `last_event_at`
+- `attempts_json`
+- `limits_json`
+- `last_failure_json`
+- `resume_snapshot_json`
+- `automation_flags_json`
+- `artifact_refs_json`
+- `issue_packet_json`
 
-### `issue_events`
+### `issue_history`
 
-Append-only event/fact stream from root sessions.
+Append-only audit/history table for every control-plane fact.
 
-Minimum fields:
+Important fields:
 
-- `event_id`
+- `history_id`
 - `issue_number`
-- `root_session_id`
-- `session_seq`
-- `event_type`
-- `payload_json`
-- `created_at`
-
-Constraints:
-
-- unique on `event_id`
-- unique on `(root_session_id, session_seq)`
-
-### `decision_log`
-
-Append-only scheduler decision history.
-
-Minimum fields:
-
+- `entry_type`
+- `role`
+- `stage`
+- `status`
+- `session_id`
+- `request_id`
 - `command_id`
-- `scheduler_id`
-- `issue_number`
-- `decision_type`
 - `from_state`
 - `to_state`
-- `reason`
+- `summary`
+- `payload_json`
 - `created_at`
+- `unique_key`
+- `session_seq`
 
-### `github_sync_attempts`
+Required `entry_type` values include:
 
-Tracks GitHub coordination writes.
+- `state_transition`
+- `session_request`
+- `session_result`
+- `execution_result`
+- `github_sync`
+- `admin_action`
+- `issue_packet_ingested`
+- `checkpoint_snapshot`
+- `root_event`
 
-Minimum fields:
+## Runtime artifact contract
 
-- `command_id`
-- `issue_number`
-- `intended_label_delta`
-- `status`
-- `attempt_count`
-- `last_error`
-- `updated_at`
+These artifacts may still exist, but they are not canonical truth:
+
+- `.opencode/runtime/orchestrator-ledger.json`
+- `.opencode/runtime/new-session-request.json`
+- `.opencode/runtime/new-session-result.json`
+- `.opencode/runtime/issue-locks/issue-<n>.json`
+- `docs/agents/issue-packets/issue-<n>.yaml`
+- compact worker / evidence / release result artifacts
+
+Usage rules:
+
+- request/result/ledger files are dispatch handoff artifacts
+- issue locks are duplicate-start safety projections
+- issue packets and execution artifacts may be ingested into SQLite, but they must not override SQLite lifecycle truth after ingestion
 
 ## Reconcile loop contract
 
 Each reconcile cycle must:
 
-1. Acquire or confirm the scheduler lease.
-2. Read eligible issues from DB truth, not from GitHub alone.
-3. Rebuild deterministic ranking from stored fields.
-4. Select at most the available bounded capacity.
-5. Write decision records for every lifecycle transition.
-6. Apply matching GitHub label changes synchronously for dispatch-critical transitions.
-7. Roll back the DB transition if required GitHub sync fails.
-8. Spawn or resume root/verifier work according to state.
+1. Read canonical issue truth from SQLite, not from GitHub alone.
+2. Rebuild deterministic ranking from stored fields.
+3. Select at most the available bounded capacity.
+4. Write auditable `issue_history` entries for lifecycle transitions and sync attempts.
+5. Apply matching GitHub label changes synchronously for dispatch-critical transitions.
+6. Roll back only pre-root-start transitions when required GitHub sync fails.
+7. Preserve fenced `running` state when a root session is already known.
+8. Spawn or route root/verifier work according to SQLite state.
 9. Reconcile quarantined issues explicitly instead of silently skipping them.
 
 ## Ranking and selection
@@ -306,21 +292,21 @@ Required inputs may include:
 - retry / quarantine penalty
 - verifier backlog pressure
 
-The scheduler must be able to explain why one issue was chosen over another from stored fields alone.
+The supervisor must be able to explain why one issue was chosen over another from stored fields alone.
 
 ## Recovery rules
 
-### Scheduler crash
+### Supervisor restart
 
-- A new scheduler may take over as soon as TTL expires.
-- The new scheduler must not trust in-memory state from the old scheduler.
-- Recovery is rebuilt from DB rows, decision log, and runtime-visible external state.
+- A fresh supervisor invocation must rebuild state only from SQLite plus currently visible runtime artifacts/evidence.
+- It must not depend on prior chat memory.
+- It must not trust stale projection files over SQLite truth.
 
 ### Root timeout or heartbeat loss
 
 - The issue transitions to `quarantined`.
-- Recovery uses **fenced resume**, not blind duplicate restart.
-- The scheduler decides whether to resume, fail, or hold the issue.
+- Recovery uses fenced resume, not blind duplicate restart.
+- The supervisor decides whether to resume, fail, or hold the issue.
 
 ### Dispatch failure
 
@@ -328,18 +314,24 @@ The scheduler must be able to explain why one issue was chosen over another from
   - revert to `ready`
   - remove `agent-dispatching`
   - restore `ready-for-agent`
-  - keep the failed command in `decision_log`
+  - release the issue-lock projection
+  - keep the failed command in `issue_history`
+
+- If dispatch already produced a live `rootSessionID`:
+  - keep the issue fenced as `running`
+  - keep the root session recorded in SQLite and the issue-lock projection
+  - record any GitHub label sync failure for operator retry/recovery
 
 ## Verifier contract
 
-- Verification is handled by a **fresh verifier worker**.
-- The verifier reads compact refs and required artifacts.
-- The verifier is the owner of completion evidence.
-- The scheduler uses verifier output to transition:
+- Verification is handled by fresh verifier/release workers.
+- Verifier/release artifacts are ingested as evidence and results.
+- The verifier/release path owns completion evidence.
+- The supervisor uses that evidence to transition:
   - `verifying -> completed`
   - `verifying -> failed`
 
-The scheduler must not treat worker self-checks as final acceptance evidence.
+The supervisor must not treat worker self-checks alone as final acceptance evidence.
 
 ## Operator and admin operations
 
@@ -347,51 +339,35 @@ Manual intervention is allowed only through explicit admin operations, not ad-ho
 
 Required operator actions:
 
-- inspect scheduler lease status
-- inspect issue state and latest decision
+- inspect canonical issue state and latest history/sync status
 - quarantine an issue intentionally
 - authorize fenced resume
 - mark terminal failure with reason
 - replay or retry a failed GitHub sync-safe command
 
-All admin operations must create auditable decision records.
-
-## Cutover runbook requirements
-
-Before enabling the new control plane:
-
-1. Stop selecting new issues in the old model.
-2. Wait for old-model root sessions to drain to zero.
-3. Confirm no issue remains in an ambiguous in-flight state.
-4. Seed the DB-backed canonical issue state from the latest trusted runtime view.
-5. Enable the scheduler lease path.
-6. Enable DB-backed issue reconciliation.
-7. Enable GitHub label enforcement for `agent-dispatching` and `agent-in-progress`.
-
-Because this design has no kill switch, cutover validation must happen before the new scheduler is allowed to select work.
+All admin operations must create auditable history entries.
 
 ## Implementation slices
 
-Recommended implementation order:
+The shipped implementation order is effectively:
 
-1. Introduce DB schema and repositories for leases, issues, events, decisions, and GitHub sync attempts.
-2. Add canonical issue state machine and transition guards.
-3. Add scheduler lease acquisition and TTL takeover.
-4. Add `claimed` / `dispatching` flow with GitHub rollback-on-sync-failure semantics.
-5. Move root event ingestion to append-only DB writes.
-6. Add `verifying` state and verifier-owned completion transition.
-7. Add quarantine and fenced resume flows.
-8. Add operator/admin commands over auditable decision APIs.
+1. simplify the schema to `issues` + `issue_history`
+2. add canonical issue state machine and transition guards
+3. move root/session/event/sync audit into `issue_history`
+4. keep runtime files only as projections or handoff artifacts
+5. keep duplicate-start safety via SQLite state plus issue-lock projections
+6. add quarantine, fenced resume, and late-result recovery flows
+7. expose operator/admin commands over auditable APIs
 
 ## Acceptance criteria
 
 This spec is satisfied when:
 
-1. Only one scheduler instance can make lifecycle decisions at a time.
+1. SQLite is the only canonical lifecycle source of truth.
 2. Duplicate starts for the same issue are prevented across sessions.
-3. Dispatch-critical GitHub label sync failure cannot leave DB state falsely advanced.
-4. Root sessions can emit facts/events without owning lifecycle decisions.
-5. Completion requires verifier-owned evidence, not only worker/root terminal status.
-6. Capacity is not released before verification finishes.
-7. Scheduler failover can rebuild state from DB and logs without relying on prior chat memory.
+3. Dispatch-critical GitHub sync failure cannot leave SQLite falsely advanced.
+4. A live root session cannot be silently rolled back to `ready`.
+5. Root sessions can emit facts/events without owning lifecycle decisions.
+6. Completion requires verifier/release-owned evidence, not only worker/root terminal status.
+7. Capacity is not released before verification finishes.
 8. Operators can inspect and recover quarantined issues through explicit auditable operations.

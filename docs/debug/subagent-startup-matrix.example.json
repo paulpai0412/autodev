@@ -1,0 +1,29 @@
+{
+  "titlePrefix": "subagent-startup-matrix",
+  "cases": [
+    {
+      "name": "short-no-skills",
+      "category": "deep",
+      "skills": [],
+      "childPrompt": "Reply with READY and stop."
+    },
+    {
+      "name": "short-karpathy",
+      "category": "deep",
+      "skills": ["karpathy-guidelines"],
+      "childPrompt": "Reply with READY and stop."
+    },
+    {
+      "name": "issue-like-minimal",
+      "category": "deep",
+      "skills": ["tdd", "karpathy-guidelines", "diagnose", "web-design-engineer"],
+      "childPrompt": "1. TASK: Act as the fresh issue_worker for issue #9 on branch agent/issue-9-add-clear-completed-flow-to-the-todo-demo in /home/timmypai/apps/autodev-demo-todo. 2. EXPECTED OUTCOME: Produce a compact worker artifact at docs/agents/worker-results/issue-9.yaml with allowed status {success|blocked|failed}. 3. REQUIRED TOOLS: Read and bash only. 4. MUST DO: Read docs/agents/issue-packets/issue-9.yaml first and then stop after reporting status. 5. MUST NOT DO: Do not edit files. 6. CONTEXT: Minimal repro for issue worker startup."
+    },
+    {
+      "name": "quick-short-no-skills",
+      "category": "quick",
+      "skills": [],
+      "childPrompt": "Reply with READY and stop."
+    }
+  ]
+}

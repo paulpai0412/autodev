@@ -2,7 +2,7 @@
 
 ## Repo shape
 - Standalone autonomous-development loop extracted from `wferp`. The executable orchestration code is in `scripts/`; the workflow contract, templates, and runbooks are in `docs/agents/`; live runtime state is in `.opencode/runtime/`.
-- Real entrypoints: `scripts/autodev_project.py`, `scripts/orchestrator_bootstrap_runner.py`, `scripts/orchestrator_supervisor.py`, `scripts/orchestrator_compact_payload.py`, and `scripts/issue_packet_intake.py`.
+- Real entrypoints: `scripts/autodev_project.py`, `scripts/orchestrator_bootstrap_runner.py`, `scripts/orchestrator_supervisor.py`, `scripts/orchestrator_compact_payload.py`, and `scripts/issue_packet_intake.py`. Artifact parsing helpers live in `scripts/orchestrator_artifacts.py`; OpenCode session launch helpers live in `scripts/orchestrator_sessions.py`; issue claim/lock/lifecycle helpers live in `scripts/orchestrator_lifecycle.py`; prompt/request builders live in `scripts/orchestrator_requests.py`; issue selection/intake helpers live in `scripts/orchestrator_selection.py`; reconcile transition/recovery, role-specific branch handlers, and main-orchestrator branch helpers live in `scripts/orchestrator_reconcile.py`.
 - Script-level regressions live in `tests/scripts/`. If you change one orchestrator script, update the matching test file.
 
 ## Exact operator commands
@@ -10,7 +10,6 @@
 - Initialize a consumer project and bootstrap git/GitHub wiring: `PYTHONPATH=. python3 scripts/autodev_project.py init --project-root <project> --github-repo <owner/repo>`
 - Install user-global OpenCode commands: `PYTHONPATH=. python3 scripts/autodev_project.py install-commands`
 - Check a consumer project: `PYTHONPATH=. python3 scripts/autodev_project.py doctor --project-root <project>`
-- Report/remove legacy local workflow files: `PYTHONPATH=. python3 scripts/autodev_project.py migrate --project-root <project> --dry-run`
 - Start a selected AFK issue: `PYTHONPATH=. python3 scripts/orchestrator_bootstrap_runner.py --issue-number <n> --dispatch-now --source-session-id auto-dev`
 - Reconcile after a worker/verifier/release artifact lands: `PYTHONPATH=. python3 scripts/orchestrator_supervisor.py reconcile --ledger .opencode/runtime/orchestrator-ledger.json --source-session-id supervisor-reconcile`
 - Inspect control-plane state: `PYTHONPATH=. python3 scripts/orchestrator_supervisor.py inspect --ledger .opencode/runtime/orchestrator-ledger.json`
@@ -24,7 +23,7 @@
 
 ## Workflow rules agents are likely to miss
 - `main_orchestrator` is orchestration-only. It validates contracts and routes work; it does **not** implement issue scope or perform final issue QA itself.
-- `issue_worker`, `pr_verifier`, and `release_worker` run as subagents inside the current root orchestrator session. Fresh root-session dispatch is only for `main_orchestrator` bootstrap/recovery handoff.
+- `issue_worker`, `pr_verifier`, and `release_worker` run as subagents inside the current root orchestrator session, and the root should launch them synchronously with `run_in_background: false`. Fresh root-session dispatch is only for `main_orchestrator` bootstrap/recovery handoff.
 - Issue execution is serial: one selected `ready-for-agent` issue, one branch, one PR, one orchestrator path at a time.
 - `scripts/orchestrator_bootstrap_runner.py` and `scripts/orchestrator_supervisor.py` are coupled through shared ledger/request/result schema. Changing runtime artifact names or paths breaks reconcile/dispatch flow.
 
@@ -41,4 +40,4 @@
 - `docs/agents/autonomous-development-workflow.yaml` for role boundaries, gates, and serial execution policy.
 - `docs/agents/runtime/orchestrator-control-plane-spec.md` for the SQLite control-plane contract, state machine, and operator recovery semantics.
 - `docs/agents/issue-tracker.md` for GitHub tracker commands and verifier/release evidence rules.
-- `scripts/autodev_project.py` for consumer project init, global command install, doctor checks, and legacy migration.
+- `scripts/autodev_project.py` for consumer project init, global command install, and doctor checks.

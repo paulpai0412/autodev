@@ -15,6 +15,12 @@ summary:
   outcome: "<what the release worker observed>"
   next_recommended_step: "<single next action for supervisor or orchestrator>"
 
+approval_policy:
+  merge_approval_mode: "<human_required|bypass_approval>"
+  human_approval_skipped: false
+  override_source: "<none|workflow_start_source>"
+  override_scope: "<workflow_run_only|none>"
+
 failure_classification: {kind: "<none|checks_pending|checks_failed|merge_conflict|approval_blocked|cleanup_failed|contract_invalid|transient_tool_failure>", retryable: true, routed_to: "<release_worker|main_orchestrator|none>", root_cause_signature: "<stable-signature-or-none>"}
 
 merge:

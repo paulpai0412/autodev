@@ -5,23 +5,28 @@ from pathlib import Path
 
 from scripts.control_plane_db import (
     append_issue_event,
+    append_issue_history,
+    completed_issue_numbers,
     control_plane_db_path,
     ensure_control_plane_db,
+    ingest_issue_packet,
+    issue_rows_with_packets,
     issues_in_states,
-    ready_issues_for_selection,
-    read_active_scheduler_lease,
     read_decision,
     read_github_sync_attempt,
     read_github_sync_attempt_by_command_id,
     read_issue,
+    read_issue_packet,
     read_latest_decision,
     read_latest_github_sync_attempt,
+    read_latest_issue_history,
+    ready_issues_for_selection,
     record_admin_decision,
     record_github_sync_attempt,
+    sync_issue_runtime_context,
     transition_issue_state,
     upsert_issue_ranking,
 )
-from scripts.orchestrator_lease import acquire_scheduler_lease
 
 
 def table_names(db_path: Path) -> set[str]:
@@ -37,16 +42,10 @@ def test_ensure_control_plane_db_creates_required_tables(tmp_path: Path):
     db_path = ensure_control_plane_db(tmp_path)
 
     assert db_path == control_plane_db_path(tmp_path)
-    assert {
-        "scheduler_leases",
-        "issues",
-        "issue_events",
-        "decision_log",
-        "github_sync_attempts",
-    }.issubset(table_names(db_path))
+    assert table_names(db_path) == {"issues", "issue_history", "sqlite_sequence"}
 
 
-def test_transition_issue_state_records_issue_and_decision_log(tmp_path: Path):
+def test_transition_issue_state_records_issue_and_history(tmp_path: Path):
     ensure_control_plane_db(tmp_path)
 
     transition_issue_state(
@@ -62,6 +61,7 @@ def test_transition_issue_state_records_issue_and_decision_log(tmp_path: Path):
 
     issue = read_issue(tmp_path, "42")
     decision = read_decision(tmp_path, "cmd-1")
+    latest_history = read_latest_issue_history(tmp_path, "42", entry_type="state_transition")
 
     assert issue is not None
     assert issue["state"] == "claimed"
@@ -69,6 +69,8 @@ def test_transition_issue_state_records_issue_and_decision_log(tmp_path: Path):
     assert decision is not None
     assert decision["from_state"] == "ready"
     assert decision["to_state"] == "claimed"
+    assert latest_history is not None
+    assert latest_history["command_id"] == "cmd-1"
 
 
 def test_append_issue_event_is_deduplicated_by_event_id_and_session_seq(tmp_path: Path):
@@ -107,7 +109,7 @@ def test_append_issue_event_is_deduplicated_by_event_id_and_session_seq(tmp_path
 
     connection = sqlite3.connect(control_plane_db_path(tmp_path))
     try:
-        count = connection.execute("SELECT COUNT(*) FROM issue_events").fetchone()[0]
+        count = connection.execute("SELECT COUNT(*) FROM issue_history WHERE entry_type = 'root_event'").fetchone()[0]
     finally:
         connection.close()
 
@@ -173,7 +175,7 @@ def test_issues_in_states_returns_only_matching_runtime_rows(tmp_path: Path):
     assert [row["issue_number"] for row in rows] == ["42"]
 
 
-def test_read_latest_rows_return_newest_issue_decision_sync_and_lease(tmp_path: Path):
+def test_read_latest_rows_return_newest_issue_decision_and_sync(tmp_path: Path):
     ensure_control_plane_db(tmp_path)
     transition_issue_state(
         tmp_path,
@@ -214,18 +216,10 @@ def test_read_latest_rows_return_newest_issue_decision_sync_and_lease(tmp_path: 
         updated_at="2026-05-11T10:02:00+08:00",
         last_error="boom",
     )
-    lease = acquire_scheduler_lease(
-        tmp_path,
-        scheduler_id="scheduler-a",
-        heartbeat_at="2026-05-11T10:03:00+08:00",
-        ttl_seconds=60,
-    )
 
     latest_decision = read_latest_decision(tmp_path, "42")
     latest_sync = read_latest_github_sync_attempt(tmp_path, "42")
-    active_lease = read_active_scheduler_lease(tmp_path)
 
-    assert lease is not None
     assert latest_decision is not None
     assert latest_decision["command_id"] == "cmd-dispatch"
     assert latest_sync is not None
@@ -234,8 +228,6 @@ def test_read_latest_rows_return_newest_issue_decision_sync_and_lease(tmp_path: 
     by_command = read_github_sync_attempt_by_command_id(tmp_path, "cmd-gh-2")
     assert by_command is not None
     assert by_command["command_id"] == "cmd-gh-2"
-    assert active_lease is not None
-    assert active_lease["scheduler_id"] == "scheduler-a"
 
 
 def test_upsert_issue_ranking_and_ready_selection_sort_by_rank_score(tmp_path: Path):
@@ -277,3 +269,121 @@ def test_record_admin_decision_persists_latest_decision(tmp_path: Path):
     assert decision is not None
     assert decision["command_id"] == "cmd-gh:retry"
     assert decision["decision_type"] == "admin_github_sync_retry"
+
+
+def test_ingest_issue_packet_and_runtime_context_store_on_issue_row(tmp_path: Path):
+    ensure_control_plane_db(tmp_path)
+
+    _ = ingest_issue_packet(
+        tmp_path,
+        issue_number="42",
+        issue_packet={
+            "issue_number": "42",
+            "title": "Demo issue",
+            "branch": "agent/issue-42-demo",
+            "issue_packet_path": "docs/agents/issue-packets/issue-42.yaml",
+            "labels": ["ready-for-agent"],
+            "parent_reference": "https://github.com/example/issues/1",
+            "dependencies": [],
+        },
+        updated_at="2026-05-11T10:00:00+08:00",
+    )
+    _ = sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-11T10:01:00+08:00",
+        current_role="issue_worker",
+        current_stage="issue_worker_execution",
+        current_status="queued",
+        attempts={"issue_worker": 1},
+        limits={"issue_worker": 3},
+        artifact_refs={"workerResultPath": "docs/agents/worker-results/issue-42.yaml"},
+    )
+
+    packet = read_issue_packet(tmp_path, "42")
+    rows = issue_rows_with_packets(tmp_path)
+    issue = read_issue(tmp_path, "42")
+
+    assert packet["branch"] == "agent/issue-42-demo"
+    assert [row["issue_number"] for row in rows] == ["42"]
+    assert issue is not None
+    assert issue["current_role"] == "issue_worker"
+    assert issue["current_stage"] == "issue_worker_execution"
+
+
+def test_completed_issue_numbers_reads_completed_state_from_db(tmp_path: Path):
+    ensure_control_plane_db(tmp_path)
+    transition_issue_state(
+        tmp_path,
+        issue_number="42",
+        to_state="claimed",
+        command_id="cmd-claim",
+        scheduler_id="scheduler:test",
+        reason="claim issue",
+        updated_at="2026-05-11T10:00:00+08:00",
+        from_state="ready",
+    )
+    transition_issue_state(
+        tmp_path,
+        issue_number="42",
+        to_state="dispatching",
+        command_id="cmd-dispatch",
+        scheduler_id="scheduler:test",
+        reason="dispatch issue",
+        updated_at="2026-05-11T10:01:00+08:00",
+        from_state="claimed",
+    )
+    transition_issue_state(
+        tmp_path,
+        issue_number="42",
+        to_state="running",
+        command_id="cmd-running",
+        scheduler_id="scheduler:test",
+        reason="run issue",
+        updated_at="2026-05-11T10:02:00+08:00",
+        from_state="dispatching",
+    )
+    transition_issue_state(
+        tmp_path,
+        issue_number="42",
+        to_state="verifying",
+        command_id="cmd-verifying",
+        scheduler_id="scheduler:test",
+        reason="verify issue",
+        updated_at="2026-05-11T10:03:00+08:00",
+        from_state="running",
+    )
+    transition_issue_state(
+        tmp_path,
+        issue_number="42",
+        to_state="completed",
+        command_id="cmd-completed",
+        scheduler_id="scheduler:test",
+        reason="complete issue",
+        updated_at="2026-05-11T10:04:00+08:00",
+        from_state="verifying",
+    )
+
+    assert completed_issue_numbers(tmp_path) == {"42"}
+
+
+def test_append_issue_history_supports_generic_history_entries(tmp_path: Path):
+    ensure_control_plane_db(tmp_path)
+    history_id = append_issue_history(
+        tmp_path,
+        issue_number="42",
+        entry_type="execution_result",
+        created_at="2026-05-11T10:00:00+08:00",
+        role="issue_worker",
+        stage="issue_worker_execution",
+        status="success",
+        session_id="ses-worker",
+        summary="worker finished",
+        payload={"pr_number": "77"},
+        unique_key="worker-result:42:2026-05-11T10:00:00+08:00",
+    )
+    latest = read_latest_issue_history(tmp_path, "42", entry_type="execution_result")
+
+    assert history_id > 0
+    assert latest is not None
+    assert latest["status"] == "success"

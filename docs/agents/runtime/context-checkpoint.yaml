@@ -47,7 +47,7 @@ refs:
   artifact_bundle: ""
 
 compact_payload:
-  active_target: {issue_number: "0", branch: "agent/issue-0-bootstrap", role: "main_orchestrator", agent: "hephaestus", next_flow: "per_issue_flow"}
+  active_target: {issue_number: "0", branch: "agent/issue-0-bootstrap", role: "main_orchestrator", agent: "build", next_flow: "per_issue_flow"}
   authoritative_refs: ["docs/agents/autonomous-development-workflow.yaml"]
   state_snapshot:
     completed: []
@@ -69,5 +69,5 @@ post_merge_workspace_hygiene:
   blocked_reason: "none"
 
 metadata:
-  updated_by: "Hephaestus"
+  updated_by: "Build"
   updated_at: "2026-05-10T00:00:00+08:00"

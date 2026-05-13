@@ -6,6 +6,7 @@ def test_transition_allows_canonical_control_plane_paths():
     assert transition("claimed", "dispatching").ok
     assert transition("dispatching", "running").ok
     assert transition("running", "verifying").ok
+    assert transition("quarantined", "claimed").ok
     assert transition("verifying", "running").ok
     assert transition("verifying", "completed").ok
 

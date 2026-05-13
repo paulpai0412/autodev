@@ -6,7 +6,7 @@ Standalone autonomous development loop extracted into its own workspace at `~/ap
 
 - Orchestrator bootstrap, supervisor, compact payload, and GitHub issue intake scripts
 - Workflow policy, runtime docs, e2e/refactor runbooks, and compact artifact templates
-- Autodev-owned project init, global command install, doctor, and migration tooling
+- Autodev-owned project init, global command install, and doctor tooling
 - Script-level pytest coverage
 
 ## Documentation
@@ -35,13 +35,6 @@ PYTHONPATH=. python3 scripts/autodev_project.py install-commands
 ```
 
 From an initialized project, use `/autodev-start <issue-number>`, `/autodev-reconcile`, `/autodev-show-session`, and `/autodev-doctor`.
-
-Remove old project-local workflow code only after reviewing the dry-run report:
-
-```bash
-PYTHONPATH=. python3 scripts/autodev_project.py migrate --project-root /path/to/project --dry-run
-PYTHONPATH=. python3 scripts/autodev_project.py migrate --project-root /path/to/project --remove-legacy
-```
 
 ## Run
 

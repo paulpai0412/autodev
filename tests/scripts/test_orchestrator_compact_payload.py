@@ -53,7 +53,7 @@ refs:
   artifact_bundle: \"\"
 
 metadata:
-  updated_by: \"Hephaestus\"
+  updated_by: \"Build\"
   updated_at: \"2026-05-07T16:00:00+08:00\"
 """
 
@@ -65,13 +65,27 @@ def test_update_checkpoint_text_inserts_compact_payload_and_standardizes_state()
     )
 
     assert "compact_payload:" in updated
-    assert '  active_target: {issue_number: "42", branch: "agent/issue-42-demo", role: "main_orchestrator", agent: "hephaestus", next_flow: "per_issue_flow"}' in updated
+    assert '  active_target: {issue_number: "42", branch: "agent/issue-42-demo", role: "main_orchestrator", agent: "build", next_flow: "per_issue_flow"}' in updated
     assert '  in_progress:' in updated
     assert '    - "Prepare the orchestrator session to enter issue #42 PR flow."' in updated
     assert '    - "Continue per_issue_flow for issue #42 by creating or switching the issue branch."' in updated
     assert '  immediate_next_action: "Continue per_issue_flow for issue #42 by creating or switching the issue branch."' in updated
     assert '  updated_at: "2026-05-07T16:30:00+08:00"' in updated
     assert len(updated.splitlines()) <= CHECKPOINT_LINE_CAP
+
+
+def test_update_checkpoint_text_can_record_workflow_start_approval_override():
+    updated = update_checkpoint_text(
+        SAMPLE_CHECKPOINT_WITHOUT_PAYLOAD,
+        approval_override_mode="bypass_approval",
+        override_source="user_requested_autodev_start",
+        human_approval_skipped=True,
+        updated_at="2026-05-07T16:30:00+08:00",
+    )
+
+    assert '  approval_override_mode: "bypass_approval"' in updated
+    assert '  override_source: "user_requested_autodev_start"' in updated
+    assert '  human_approval_skipped: true' in updated
 
 
 def test_update_checkpoint_text_real_issue20_shape_stays_within_line_cap():
@@ -102,7 +116,7 @@ def test_derive_compact_payload_reads_runtime_checkpoint_contract():
 
     assert payload["active_target"]["issue_number"] == record.issue_number
     assert payload["active_target"]["next_flow"] == "per_issue_flow"
-    assert payload["active_target"]["agent"] == "hephaestus"
+    assert payload["active_target"]["agent"] == "build"
     assert payload["authoritative_refs"][0] == record.issue_packet
     assert payload["authoritative_refs"][-1] == "docs/agents/autonomous-development-workflow.yaml"
     assert payload["immediate_next_action"].startswith("Continue per_issue_flow")

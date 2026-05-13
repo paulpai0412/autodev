@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 from pathlib import Path
 import json
 from subprocess import CompletedProcess
@@ -12,6 +13,19 @@ import scripts.orchestrator_bootstrap_runner as orchestrator_bootstrap_runner
 from scripts.orchestrator_bootstrap_runner import resolve_issue_packet_path, run_orchestrator_bootstrap
 from scripts.control_plane_db import read_github_sync_attempt, read_issue
 from scripts.orchestrator_supervisor import issue_lock_path, parse_issue_packet_text
+
+
+class FakePopen:
+    def __init__(self, stdout: str, stderr: str = "", *, returncode: int | None = None):
+        self.stdout = io.StringIO(stdout)
+        self.stderr = io.StringIO(stderr)
+        self._returncode = returncode
+
+    def poll(self) -> int | None:
+        return self._returncode
+
+    def terminate(self) -> None:
+        self._returncode = -15
 
 
 SAMPLE_ISSUE_PACKET = """schema_version: "1.0"
@@ -74,7 +88,7 @@ refs:
   artifact_bundle: ""
 
 metadata:
-  updated_by: "Hephaestus"
+  updated_by: "Build"
   updated_at: "2026-05-07T16:00:00+08:00"
 """
 
@@ -116,18 +130,53 @@ def test_run_orchestrator_bootstrap_updates_checkpoint_and_returns_next_action(t
     assert 'issue_number: "42"' in updated
     assert 'branch: "agent/issue-42-demo"' in updated
     assert 'handoff: "docs/agents/handoffs/issue-41.yaml"' in updated
-    assert 'agent: "hephaestus"' in updated
+    assert 'agent: "build"' in updated
     assert '"reason": "orchestrator bootstrap continuation for issue #42"' in request
     assert '"title": "Continue issue #42 on agent/issue-42-demo"' in request
     assert result.immediate_next_action in request
+    assert "Immediately launch the first issue_worker subagent in this same turn" in request
+    assert "run_in_background=true" in request
+    assert "collect its result with background_output(...) before continuing" in request
+    assert "Do not include karpathy-guidelines in load_skills for child subagents" not in request
     assert request_payload["requestGeneration"] == 2
     assert request_payload["nonce"]
-    assert request_payload["agent"] == "hephaestus"
+    assert request_payload["agent"] == "build"
     assert request_payload["createdForLedgerRevision"] == ledger["ledgerRevision"]
     issue_state = cast(dict[str, object], ledger["issue"])
     current_state = cast(dict[str, object], ledger["current"])
+    automation = cast(dict[str, object], ledger["automation"])
+    workflow = cast(dict[str, object], ledger["workflow"])
     assert issue_state["number"] == "42"
     assert current_state["stage"] == "orchestrator_bootstrap"
+    assert str(automation["supervisorDocPath"]).endswith("docs/agents/runtime/nonstop-supervisor-loop.md")
+    assert str(workflow["workflowPolicyPath"]).endswith("docs/agents/autonomous-development-workflow.yaml")
+    assert str(workflow["releaseResultTemplatePath"]).endswith("docs/agents/release-result-template.yaml")
+
+
+def test_run_orchestrator_bootstrap_records_workflow_start_approval_override(tmp_path: Path):
+    issue_packet_path = tmp_path / "issue-42.yaml"
+    checkpoint_path = tmp_path / "context-checkpoint.yaml"
+    ledger_path = tmp_path / "orchestrator-ledger.json"
+    request_path = tmp_path / "new-session-request.json"
+    _ = issue_packet_path.write_text(SAMPLE_ISSUE_PACKET, encoding="utf-8")
+    _ = checkpoint_path.write_text(SAMPLE_CHECKPOINT, encoding="utf-8")
+
+    _ = run_orchestrator_bootstrap(
+        issue_packet_path=issue_packet_path,
+        checkpoint_path=checkpoint_path,
+        ledger_path=ledger_path,
+        new_session_request_path=request_path,
+        approval_override_mode="bypass_approval",
+        override_source="user_requested_autodev_start",
+        human_approval_skipped=True,
+        updated_at="2026-05-07T17:00:00+08:00",
+    )
+
+    updated = checkpoint_path.read_text(encoding="utf-8")
+
+    assert '  approval_override_mode: "bypass_approval"' in updated
+    assert '  override_source: "user_requested_autodev_start"' in updated
+    assert '  human_approval_skipped: true' in updated
 
 
 def test_main_reports_continuation_request_written(tmp_path: Path, capsys: CaptureFixture[str]):
@@ -215,6 +264,50 @@ def test_main_accepts_issue_number(tmp_path: Path, capsys: CaptureFixture[str], 
     assert json.loads(ledger_path.read_text(encoding="utf-8"))["issue"]["number"] == "42"
 
 
+def test_main_accepts_issue_number_using_consumer_project_base_dir(
+    tmp_path: Path,
+    capsys: CaptureFixture[str],
+    monkeypatch: MonkeyPatch,
+):
+    consumer_root = tmp_path / "consumer-project"
+    checkpoint_path = consumer_root / "docs/agents/runtime/context-checkpoint.yaml"
+    ledger_path = consumer_root / ".opencode/runtime/orchestrator-ledger.json"
+    request_path = consumer_root / ".opencode/runtime/new-session-request.json"
+    _ = checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    _ = ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    _ = checkpoint_path.write_text(SAMPLE_CHECKPOINT, encoding="utf-8")
+
+    def fake_intake(base_dir: Path) -> bool:
+        issue_packet_path = base_dir / "docs/agents/issue-packets/issue-42.yaml"
+        issue_packet_path.parent.mkdir(parents=True, exist_ok=True)
+        _ = issue_packet_path.write_text(SAMPLE_ISSUE_PACKET, encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(orchestrator_bootstrap_runner, "run_issue_packet_intake", fake_intake)
+
+    exit_code = orchestrator_bootstrap_runner.main(
+        [
+            "--issue-number",
+            "42",
+            "--checkpoint",
+            str(checkpoint_path),
+            "--ledger",
+            str(ledger_path),
+            "--new-session-request",
+            str(request_path),
+            "--updated-at",
+            "2026-05-07T17:00:00+08:00",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "orchestrator bootstrap: updated checkpoint" in captured.out
+    assert json.loads(ledger_path.read_text(encoding="utf-8"))["issue"]["issuePacketPath"] == str(
+        consumer_root / "docs/agents/issue-packets/issue-42.yaml"
+    )
+
+
 def test_main_can_dispatch_immediately(tmp_path: Path, capsys: CaptureFixture[str]):
     issue_packet_path = tmp_path / "issue-42.yaml"
     checkpoint_path = tmp_path / "context-checkpoint.yaml"
@@ -225,13 +318,8 @@ def test_main_can_dispatch_immediately(tmp_path: Path, capsys: CaptureFixture[st
     _ = checkpoint_path.write_text(SAMPLE_CHECKPOINT, encoding="utf-8")
 
     with patch("scripts.orchestrator_supervisor._resolve_opencode_cli", return_value="/usr/bin/opencode"), patch(
-        "scripts.orchestrator_supervisor.subprocess.run",
-        return_value=CompletedProcess(
-            args=["opencode"],
-            returncode=0,
-            stdout='{"type":"step_start","sessionID":"ses_root_test"}\n',
-            stderr="",
-        ),
+        "scripts.orchestrator_supervisor._spawn_detached_opencode_run",
+        return_value=FakePopen('{"type":"step_start","sessionID":"ses_root_test"}\n'),
     ):
         exit_code = orchestrator_bootstrap_runner.main(
             [
@@ -302,11 +390,14 @@ def test_run_orchestrator_bootstrap_rejects_duplicate_issue_lock(tmp_path: Path)
     _ = issue_packet_path.write_text(SAMPLE_ISSUE_PACKET, encoding="utf-8")
     _ = checkpoint_path.write_text(SAMPLE_CHECKPOINT, encoding="utf-8")
     issue_lock_path(tmp_path, "42").parent.mkdir(parents=True, exist_ok=True)
-    issue_lock_path(tmp_path, "42").write_text('{"sourceSessionID": "ses_existing", "createdAt": "2026-05-07T16:59:00+08:00"}\n', encoding="utf-8")
+    _ = issue_lock_path(tmp_path, "42").write_text(
+        '{"sourceSessionID": "ses_existing", "createdAt": "2026-05-07T16:59:00+08:00"}\n',
+        encoding="utf-8",
+    )
 
     with patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
         try:
-            run_orchestrator_bootstrap(
+            _ = run_orchestrator_bootstrap(
                 issue_packet_path=issue_packet_path,
                 checkpoint_path=checkpoint_path,
                 ledger_path=ledger_path,
@@ -329,14 +420,14 @@ def test_run_orchestrator_bootstrap_duplicate_issue_lock_reports_resume_command(
     _ = issue_packet_path.write_text(SAMPLE_ISSUE_PACKET, encoding="utf-8")
     _ = checkpoint_path.write_text(SAMPLE_CHECKPOINT, encoding="utf-8")
     issue_lock_path(tmp_path, "42").parent.mkdir(parents=True, exist_ok=True)
-    issue_lock_path(tmp_path, "42").write_text(
+    _ = issue_lock_path(tmp_path, "42").write_text(
         '{"sourceSessionID": "ses_existing", "rootSessionID": "ses_root_active", "createdAt": "2026-05-07T16:59:00+08:00"}\n',
         encoding="utf-8",
     )
 
     with patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
         try:
-            run_orchestrator_bootstrap(
+            _ = run_orchestrator_bootstrap(
                 issue_packet_path=issue_packet_path,
                 checkpoint_path=checkpoint_path,
                 ledger_path=ledger_path,
@@ -344,8 +435,10 @@ def test_run_orchestrator_bootstrap_duplicate_issue_lock_reports_resume_command(
                 updated_at="2026-05-07T17:00:00+08:00",
             )
         except RuntimeError as error:
-            assert "ses_root_active" in str(error)
-            assert "opencode --session ses_root_active" in str(error)
+            assert str(error) == (
+                "issue #42 is already in progress via ses_root_active since 2026-05-07T16:59:00+08:00; "
+                "refusing duplicate start. Resume with: opencode --session ses_root_active."
+            )
         else:
             raise AssertionError("expected duplicate issue lock to be rejected with resume hint")
 
@@ -395,6 +488,38 @@ def test_run_orchestrator_bootstrap_records_claimed_control_plane_state(tmp_path
 
     assert issue is not None
     assert issue["state"] == "claimed"
+
+
+def test_run_orchestrator_bootstrap_clears_stale_issue_artifacts(tmp_path: Path):
+    issue_packet_path = tmp_path / "issue-42.yaml"
+    checkpoint_path = tmp_path / "docs/agents/runtime/context-checkpoint.yaml"
+    ledger_path = tmp_path / ".opencode/runtime/orchestrator-ledger.json"
+    request_path = tmp_path / ".opencode/runtime/new-session-request.json"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    stale_worker = tmp_path / "docs/agents/worker-results/issue-42.yaml"
+    stale_handoff = tmp_path / "docs/agents/handoffs/issue-42.yaml"
+    stale_evidence = tmp_path / "docs/agents/evidence/issue-42-pr-77.yaml"
+    stale_release = tmp_path / "docs/agents/release-results/issue-42-pr-77.yaml"
+    for path in [stale_worker, stale_handoff, stale_evidence, stale_release]:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text("stale\n", encoding="utf-8")
+    _ = issue_packet_path.write_text(SAMPLE_ISSUE_PACKET, encoding="utf-8")
+    _ = checkpoint_path.write_text(SAMPLE_CHECKPOINT, encoding="utf-8")
+
+    with patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+        _ = run_orchestrator_bootstrap(
+            issue_packet_path=issue_packet_path,
+            checkpoint_path=checkpoint_path,
+            ledger_path=ledger_path,
+            new_session_request_path=request_path,
+            updated_at="2026-05-07T17:00:00+08:00",
+        )
+
+    assert not stale_worker.exists()
+    assert not stale_handoff.exists()
+    assert not stale_evidence.exists()
+    assert not stale_release.exists()
 
 
 def test_bootstrap_dispatch_error_releases_issue_lock(tmp_path: Path, capsys: CaptureFixture[str]):
@@ -464,3 +589,4 @@ def test_bootstrap_claim_github_sync_failure_rolls_back_control_plane_state(tmp_
 
     assert issue is not None
     assert issue["state"] == "ready"
+    assert not issue_lock_path(tmp_path, "42").exists()

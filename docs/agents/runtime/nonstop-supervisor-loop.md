@@ -4,26 +4,28 @@ This repo now has a runtime supervisor layer for the autonomous development work
 
 ## Runtime artifacts
 
-- `.opencode/runtime/orchestrator-ledger.json` is the machine-readable source of truth for the current issue, role, attempts, latest failure, and next dispatch target.
-- `.opencode/runtime/control-plane.sqlite3` is the canonical control-plane store for scheduler leases, issue state, root events, decisions, and GitHub sync attempts.
+- `.opencode/runtime/orchestrator-ledger.json` is the machine-readable handoff artifact for the current issue, role, attempts, latest failure, and next dispatch target.
+- `.opencode/runtime/control-plane.sqlite3` is the canonical control-plane store for current issue state plus append-only issue history.
 - `.opencode/runtime/new-session-request.json` is the queue file consumed by the explicit `dispatch` fallback when a fresh `main_orchestrator` root session must be created.
 - The configured root-session agent must survive checkpoint compaction, runtime-ledger handoff, and fresh-session dispatch; restore must not silently switch agents.
 - `.opencode/runtime/new-session-result.json` records the created root session plus source-session stop status.
 - `docs/agents/issue-packets/issue-<n>.yaml` remains the local execution source for selected issues, even when the issue first came from GitHub.
 - `scripts/issue_packet_intake.py` is the GitHub-to-local materialization step for `ready-for-agent` issues.
+- `.opencode/runtime/issue-locks/issue-<n>.json` is a duplicate-start safety projection, not canonical truth.
 
 ## Session chain contract
 
 1. Orchestrator bootstrap writes the checkpoint, initializes the supervisor ledger, writes the first `new-session-request.json`, and immediately dispatches a fresh `main_orchestrator` root session.
 2. The `main_orchestrator` root session owns the selected issue end-to-end. It delegates `issue_worker`, `pr_verifier`, and `release_worker` work to subagents rather than creating root sessions for those roles.
-3. After each subagent writes its compact artifact, the orchestrator runs `PYTHONPATH=. python3 scripts/orchestrator_supervisor.py reconcile --ledger .opencode/runtime/orchestrator-ledger.json` and uses the returned decision to choose the next subagent or recovery action.
-4. `reconcile --write-request --dispatch-now` is reserved for creating a new `main_orchestrator` root session during orchestrator bootstrap, recovery, or next-issue handoff; it must not be used to launch worker/verifier/release roles as root sessions.
-5. `.opencode/runtime/new-session-result.json` records created root orchestrator sessions so operators can inspect or resume them if needed.
-6. If recovery needs another `ready-for-agent` issue and no suitable local packet exists yet, the supervisor runs `python3 scripts/issue_packet_intake.py --output-dir docs/agents/issue-packets` and retries selection once.
+3. The root orchestrator launches each worker/verifier/release subagent with `task(..., run_in_background=false)` so the same root session waits for the child reply before moving on.
+4. After each subagent writes its compact artifact, the orchestrator runs `PYTHONPATH=. python3 scripts/orchestrator_supervisor.py reconcile --ledger .opencode/runtime/orchestrator-ledger.json` and uses the returned decision to choose the next subagent or recovery action.
+5. `reconcile --write-request --dispatch-now` is reserved for creating a new `main_orchestrator` root session during orchestrator bootstrap, recovery, or next-issue handoff; it must not be used to launch worker/verifier/release roles as root sessions.
+6. `.opencode/runtime/new-session-result.json` records created root orchestrator sessions so operators can inspect or resume them if needed.
+7. If recovery needs another `ready-for-agent` issue and no suitable local packet exists yet, the supervisor runs `python3 scripts/issue_packet_intake.py --output-dir docs/agents/issue-packets` and retries selection once.
 
 ## GitHub intake prerequisites
 
-- `gh` must be installed and authenticated for `paulpai0412/wferp`.
+- `gh` must be installed and authenticated for the target repository.
 - The runtime host must have network access to GitHub when intake fallback is expected.
 - If GitHub is unavailable, the loop can continue only with already-materialized local issue packets.
 
@@ -46,7 +48,7 @@ When `select_next_issue_packet(...)` finds no next local candidate, recovery tri
 
 ## Control-plane operator commands
 
-- `inspect` shows the active scheduler lease, canonical issue state, latest decision, and latest GitHub sync attempt.
+- `inspect` shows canonical issue state, latest decision, and latest GitHub sync attempt.
 - `quarantine` moves a running issue into the explicit quarantined state.
 - `resume-quarantined` performs fenced resume from `quarantined` back to `running`.
 - `fail-quarantined` marks a quarantined issue as terminally failed.

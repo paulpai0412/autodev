@@ -23,7 +23,7 @@ _ALLOWED_TRANSITIONS = {
     "dispatching": {"running", "ready"},
     "running": {"verifying", "quarantined"},
     "verifying": {"running", "completed", "failed"},
-    "quarantined": {"running", "failed"},
+    "quarantined": {"claimed", "running", "failed"},
     "completed": set(),
     "failed": set(),
 }

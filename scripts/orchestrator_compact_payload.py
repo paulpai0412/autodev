@@ -14,7 +14,7 @@ from typing import TypedDict, cast
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CHECKPOINT_PATH = ROOT / "docs/agents/runtime/context-checkpoint.yaml"
 DEFAULT_WORKFLOW_POLICY_PATH = "docs/agents/autonomous-development-workflow.yaml"
-DEFAULT_ROOT_SESSION_AGENT = "hephaestus"
+DEFAULT_ROOT_SESSION_AGENT = "build"
 CHECKPOINT_LINE_CAP = 80
 
 
@@ -33,6 +33,10 @@ class CheckpointRecord:
     updated_by: str
     completed: list[str]
     blockers: list[str]
+    approval_override_mode: str
+    default_merge_approval_mode: str
+    override_source: str
+    human_approval_skipped: bool
 
 
 class ActiveTarget(TypedDict):
@@ -166,6 +170,10 @@ def parse_checkpoint_text(text: str) -> CheckpointRecord:
     refs = _parse_mapping_block(_extract_block_lines(lines, "refs"))
     metadata = _parse_mapping_block(_extract_block_lines(lines, "metadata"))
     state = _parse_state_block(_extract_block_lines(lines, "state"))
+    try:
+        runtime_controls = _parse_mapping_block(_extract_block_lines(lines, "runtime_controls"))
+    except ValueError:
+        runtime_controls = {}
 
     return CheckpointRecord(
         issue_number=subject["issue_number"],
@@ -178,9 +186,13 @@ def parse_checkpoint_text(text: str) -> CheckpointRecord:
         evidence_packet=refs.get("evidence_packet", ""),
         handoff=refs.get("handoff", ""),
         artifact_bundle=refs.get("artifact_bundle", ""),
-        updated_by=metadata.get("updated_by", "Hephaestus"),
+        updated_by=metadata.get("updated_by", "Build"),
         completed=state.get("completed", []),
         blockers=state.get("blockers", []) or ["none"],
+        approval_override_mode=runtime_controls.get("approval_override_mode", ""),
+        default_merge_approval_mode=runtime_controls.get("default_merge_approval_mode", "human_required"),
+        override_source=runtime_controls.get("override_source", "none"),
+        human_approval_skipped=_parse_scalar(runtime_controls.get("human_approval_skipped", "false")).lower() == "true",
     )
 
 
@@ -193,6 +205,9 @@ def apply_overrides(
     agent: str | None = None,
     issue_packet: str | None = None,
     handoff: str | None = None,
+    approval_override_mode: str | None = None,
+    override_source: str | None = None,
+    human_approval_skipped: bool | None = None,
 ) -> CheckpointRecord:
     return CheckpointRecord(
         issue_number=issue_number or record.issue_number,
@@ -208,6 +223,10 @@ def apply_overrides(
         updated_by=record.updated_by,
         completed=list(record.completed),
         blockers=list(record.blockers) or ["none"],
+        approval_override_mode=record.approval_override_mode if approval_override_mode is None else approval_override_mode,
+        default_merge_approval_mode=record.default_merge_approval_mode,
+        override_source=record.override_source if override_source is None else override_source,
+        human_approval_skipped=record.human_approval_skipped if human_approval_skipped is None else human_approval_skipped,
     )
 
 
@@ -324,6 +343,22 @@ def _render_refs_block(record: CheckpointRecord) -> list[str]:
     ]
 
 
+def _render_runtime_controls_block(record: CheckpointRecord) -> list[str]:
+    human_approval_skipped = "true" if record.human_approval_skipped else "false"
+    return [
+        "runtime_controls:",
+        f"  approval_override_mode: {_quote(record.approval_override_mode)}",
+        f"  default_merge_approval_mode: {_quote(record.default_merge_approval_mode)}",
+        '  set_only_at_workflow_start: true',
+        '  mutable_after_start: false',
+        '  scope: "workflow_run_only"',
+        '  applies_to: "all_prs_created_by_this_run"',
+        '  affects_stage: "release_worker_only"',
+        f"  override_source: {_quote(record.override_source)}",
+        f"  human_approval_skipped: {human_approval_skipped}",
+    ]
+
+
 def _render_metadata_block(updated_by: str, updated_at: str) -> list[str]:
     return [
         "metadata:",
@@ -360,6 +395,9 @@ def update_checkpoint_text(
     agent: str | None = None,
     issue_packet: str | None = None,
     handoff: str | None = None,
+    approval_override_mode: str | None = None,
+    override_source: str | None = None,
+    human_approval_skipped: bool | None = None,
     workflow_policy_path: str = DEFAULT_WORKFLOW_POLICY_PATH,
     updated_at: str | None = None,
 ) -> str:
@@ -371,12 +409,21 @@ def update_checkpoint_text(
         agent=agent,
         issue_packet=issue_packet,
         handoff=handoff,
+        approval_override_mode=approval_override_mode,
+        override_source=override_source,
+        human_approval_skipped=human_approval_skipped,
     )
     payload = derive_compact_payload(record, workflow_policy_path=workflow_policy_path)
     timestamp = updated_at or datetime.now().astimezone().isoformat(timespec="seconds")
 
     lines = text.splitlines()
     lines = _replace_or_insert_block(lines, "subject", _render_subject_block(record))
+    lines = _replace_or_insert_block(
+        lines,
+        "runtime_controls",
+        _render_runtime_controls_block(record),
+        insert_before="state",
+    )
     lines = _replace_or_insert_block(lines, "state", _render_state_block(record))
     lines = _replace_or_insert_block(lines, "refs", _render_refs_block(record))
     lines = _replace_or_insert_block(
@@ -404,6 +451,9 @@ def write_checkpoint_file(
     agent: str | None = None,
     issue_packet: str | None = None,
     handoff: str | None = None,
+    approval_override_mode: str | None = None,
+    override_source: str | None = None,
+    human_approval_skipped: bool | None = None,
     workflow_policy_path: str = DEFAULT_WORKFLOW_POLICY_PATH,
     updated_at: str | None = None,
 ) -> str:
@@ -416,6 +466,9 @@ def write_checkpoint_file(
         agent=agent,
         issue_packet=issue_packet,
         handoff=handoff,
+        approval_override_mode=approval_override_mode,
+        override_source=override_source,
+        human_approval_skipped=human_approval_skipped,
         workflow_policy_path=workflow_policy_path,
         updated_at=updated_at,
     )

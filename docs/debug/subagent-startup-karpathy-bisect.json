@@ -1,0 +1,53 @@
+{
+  "titlePrefix": "subagent-startup-karpathy-bisect",
+  "cases": [
+    {
+      "name": "baseline-no-skills",
+      "category": "deep",
+      "skills": [],
+      "childPrompt": "Reply with READY and stop."
+    },
+    {
+      "name": "skill-loaded",
+      "category": "deep",
+      "skills": ["karpathy-guidelines"],
+      "childPrompt": "Reply with READY and stop."
+    },
+    {
+      "name": "inline-full-skill-body",
+      "category": "deep",
+      "skills": [],
+      "childPromptFile": "/tmp/opencode/karpathy-guidelines-slices/full-skill-body.txt"
+    },
+    {
+      "name": "inline-intro",
+      "category": "deep",
+      "skills": [],
+      "childPromptFile": "/tmp/opencode/karpathy-guidelines-slices/intro.txt"
+    },
+    {
+      "name": "inline-think-before-coding",
+      "category": "deep",
+      "skills": [],
+      "childPromptFile": "/tmp/opencode/karpathy-guidelines-slices/think-before-coding.txt"
+    },
+    {
+      "name": "inline-simplicity-first",
+      "category": "deep",
+      "skills": [],
+      "childPromptFile": "/tmp/opencode/karpathy-guidelines-slices/simplicity-first.txt"
+    },
+    {
+      "name": "inline-surgical-changes",
+      "category": "deep",
+      "skills": [],
+      "childPromptFile": "/tmp/opencode/karpathy-guidelines-slices/surgical-changes.txt"
+    },
+    {
+      "name": "inline-goal-driven-execution",
+      "category": "deep",
+      "skills": [],
+      "childPromptFile": "/tmp/opencode/karpathy-guidelines-slices/goal-driven-execution.txt"
+    }
+  ]
+}

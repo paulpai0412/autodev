@@ -14,6 +14,7 @@ from scripts.orchestrator_supervisor import (
     DEFAULT_LEDGER_PATH,
     _infer_artifact_base_dir,
     _dispatch_consumed_request,
+    _sync_issue_packet_to_db,
     build_orchestrator_request,
     claim_issue_execution,
     create_initial_ledger,
@@ -35,6 +36,17 @@ from scripts.orchestrator_compact_payload import (
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_NEW_SESSION_REQUEST_PATH = ROOT / ".opencode/runtime/new-session-request.json"
 DEFAULT_ISSUE_PACKETS_DIR = ROOT / "docs/agents/issue-packets"
+
+
+def _clear_issue_runtime_artifacts(*, base_dir: Path, issue_number: str) -> None:
+    artifact_paths = [
+        base_dir / "docs/agents/worker-results" / f"issue-{issue_number}.yaml",
+        base_dir / "docs/agents/handoffs" / f"issue-{issue_number}.yaml",
+    ]
+    artifact_paths.extend((base_dir / "docs/agents/evidence").glob(f"issue-{issue_number}-pr-*.yaml"))
+    artifact_paths.extend((base_dir / "docs/agents/release-results").glob(f"issue-{issue_number}-pr-*.yaml"))
+    for artifact_path in artifact_paths:
+        artifact_path.unlink(missing_ok=True)
 
 
 @dataclass
@@ -90,6 +102,9 @@ def run_orchestrator_bootstrap(
     new_session_request_path: Path = DEFAULT_NEW_SESSION_REQUEST_PATH,
     dispatch_now: bool = False,
     source_session_id: str = "orchestrator-bootstrap",
+    approval_override_mode: str | None = None,
+    override_source: str | None = None,
+    human_approval_skipped: bool | None = None,
     updated_at: str | None = None,
 ) -> RunnerResult:
     issue_packet = parse_issue_packet_text(
@@ -97,6 +112,8 @@ def run_orchestrator_bootstrap(
         _normalize_issue_packet_ref(issue_packet_path),
     )
     base_dir = _infer_artifact_base_dir(ledger_path)
+    _clear_issue_runtime_artifacts(base_dir=base_dir, issue_number=issue_packet.issue_number)
+    _sync_issue_packet_to_db(base_dir, issue_packet, updated_at=updated_at)
     claim_issue_execution(
         base_dir=base_dir,
         issue_number=issue_packet.issue_number,
@@ -113,6 +130,9 @@ def run_orchestrator_bootstrap(
         agent=DEFAULT_ROOT_SESSION_AGENT,
         issue_packet=issue_packet.issue_packet_path,
         handoff=issue_packet.prior_handoff,
+        approval_override_mode=approval_override_mode,
+        override_source=override_source,
+        human_approval_skipped=human_approval_skipped,
         workflow_policy_path=workflow_policy_path,
         updated_at=updated_at,
     )
@@ -170,6 +190,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _ = parser.add_argument("--dispatch-now", action="store_true", help="Explicitly launch the fresh root session immediately")
     _ = parser.add_argument("--source-session-id", default="orchestrator-bootstrap", help="Source session id to record when dispatching immediately")
+    _ = parser.add_argument("--approval-override-mode", help="Workflow-start merge approval override mode")
+    _ = parser.add_argument("--override-source", help="Workflow-start approval override source")
+    _ = parser.add_argument("--human-approval-skipped", action="store_true", help="Record that human approval is intentionally skipped for this workflow run")
     _ = parser.add_argument(
         "--workflow-policy-path",
         default=DEFAULT_WORKFLOW_POLICY_PATH,
@@ -183,10 +206,13 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     issue_packet_arg = cast(str | None, args.issue_packet)
     issue_number_arg = cast(str | None, args.issue_number)
-    issue_packet_path = Path(issue_packet_arg) if issue_packet_arg else resolve_issue_packet_path(cast(str, issue_number_arg))
     checkpoint_path = Path(cast(str, args.checkpoint))
     ledger_path = Path(cast(str, args.ledger))
     new_session_request_path = Path(cast(str, args.new_session_request))
+    issue_packet_path = Path(issue_packet_arg) if issue_packet_arg else resolve_issue_packet_path(
+        cast(str, issue_number_arg),
+        base_dir=_infer_artifact_base_dir(ledger_path),
+    )
     try:
         result = run_orchestrator_bootstrap(
             issue_packet_path=issue_packet_path,
@@ -195,6 +221,9 @@ def main(argv: list[str] | None = None) -> int:
             new_session_request_path=new_session_request_path,
             dispatch_now=cast(bool, args.dispatch_now),
             source_session_id=cast(str, args.source_session_id),
+            approval_override_mode=cast(str | None, args.approval_override_mode),
+            override_source=cast(str | None, args.override_source),
+            human_approval_skipped=cast(bool, args.human_approval_skipped),
             workflow_policy_path=cast(str, args.workflow_policy_path),
             updated_at=cast(str | None, args.updated_at),
         )
