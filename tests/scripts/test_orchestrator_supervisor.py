@@ -1621,6 +1621,46 @@ def test_dispatch_session_request_uses_unique_launch_title_for_db_fallback_looku
     assert mocked_wait_for_db.call_args.kwargs["title"] == "Continue issue #42 on agent/issue-42-demo [request-42abcdef]"
 
 
+def test_dispatch_session_request_waits_thirty_seconds_for_db_fallback_lookup():
+    request: orchestrator_supervisor.SessionRequest = {
+        "requestGeneration": 1,
+        "nonce": "nonce-42",
+        "requestID": "request-42",
+        "createdAt": "2026-05-07T17:00:00+08:00",
+        "createdForLedgerRevision": "2026-05-07T17:00:00+08:00",
+        "reason": "orchestrator bootstrap continuation for issue #42",
+        "title": "Continue issue #42 on agent/issue-42-demo",
+        "agent": "build",
+        "prompt": "Bootstrap from checkpoint only.",
+        "role": "main_orchestrator",
+        "stage": "orchestrator_bootstrap",
+        "issueNumber": "42",
+        "branch": "agent/issue-42-demo",
+    }
+
+    with patch("scripts.orchestrator_supervisor._resolve_opencode_cli", return_value="/usr/bin/opencode"), patch(
+        "scripts.orchestrator_supervisor._spawn_detached_opencode_run",
+        return_value=FakePopen("", stderr="", returncode=None),
+    ), patch(
+        "scripts.orchestrator_supervisor._read_initial_session_id",
+        return_value=(None, "", ""),
+    ), patch(
+        "scripts.orchestrator_supervisor._wait_for_session_id_in_db",
+        return_value="ses_root_db",
+    ) as mocked_wait_for_db, patch(
+        "scripts.orchestrator_supervisor._probe_same_repo_session_readability",
+        return_value=(True, "ok"),
+    ):
+        _ = orchestrator_supervisor.dispatch_session_request(
+            request,
+            workdir=Path("/tmp/demo"),
+            source_session_id="ses_source_test",
+            updated_at="2026-05-07T17:10:00+08:00",
+        )
+
+    assert mocked_wait_for_db.call_args.kwargs["timeout_seconds"] == 30.0
+
+
 def test_dispatch_session_request_preserves_explicit_cli_agent_override():
     request: orchestrator_supervisor.SessionRequest = {
         "requestGeneration": 1,

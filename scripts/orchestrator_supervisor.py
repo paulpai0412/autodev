@@ -1280,7 +1280,7 @@ def dispatch_session_request(
             title=launch_title,
             workdir=workdir,
             created_after_ms=started_at_ms,
-            timeout_seconds=2.0,
+            timeout_seconds=30.0,
         )
     if not root_session_id:
         if process.poll() is None:

@@ -3,6 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import cast
+
+from pytest import MonkeyPatch
 
 import scripts.subagent_startup_repro as repro
 from scripts.subagent_startup_repro import (
@@ -176,7 +179,7 @@ class _FakeProcess:
         return None
 
 
-def test_run_once_inserts_explicit_root_agent_into_opencode_command(monkeypatch, tmp_path: Path) -> None:
+def test_run_once_inserts_explicit_root_agent_into_opencode_command(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
     captured: dict[str, object] = {}
 
     monkeypatch.setattr(repro, "resolve_opencode_cli", lambda: "/fake/opencode")
@@ -223,12 +226,90 @@ def test_run_once_inserts_explicit_root_agent_into_opencode_command(monkeypatch,
     )
 
     assert captured["workdir"] == tmp_path
-    command = captured["command"]
+    command = cast(list[str], captured["command"])
     assert command[:4] == ["/fake/opencode", "run", "--format", "json"]
     assert command[4:8] == ["--agent", "hephaestus", "--title", "root-title"]
     assert 'subagent_type: "general"' in str(command[-1])
     assert result["root_agent"] == "hephaestus"
     assert result["child_subagent_type"] == "general"
+
+
+def test_run_once_prompt_differs_between_immediate_stop_and_thirty_second_keepalive(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    captured_commands: list[list[str]] = []
+
+    monkeypatch.setattr(repro, "resolve_opencode_cli", lambda: "/fake/opencode")
+
+    def fake_spawn_detached_opencode_run(command: list[str], *, workdir: Path) -> _FakeProcess:
+        _ = workdir
+        captured_commands.append(command)
+        return _FakeProcess()
+
+    monkeypatch.setattr(repro, "spawn_detached_opencode_run", fake_spawn_detached_opencode_run)
+    monkeypatch.setattr(repro, "read_initial_session_id", lambda *args, **kwargs: ("ses-root", "", ""))
+    monkeypatch.setattr(
+        repro,
+        "read_session_summary",
+        lambda session_id: {
+            "session_id": session_id,
+            "latest_assistant_status": "stop",
+            "message_count": 1,
+            "part_count": 1,
+        },
+    )
+    monkeypatch.setattr(repro, "_load_session_parts", lambda session_id: [])
+    monkeypatch.setattr(repro, "poll_child_session", lambda *args, **kwargs: None)
+    monkeypatch.setattr(repro.time, "sleep", lambda _seconds: None)
+
+    immediate_result = run_once(
+        workdir=tmp_path,
+        title="root-immediate",
+        root_agent="",
+        child_subagent_type="general",
+        category="deep",
+        skills=[],
+        child_description="Repro child session",
+        child_title_contains="Repro child session",
+        child_prompt="Do work.",
+        child_prompt_file="",
+        run_in_background=True,
+        parent_keepalive_seconds=0.0,
+        root_timeout=15.0,
+        db_timeout=5.0,
+        child_timeout=30.0,
+        poll_interval=0.5,
+        settle_timeout=5.0,
+    )
+    keepalive_result = run_once(
+        workdir=tmp_path,
+        title="root-keepalive",
+        root_agent="",
+        child_subagent_type="general",
+        category="deep",
+        skills=[],
+        child_description="Repro child session",
+        child_title_contains="Repro child session",
+        child_prompt="Do work.",
+        child_prompt_file="",
+        run_in_background=True,
+        parent_keepalive_seconds=30.0,
+        root_timeout=15.0,
+        db_timeout=5.0,
+        child_timeout=30.0,
+        poll_interval=0.5,
+        settle_timeout=5.0,
+    )
+
+    immediate_prompt = captured_commands[0][-1]
+    keepalive_prompt = captured_commands[1][-1]
+
+    assert immediate_result["parent_keepalive_seconds"] == 0.0
+    assert keepalive_result["parent_keepalive_seconds"] == 30.0
+    assert 'After the task tool returns, stop immediately.' in immediate_prompt
+    assert 'command "sleep 30"' not in immediate_prompt
+    assert 'command "sleep 30"' in keepalive_prompt
+    assert 'After the bash sleep command finishes, stop.' in keepalive_prompt
 
 
 def test_run_matrix_prefers_case_level_root_and_child_agent_overrides(monkeypatch, tmp_path: Path) -> None:
