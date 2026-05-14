@@ -4,43 +4,48 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
+import sqlite3
 import subprocess
-import shutil
 import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import ModuleType
 from uuid import uuid4
-from typing import IO, Callable, NotRequired, Protocol, TypedDict, cast
+from typing import Callable, NotRequired, Protocol, TypedDict, cast
 
 from scripts.control_plane_db import (
     append_issue_event,
     append_issue_history,
     completed_issue_numbers,
+    control_plane_db_path,
     describe_control_plane_schema,
     ensure_control_plane_db,
     ensure_issue_row,
     ingest_issue_packet,
     issue_rows_with_packets,
+    list_issues,
     issues_in_states,
     ready_issues_for_selection,
-    read_latest_issue_history,
+    read_latest_history_entry,
     read_issue_packet,
     record_admin_decision,
     read_latest_decision,
     read_latest_github_sync_attempt,
     read_github_sync_attempt_by_command_id,
     read_issue,
+    read_runtime_context,
     record_github_sync_attempt,
     sync_issue_runtime_context,
     transition_issue_state,
     upsert_issue_ranking,
     upsert_issue_state,
 )
+from scripts.host_adapter import HostAdapter, SessionStartContext
 from scripts.orchestrator_compact_payload import write_checkpoint_file
 
 
@@ -58,6 +63,22 @@ class IssuePacketRecord(Protocol):
     parent_reference: str
     dependencies: list[str]
     raw_text: str
+
+
+def _normalize_requested_issue_number(issue_number: str) -> str:
+    normalized = issue_number.strip().removeprefix("#").removeprefix("issue-")
+    if not normalized.isdigit():
+        raise RuntimeError(f"issue number must be numeric, got {issue_number!r}")
+    return normalized
+
+
+def _validate_start_packet_issue_number(*, requested_issue_number: str, packet: IssuePacketRecord) -> str:
+    packet_issue_number = str(packet.issue_number).strip()
+    if packet_issue_number != requested_issue_number or not packet_issue_number.isdigit():
+        raise RuntimeError(
+            f"issue packet number mismatch for requested issue #{requested_issue_number}: got {packet_issue_number!r}"
+        )
+    return packet_issue_number
 
 
 def _load_artifact_helpers() -> ModuleType:
@@ -273,24 +294,6 @@ def _clear_issue_runtime_artifacts(*, base_dir: Path, issue_number: str) -> None
         artifact_path.unlink(missing_ok=True)
 
 
-def _resolve_opencode_cli() -> str | None:
-    opencode_cli = shutil.which("opencode")
-    if opencode_cli:
-        return opencode_cli
-
-    known_install_paths = [
-        Path.home() / ".opencode/bin/opencode",
-        Path.home() / ".local/bin/opencode",
-        Path.home() / "bin/opencode",
-    ]
-    for candidate in known_install_paths:
-        if candidate.exists():
-            return str(candidate)
-
-    return shutil.which("opencode-desktop")
-
-
-
 class SessionRequest(TypedDict):
     requestGeneration: int
     nonce: str
@@ -331,6 +334,18 @@ class SessionResult(TypedDict, total=False):
     recordedAt: str
 
 
+def _session_request_body(request: SessionRequest) -> str:
+    return json.dumps(dict(request), ensure_ascii=False, indent=2)
+
+
+def _session_result_body(result: SessionResult) -> str:
+    return json.dumps(dict(result), ensure_ascii=False, indent=2)
+
+
+def _content_hash(text: str) -> str:
+    return f"sha256:{hashlib.sha256(text.encode('utf-8')).hexdigest()}"
+
+
 def _record_dispatch_request_history(
     *,
     base_dir: Path,
@@ -338,6 +353,7 @@ def _record_dispatch_request_history(
     created_at: str,
 ) -> int:
     request_id = str(request.get("requestID") or "")
+    body_text = _session_request_body(request)
     return append_issue_history(
         base_dir,
         issue_number=request["issueNumber"],
@@ -350,6 +366,8 @@ def _record_dispatch_request_history(
         command_id=request_id,
         summary=request["reason"],
         payload=dict(request),
+        body_text=body_text,
+        content_hash=_content_hash(body_text),
         unique_key=f"dispatch-request:{request_id or created_at}",
     )
 
@@ -366,6 +384,7 @@ def _record_dispatch_result_history(
     status = str(session_result.get("status") or "")
     if not issue_number or not recorded_at:
         return 0
+    body_text = _session_result_body(session_result)
     return append_issue_history(
         base_dir,
         issue_number=issue_number,
@@ -379,41 +398,139 @@ def _record_dispatch_result_history(
         command_id=request_id,
         summary=str(session_result.get("reason") or status),
         payload=dict(session_result),
+        body_text=body_text,
+        content_hash=_content_hash(body_text),
         unique_key=f"dispatch-result:{request_id or recorded_at}",
     )
 
 
+def _record_runtime_transition_history(
+    *,
+    base_dir: Path,
+    issue_number: str,
+    recorded_at: str,
+    from_role: str,
+    from_stage: str,
+    to_role: str,
+    to_stage: str,
+    reason: str,
+) -> int:
+    body_text = f"{from_role}/{from_stage} -> {to_role}/{to_stage}"
+    unique_key = f"runtime-transition:{issue_number}:{recorded_at}:{from_role}:{from_stage}:{to_role}:{to_stage}"
+    payload = json.dumps(
+        {
+            "transition_type": "runtime_role_stage",
+            "from_role": from_role,
+            "from_stage": from_stage,
+            "to_role": to_role,
+            "to_stage": to_stage,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    ensure_control_plane_db(base_dir)
+    connection = sqlite3.connect(control_plane_db_path(base_dir))
+    try:
+        cursor = connection.execute(
+            "SELECT history_id FROM issue_history WHERE unique_key = ?",
+            (unique_key,),
+        )
+        existing = cursor.fetchone()
+        if existing is not None:
+            return int(existing[0])
+        cursor = connection.execute(
+            """
+            INSERT INTO issue_history (
+                issue_number,
+                entry_type,
+                role,
+                stage,
+                status,
+                summary,
+                payload_json,
+                body_text,
+                content_hash,
+                created_at,
+                unique_key
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                issue_number,
+                "runtime_transition",
+                to_role,
+                to_stage,
+                "queued",
+                reason,
+                payload,
+                body_text,
+                _content_hash(body_text),
+                recorded_at,
+                unique_key,
+            ),
+        )
+        connection.commit()
+        history_id_raw = cursor.lastrowid
+        if history_id_raw is None:
+            raise RuntimeError("failed to insert runtime_transition history row")
+        return int(history_id_raw)
+    finally:
+        connection.close()
+
+
+def _backfill_runtime_transition_history(*, base_dir: Path, ledger: JsonObject) -> None:
+    issue = cast(dict[str, str], ledger.get("issue", {}))
+    issue_number = issue.get("number", "")
+    if not issue_number:
+        return
+    history = cast(list[JsonObject], ledger.get("history", []))
+    for entry in history:
+        recorded_at = str(entry.get("recordedAt") or "")
+        from_role = str(entry.get("fromRole") or "")
+        from_stage = str(entry.get("fromStage") or "")
+        to_role = str(entry.get("toRole") or "")
+        to_stage = str(entry.get("toStage") or "")
+        reason = str(entry.get("reason") or "")
+        if not (recorded_at and from_role and to_role and to_stage):
+            continue
+        _record_runtime_transition_history(
+            base_dir=base_dir,
+            issue_number=issue_number,
+            recorded_at=recorded_at,
+            from_role=from_role,
+            from_stage=from_stage,
+            to_role=to_role,
+            to_stage=to_stage,
+            reason=reason,
+        )
+
+
 def read_latest_dispatch_result(base_dir: Path, *, issue_number: str | None = None) -> SessionResult | None:
-    if issue_number is None:
-        return None
-    row = read_latest_issue_history(base_dir, issue_number, entry_type="dispatch_result")
+    row = read_latest_history_entry(base_dir, issue_number=issue_number, entry_type="dispatch_result")
     if row is None:
         return None
-    payload = row.get("payload_json")
-    if isinstance(payload, dict):
-        return cast(SessionResult, cast(object, payload))
-    if isinstance(payload, str):
-        try:
-            parsed = json.loads(payload)
-        except json.JSONDecodeError:
-            return None
-        if isinstance(parsed, dict):
-            return cast(SessionResult, cast(object, parsed))
-    return None
+    payload = json.loads(str(row.get("payload_json") or "{}"))
+    return cast(SessionResult, cast(object, payload)) if isinstance(payload, dict) else None
 
 
 def show_latest_session(*, base_dir: Path, issue_number: str | None = None) -> SessionResult | None:
-    if issue_number is not None:
-        return read_latest_dispatch_result(base_dir, issue_number=issue_number)
-    issue_rows = issue_rows_with_packets(base_dir)
-    for issue_row in issue_rows:
-        candidate_issue_number = str(issue_row.get("issue_number") or "")
-        if not candidate_issue_number:
-            continue
-        result = read_latest_dispatch_result(base_dir, issue_number=candidate_issue_number)
-        if result is not None:
+    if issue_number:
+        issue = read_issue(base_dir, issue_number)
+        if issue is not None:
+            current_session_id = str(issue.get("current_session_id") or "")
+            result = read_latest_dispatch_result(base_dir, issue_number=issue_number)
+            if result is not None and current_session_id and not result.get("cliOpenCommand"):
+                result["cliOpenCommand"] = _default_host_adapter().resume_link(current_session_id)
             return result
-    return None
+    active_issues = list_issues(base_dir, require_current_session=True)
+    if active_issues:
+        latest_issue = active_issues[0]
+        latest_issue_number = str(latest_issue.get("issue_number") or "")
+        result = read_latest_dispatch_result(base_dir, issue_number=latest_issue_number)
+        current_session_id = str(latest_issue.get("current_session_id") or "")
+        if result is not None and current_session_id and not result.get("cliOpenCommand"):
+            result["cliOpenCommand"] = _default_host_adapter().resume_link(current_session_id)
+        return result
+    return read_latest_dispatch_result(base_dir)
 
 
 def start_issue(
@@ -427,7 +544,7 @@ def start_issue(
     updated_at: str | None = None,
 ) -> SessionResult:
     ensure_control_plane_db(base_dir)
-    normalized_issue_number = issue_number.strip().removeprefix("#").removeprefix("issue-")
+    normalized_issue_number = _normalize_requested_issue_number(issue_number)
     packet = _load_issue_packet_from_db(base_dir, normalized_issue_number)
     if packet is None:
         issue_packet_path = base_dir / "docs/agents/issue-packets" / f"issue-{normalized_issue_number}.yaml"
@@ -436,14 +553,15 @@ def start_issue(
         if not issue_packet_path.exists():
             raise RuntimeError(f"issue packet not found for issue #{normalized_issue_number}: {issue_packet_path}")
         packet = parse_issue_packet_text(issue_packet_path.read_text(encoding="utf-8"), str(issue_packet_path.relative_to(base_dir)))
+        _validate_start_packet_issue_number(requested_issue_number=normalized_issue_number, packet=packet)
         _sync_issue_packet_to_db(base_dir, packet, updated_at=updated_at)
 
-    issue_number = packet.issue_number
+    issue_number = _validate_start_packet_issue_number(requested_issue_number=normalized_issue_number, packet=packet)
     issue_state = read_issue(base_dir, issue_number)
     state = str(issue_state.get("state") or "ready") if issue_state else "ready"
     if state != "ready":
-        current_root_session_id = str(issue_state.get("current_root_session_id") or "") if issue_state else ""
-        resume_suffix = f" Resume with: opencode --session {current_root_session_id}." if current_root_session_id else ""
+        current_session_id = str(issue_state.get("current_session_id") or "") if issue_state else ""
+        resume_suffix = f" Resume with: {_default_host_adapter().resume_link(current_session_id)}." if current_session_id else ""
         raise RuntimeError(f"issue #{issue_number} is already {state}; refusing duplicate start.{resume_suffix}")
 
     timestamp = _now(updated_at)
@@ -471,10 +589,9 @@ def start_issue(
             state="ready",
             command_id=f"start-issue:{issue_number}:labels-rollback",
             updated_at=timestamp,
-            current_root_session_id="",
+            current_session_id="",
         )
         raise RuntimeError(f"failed to sync GitHub in-progress state for issue #{issue_number}: {sync_error}")
-
     ledger = create_initial_ledger(
         issue_packet=packet,
         checkpoint_path=str(base_dir / DEFAULT_CHECKPOINT_PATH),
@@ -494,7 +611,7 @@ def start_issue(
         base_dir,
         issue_number=issue_number,
         updated_at=timestamp,
-        resume_snapshot={
+        runtime_context={
             "workflow_start_runtime_controls": cast(dict[str, object], workflow["runtimeControls"]),
         },
     )
@@ -527,7 +644,7 @@ def start_issue(
             updated_at=recorded_at,
             reason=f"Root session {root_session_id} acknowledged for issue #{issue_number}.",
             from_state="dispatching",
-            current_root_session_id=root_session_id,
+            current_session_id=root_session_id,
         )
         _append_root_issue_event(
             base_dir=base_dir,
@@ -548,9 +665,19 @@ def start_issue(
         )
         if sync_error:
             session_result["recommendedAction"] = (
-                f"Open /sessions in OpenCode TUI and switch to {root_session_id}, or run opencode --session {root_session_id}. "
+                f"Resume the active root session with {_default_host_adapter().resume_link(root_session_id)}. "
                 f"GitHub running-label sync failed and may need retry: {sync_error}"
             )
+        # Persist the initial bootstrap -> issue_worker handoff in SQLite before the
+        # first issue_worker launch so verifier evidence can come from the control plane.
+        ledger["lastSessionResult"] = dict(session_result)
+        _bump_ledger_revision(ledger, recorded_at)
+        reconcile_ledger(
+            ledger,
+            session_result_path=base_dir / ".opencode/runtime/_no-session-result.json",
+            artifact_base_dir=base_dir,
+            updated_at=recorded_at,
+        )
     else:
         failure_updated_at = str(session_result.get("recordedAt") or timestamp)
         release_issue_execution(
@@ -649,15 +776,15 @@ def _sync_root_issue_event_from_session_result(ledger: JsonObject, *, base_dir: 
         return
     runtime_issue = read_issue(base_dir, issue_number) or {}
     current_state = str(runtime_issue.get("state") or "")
-    current_root_session_id = str(runtime_issue.get("current_root_session_id") or "")
-    if current_state and not current_root_session_id:
+    current_session_id = str(runtime_issue.get("current_session_id") or "")
+    if current_state and not current_session_id:
         upsert_issue_state(
             base_dir,
             issue_number=issue_number,
             state=current_state,
             command_id=f"session-result-hydrate:{issue_number}:{recorded_at}",
             updated_at=recorded_at,
-            current_root_session_id=root_session_id,
+            current_session_id=root_session_id,
         )
     _append_root_issue_event(
         base_dir=base_dir,
@@ -840,7 +967,7 @@ def _refresh_running_issue_heartbeat_from_worker_result(
 ) -> bool:
     if str(runtime_issue.get("state") or "") != "running":
         return False
-    current_root_session_id = str(runtime_issue.get("current_root_session_id") or "")
+    current_root_session_id = str(runtime_issue.get("current_session_id") or "")
     if not current_root_session_id or not worker_result_path.is_file():
         return False
     try:
@@ -863,8 +990,7 @@ def _refresh_running_issue_heartbeat_from_worker_result(
         state="running",
         command_id=f"worker-result-heartbeat:{issue_number}:{completed_at}",
         updated_at=completed_at,
-        current_root_session_id=current_root_session_id,
-        current_verifier_session_id=str(runtime_issue.get("current_verifier_session_id") or "") or None,
+        current_session_id=current_root_session_id,
     )
     return True
 
@@ -887,7 +1013,7 @@ def _record_current_verifier_session(
         state=state,
         command_id=uuid4().hex,
         updated_at=updated_at,
-        current_verifier_session_id=verifier_session_id,
+        current_session_id=verifier_session_id,
     )
 
 def issue_lock_path(base_dir: Path, issue_number: str) -> Path:
@@ -942,147 +1068,14 @@ def _sync_issue_progress_label(
     )
 
 
-def _spawn_detached_opencode_run(command: list[str], *, workdir: Path) -> subprocess.Popen[str]:
-    spawn_run = cast(Callable[..., subprocess.Popen[str]], _session_helpers.spawn_detached_opencode_run)
-    return spawn_run(command, workdir=workdir)
-
-
-def _find_session_id_in_db(*, title: str, workdir: Path, created_after_ms: int) -> str | None:
-    find_session = cast(Callable[..., str | None], _session_helpers.find_session_id_in_db)
-    return find_session(title=title, workdir=workdir, created_after_ms=created_after_ms)
-
-
-def _wait_for_session_id_in_db(
-    *,
-    title: str,
-    workdir: Path,
-    created_after_ms: int,
-    timeout_seconds: float,
-) -> str | None:
-    wait_for_session = cast(Callable[..., str | None], _session_helpers.wait_for_session_id_in_db)
-    return wait_for_session(
-        title=title,
-        workdir=workdir,
-        created_after_ms=created_after_ms,
-        timeout_seconds=timeout_seconds,
-        find_session_id=_find_session_id_in_db,
-    )
-
-
-def _read_initial_session_id(
-    process: subprocess.Popen[str],
-    *,
-    timeout_seconds: float,
-) -> tuple[str | None, str, str]:
-    read_session = cast(Callable[..., tuple[str | None, str, str]], _session_helpers.read_initial_session_id)
-    extract_session_id = cast(Callable[[str], str], _session_helpers.extract_session_id_from_run_output)
-    supports_fileno = cast(Callable[[IO[str]], bool], _session_helpers.stream_supports_fileno)
-    return read_session(
-        process,
-        timeout_seconds=timeout_seconds,
-        extract_session_id=extract_session_id,
-        supports_fileno=supports_fileno,
-    )
+def _default_host_adapter() -> HostAdapter:
+    factory = cast(Callable[[], HostAdapter], _session_helpers.default_host_adapter)
+    return factory()
 
 
 def _dispatch_launch_title(request: SessionRequest) -> str:
     request_id = str(request.get("requestID") or uuid4().hex)
     return f"{request['title']} [{request_id}]"
-
-
-def _extract_same_repo_session_read_probe_result(stdout_text: str) -> tuple[bool | None, str]:
-    for line in stdout_text.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        try:
-            event = cast(dict[str, object], json.loads(stripped))
-        except json.JSONDecodeError:
-            continue
-        if event.get("type") != "tool_use":
-            continue
-        part = event.get("part")
-        if not isinstance(part, dict) or part.get("tool") != "session_read":
-            continue
-        state = part.get("state")
-        if not isinstance(state, dict):
-            return False, "session_read probe returned invalid tool state"
-        output = state.get("output")
-        if not isinstance(output, str):
-            return False, "session_read probe returned no output"
-        stripped_output = output.strip()
-        if stripped_output.startswith("Session not found:"):
-            return False, stripped_output
-        if stripped_output:
-            return True, stripped_output
-        return False, "session_read probe returned empty output"
-    return None, "session_read probe did not emit a session_read tool result"
-
-
-def _probe_same_repo_session_readability(
-    cli_command: str,
-    *,
-    workdir: Path,
-    root_session_id: str,
-    timeout_seconds: float = 30.0,
-    max_attempts: int = 3,
-    retry_delay_seconds: float = 0.5,
-) -> tuple[bool, str]:
-    cli_path = Path(cli_command)
-    if not cli_path.exists():
-        return True, "skipped_same_repo_probe_missing_cli"
-
-    resolved_workdir = workdir.resolve()
-    probe_env = os.environ.copy()
-    probe_env["PWD"] = str(resolved_workdir)
-    prompt = (
-        f"Use the session_read tool to read session {root_session_id} with limit 1. "
-        "Stop immediately after the tool call."
-    )
-
-    for attempt in range(1, max_attempts + 1):
-        probe_command = [
-            cli_command,
-            "run",
-            "--format",
-            "json",
-            "--title",
-            f"session-readability-check-{root_session_id[-8:]}-{attempt}",
-            prompt,
-        ]
-        try:
-            completed = subprocess.run(
-                probe_command,
-                cwd=str(resolved_workdir),
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds,
-                env=probe_env,
-            )
-        except subprocess.TimeoutExpired:
-            return False, f"session_read probe timed out after {timeout_seconds} seconds"
-        except OSError as error:
-            return False, str(error)
-
-        probe_ok, probe_detail = _extract_same_repo_session_read_probe_result(completed.stdout)
-        if probe_ok is True:
-            return True, probe_detail
-        if probe_ok is False and probe_detail.startswith("Session not found:") and attempt < max_attempts:
-            time.sleep(retry_delay_seconds)
-            continue
-
-        stderr_text = completed.stderr.strip()
-        if stderr_text and probe_detail:
-            return False, f"{probe_detail} | stderr: {stderr_text}"
-        if stderr_text:
-            return False, stderr_text
-        if completed.returncode != 0 and probe_detail:
-            return False, probe_detail
-        if probe_detail:
-            return False, probe_detail
-        return False, "session_read probe failed without output"
-
-    return False, f"session_read probe could not read {root_session_id} from {resolved_workdir}"
 
 
 def _scheduler_id(base_dir: Path) -> str:
@@ -1099,8 +1092,7 @@ def _transition_issue_state_if_possible(
     updated_at: str,
     reason: str,
     from_state: str | None = None,
-    current_root_session_id: str | None = None,
-    current_verifier_session_id: str | None = None,
+    current_session_id: str | None = None,
 ) -> None:
     transition = cast(Callable[..., None], _lifecycle_helpers.transition_issue_state_if_possible)
     transition(
@@ -1111,8 +1103,7 @@ def _transition_issue_state_if_possible(
         updated_at=updated_at,
         reason=reason,
         from_state=from_state,
-        current_root_session_id=current_root_session_id,
-        current_verifier_session_id=current_verifier_session_id,
+        current_session_id=current_session_id,
     )
 
 
@@ -1174,14 +1165,22 @@ def _sync_runtime_phase_to_control_plane_state(
 
     runtime_issue = read_issue(base_dir, issue_number)
     current_state = str(runtime_issue.get("state") or "") if runtime_issue else ""
-    current_root_session_id = str(runtime_issue.get("current_root_session_id") or "") if runtime_issue else ""
+    current_session_id = str(runtime_issue.get("current_session_id") or "") if runtime_issue else ""
     last_session_result = cast(JsonObject, ledger.get("lastSessionResult", {}))
     session_result_root_session_id = str(last_session_result.get("rootSessionID") or "")
     if current_state in {"quarantined", "completed", "failed"}:
         return
     if current_state == desired_state:
         return
-    if desired_state == "running" and not current_root_session_id and not session_result_root_session_id:
+    if (
+        current["role"] == "issue_worker"
+        and current.get("status") == "queued"
+        and current_state == "dispatching"
+        and not current_session_id
+        and not session_result_root_session_id
+    ):
+        return
+    if desired_state == "running" and not current_session_id and not session_result_root_session_id:
         return
     _rebuild_issue_state_from_runtime_phase(
         base_dir=base_dir,
@@ -1218,6 +1217,133 @@ def _sync_runtime_phase_metadata(
         automation_flags=automation,
         artifact_refs=artifacts,
     )
+
+
+def _write_checkpoint_if_present(
+    checkpoint_path: Path,
+    *,
+    issue_number: str | None = None,
+    branch: str | None = None,
+    role: str | None = None,
+    agent: str | None = None,
+    issue_packet: str | None = None,
+    handoff: str | None = None,
+    worker_result: str | None = None,
+    evidence_packet: str | None = None,
+    artifact_bundle: str | None = None,
+    completed: list[str] | None = None,
+    in_progress: list[str] | None = None,
+    next_steps: list[str] | None = None,
+    blockers: list[str] | None = None,
+    approval_override_mode: str | None = None,
+    override_source: str | None = None,
+    human_approval_skipped: bool | None = None,
+    workflow_policy_path: str = DEFAULT_WORKFLOW_POLICY_PATH,
+    updated_at: str | None = None,
+) -> None:
+    if not checkpoint_path.exists():
+        return
+    _ = write_checkpoint_file(
+        checkpoint_path,
+        issue_number=issue_number,
+        branch=branch,
+        role=role,
+        agent=agent,
+        issue_packet=issue_packet,
+        handoff=handoff,
+        worker_result=worker_result,
+        evidence_packet=evidence_packet,
+        artifact_bundle=artifact_bundle,
+        completed=completed,
+        in_progress=in_progress,
+        next_steps=next_steps,
+        blockers=blockers,
+        approval_override_mode=approval_override_mode,
+        override_source=override_source,
+        human_approval_skipped=human_approval_skipped,
+        workflow_policy_path=workflow_policy_path,
+        updated_at=updated_at,
+    )
+
+
+def _json_dict(raw: object) -> dict[str, object]:
+    return cast(dict[str, object], raw) if isinstance(raw, dict) else {}
+
+
+def _load_json_dict(raw: object) -> dict[str, object]:
+    if isinstance(raw, str):
+        try:
+            return _json_dict(json.loads(raw))
+        except json.JSONDecodeError:
+            return {}
+    return _json_dict(raw)
+
+
+def _db_issue_to_ledger(issue: dict[str, object], *, runtime_context: dict[str, object]) -> JsonObject:
+    issue_number = str(issue.get("issue_number") or "")
+    issue_packet = _load_json_dict(issue.get("issue_packet_json"))
+    attempts = _load_json_dict(issue.get("attempts_json"))
+    limits = _load_json_dict(issue.get("limits_json"))
+    last_failure = _load_json_dict(issue.get("last_failure_json"))
+    resume_snapshot = _load_json_dict(issue.get("resume_snapshot_json"))
+    automation_flags = _load_json_dict(issue.get("automation_flags_json"))
+    artifact_refs = _load_json_dict(issue.get("artifact_refs_json"))
+    return {
+        "schemaVersion": "1.0",
+        "automation": {
+            "continueWithoutHuman": bool(automation_flags.get("continueWithoutHuman", True)),
+            "queueNextSessionOnIdle": bool(automation_flags.get("queueNextSessionOnIdle", True)),
+            "primaryWorkspaceRoot": str(automation_flags.get("primaryWorkspaceRoot") or ""),
+            "rootSessionAgent": str(automation_flags.get("rootSessionAgent") or DEFAULT_ROOT_SESSION_AGENT),
+            "supervisorDocPath": str(automation_flags.get("supervisorDocPath") or DEFAULT_SUPERVISOR_DOC_PATH),
+        },
+        "issue": {
+            "number": issue_number,
+            "title": str(issue.get("title") or issue_packet.get("title") or ""),
+            "branch": str(issue.get("branch") or issue_packet.get("branch") or ""),
+            "issuePacketPath": str(issue_packet.get("issue_packet_path") or f"docs/agents/issue-packets/issue-{issue_number}.yaml"),
+            "backingType": str(issue_packet.get("backing_type") or "github"),
+            "priorHandoffPath": str(issue_packet.get("prior_handoff") or ""),
+            "parentReference": str(issue_packet.get("parent_reference") or ""),
+        },
+        "workflow": resume_snapshot,
+        "artifacts": artifact_refs,
+        "current": {
+            "role": str(issue.get("current_role") or ""),
+            "stage": str(issue.get("current_stage") or ""),
+            "status": str(issue.get("current_status") or ""),
+        },
+        "attempts": attempts,
+        "limits": limits,
+        "lastFailure": last_failure,
+        "lastSessionResult": {},
+        "history": [],
+        "ledgerRevision": str(issue.get("updated_at") or issue.get("last_event_at") or ""),
+        "updatedAt": str(issue.get("updated_at") or issue.get("last_event_at") or ""),
+        "runtimeContext": runtime_context,
+    }
+
+
+def reconcile_issue_from_db(*, base_dir: Path, issue_number: str, updated_at: str | None = None) -> tuple[JsonObject, SupervisorDecision, SessionRequest | None]:
+    issue = read_issue(base_dir, issue_number)
+    if issue is None:
+        raise RuntimeError(f"issue #{issue_number} not found in control plane")
+    runtime_context = read_runtime_context(base_dir, issue_number)
+    return reconcile_ledger(
+        _db_issue_to_ledger(cast(dict[str, object], issue), runtime_context=cast(dict[str, object], runtime_context)),
+        session_result_path=base_dir / ".opencode/runtime/__db_only_no_session_result__.json",
+        artifact_base_dir=base_dir,
+        updated_at=updated_at,
+    )
+
+
+def _run_reconcile_issue_cli(*, base_dir: Path, issue_number: str, updated_at: str | None) -> int:
+    _, decision, request = reconcile_issue_from_db(base_dir=base_dir, issue_number=issue_number, updated_at=updated_at)
+    payload: JsonObject = {"status": "success", "decision": decision}
+    if request is not None:
+        payload["request"] = request
+    print(json.dumps(payload, ensure_ascii=False))
+    return 0
 
 
 def _recover_stale_bootstrap_with_worker_artifact(
@@ -1651,90 +1777,32 @@ def dispatch_session_request(
     source_session_id: str,
     updated_at: str | None = None,
 ) -> SessionResult:
-    cli_command = _resolve_opencode_cli()
     timestamp = _now(updated_at)
     launch_title = _dispatch_launch_title(request)
-    if not cli_command:
-        return {
-            "status": "error",
-            "sourceSessionID": source_session_id,
-            "launchTitle": launch_title,
-            "title": request["title"],
-            "reason": request["reason"],
-            "role": request["role"],
-            "stage": request["stage"],
-            "issueNumber": request["issueNumber"],
-            "branch": request["branch"],
-            "error": 'OpenCode CLI not found in PATH. Install or expose the core "opencode" (or "opencode-desktop") executable before running autodev dispatch.',
-            "recordedAt": timestamp,
-        }
-    cli_agent = _cli_agent_name(request["agent"])
-    command = [
-        cli_command,
-        "run",
-        "--format",
-        "json",
-        "--title",
-        launch_title,
-    ]
-    if cli_agent:
-        command.extend(["--agent", cli_agent])
-    command.append(request["prompt"])
-    started_at_ms = int(time.time() * 1000)
-    try:
-        process = _spawn_detached_opencode_run(command, workdir=workdir)
-    except OSError as error:
-        return {
-            "status": "error",
-            "sourceSessionID": source_session_id,
-            "launchTitle": launch_title,
-            "title": request["title"],
-            "reason": request["reason"],
-            "role": request["role"],
-            "stage": request["stage"],
-            "issueNumber": request["issueNumber"],
-            "branch": request["branch"],
-            "error": str(error),
-            "recordedAt": timestamp,
-        }
-
-    root_session_id, stdout_text, stderr_text = _read_initial_session_id(process, timeout_seconds=10.0)
-    if not root_session_id:
-        root_session_id = _wait_for_session_id_in_db(
-            title=launch_title,
-            workdir=workdir,
-            created_after_ms=started_at_ms,
-            timeout_seconds=30.0,
-        )
-    if not root_session_id:
-        if process.poll() is None:
-            process.terminate()
-        return {
-            "status": "error",
-            "sourceSessionID": source_session_id,
-            "launchTitle": launch_title,
-            "title": request["title"],
-            "reason": request["reason"],
-            "role": request["role"],
-            "stage": request["stage"],
-            "issueNumber": request["issueNumber"],
-            "branch": request["branch"],
-            "error": (stderr_text or stdout_text).strip() or "opencode run did not emit a sessionID before timeout",
-            "recordedAt": timestamp,
-        }
-
-    readable, readability_detail = _probe_same_repo_session_readability(
-        cli_command,
+    adapter = _default_host_adapter()
+    start_context = SessionStartContext(
+        title=launch_title,
+        prompt=request["prompt"],
+        agent=request["agent"],
         workdir=workdir,
-        root_session_id=root_session_id,
+        source_session_id=source_session_id,
+        role=request["role"],
+        stage=request["stage"],
+        issue_number=request["issueNumber"],
+        branch=request["branch"],
+        started_at_iso=timestamp,
     )
-    if not readable:
-        if process.poll() is None:
-            process.terminate()
+    start_result = adapter.start_root_session(start_context)
+    stop_attempts_raw = start_result.metadata.get("stopContinuationAttempts")
+    stop_attempts = (
+        int(stop_attempts_raw)
+        if isinstance(stop_attempts_raw, (int, float, str)) and not isinstance(stop_attempts_raw, bool)
+        else 0
+    )
+    if start_result.status != "success":
         return {
             "status": "error",
             "sourceSessionID": source_session_id,
-            "rootSessionID": root_session_id,
             "launchTitle": launch_title,
             "title": request["title"],
             "reason": request["reason"],
@@ -1742,11 +1810,12 @@ def dispatch_session_request(
             "stage": request["stage"],
             "issueNumber": request["issueNumber"],
             "branch": request["branch"],
-            "error": f"root session {root_session_id} was created but failed same-repo session_read probe: {readability_detail}",
-            "sessionReadabilityStatus": "failed_same_repo_probe",
+            "error": start_result.error,
+            "rootSessionID": start_result.session_id,
+            "sessionReadabilityStatus": start_result.readability_status,
             "recordedAt": timestamp,
         }
-
+    root_session_id = start_result.session_id
     return {
         "status": "success",
         "sourceSessionID": source_session_id,
@@ -1758,14 +1827,12 @@ def dispatch_session_request(
         "stage": request["stage"],
         "issueNumber": request["issueNumber"],
         "branch": request["branch"],
-        "tuiResumeCommand": "/sessions",
-        "cliOpenCommand": f"opencode --session {root_session_id}",
-        "recommendedAction": (
-            f"Open /sessions in OpenCode TUI and switch to {root_session_id}, or run opencode --session {root_session_id}."
-        ),
-        "sessionReadabilityStatus": "verified_same_repo_probe",
-        "stopContinuationStatus": "root_session_detached",
-        "stopContinuationAttempts": 0,
+        "tuiResumeCommand": str(start_result.metadata.get("tuiResumeCommand") or "/sessions"),
+        "cliOpenCommand": start_result.resume_command,
+        "recommendedAction": start_result.resume_hint,
+        "sessionReadabilityStatus": start_result.readability_status,
+        "stopContinuationStatus": str(start_result.metadata.get("stopContinuationStatus") or "root_session_detached"),
+        "stopContinuationAttempts": stop_attempts,
         "recordedAt": timestamp,
     }
 
@@ -1825,7 +1892,7 @@ def _handoff_to_selected_issue(
 ) -> tuple[JsonObject, SupervisorDecision, SessionRequest]:
     workflow = cast(dict[str, str], current_ledger["workflow"])
     checkpoint_path = _resolve_artifact_path(workflow["checkpointPath"], base_dir=base_dir)
-    _ = write_checkpoint_file(
+    _write_checkpoint_if_present(
         checkpoint_path,
         issue_number=selected_issue.issue_number,
         branch=selected_issue.branch,
@@ -2186,7 +2253,7 @@ def _dispatch_consumed_request(
                 updated_at=recorded_at,
                 reason=f"Root session {root_session_id} acknowledged for issue #{request['issueNumber']}.",
                 from_state="dispatching",
-                current_root_session_id=root_session_id,
+                current_session_id=root_session_id,
             )
             _append_root_issue_event(
                 base_dir=base_dir,
@@ -2215,8 +2282,9 @@ def _dispatch_consumed_request(
                 updated_at=dispatch_timestamp,
             )
             if sync_error:
+                resume_link = _default_host_adapter().resume_link(root_session_id)
                 session_result["recommendedAction"] = (
-                    f"Open /sessions in OpenCode TUI and switch to {root_session_id}, or run opencode --session {root_session_id}. "
+                    f"Resume the active root session with {resume_link}. "
                     f"GitHub running-label sync failed and may need retry: {sync_error}"
                 )
     if session_result.get("status") != "success":
@@ -2236,8 +2304,7 @@ def _dispatch_consumed_request(
                     state="quarantined",
                     command_id=f"{dispatch_command_id}:quarantine-rollback",
                     updated_at=failure_updated_at,
-                    current_root_session_id="",
-                    current_verifier_session_id="",
+                    current_session_id="",
                 )
                 _ = _sync_issue_progress_label(
                     base_dir=base_dir,
@@ -2331,6 +2398,8 @@ def _queue_transition(
     summary: str,
     updated_at: str,
 ) -> None:
+    issue = cast(dict[str, str], ledger["issue"])
+    current_before = cast(dict[str, str], ledger["current"])
     queue_transition = cast(Callable[..., None], _reconcile_helpers.queue_transition)
     queue_transition(
         ledger,
@@ -2340,12 +2409,22 @@ def _queue_transition(
         updated_at=updated_at,
         bump_ledger_revision=_bump_ledger_revision,
     )
-    workflow = cast(dict[str, str], ledger["workflow"])
     automation = cast(dict[str, object], ledger.get("automation", {}))
     primary_workspace_root = str(automation.get("primaryWorkspaceRoot") or "")
+    transition_base_dir = Path(primary_workspace_root) if primary_workspace_root else ROOT
+    _record_runtime_transition_history(
+        base_dir=transition_base_dir,
+        issue_number=issue.get("number", ""),
+        recorded_at=updated_at,
+        from_role=current_before.get("role", "unknown"),
+        from_stage=current_before.get("stage", "unknown"),
+        to_role=next_role,
+        to_stage=next_stage,
+        reason=summary,
+    )
+    workflow = cast(dict[str, str], ledger["workflow"])
     checkpoint_base_dir = Path(primary_workspace_root) if primary_workspace_root else ROOT
     checkpoint_path = _resolve_artifact_path(workflow["checkpointPath"], base_dir=checkpoint_base_dir)
-    issue = cast(dict[str, str], ledger["issue"])
     current = cast(dict[str, str], ledger["current"])
     artifacts = cast(dict[str, str], ledger.get("artifacts", {}))
     role = current.get("role", "")
@@ -2364,7 +2443,7 @@ def _queue_transition(
     elif role == "main_orchestrator" and stage == "issue_selection_or_recovery":
         in_progress = [f"Continue supervisor recovery for issue #{issue.get('number', '')}." ]
         next_steps = ["Select the next ready issue packet or remain in orchestrator recovery if none are available."]
-    _ = write_checkpoint_file(
+    _write_checkpoint_if_present(
         checkpoint_path,
         issue_number=issue.get("number") or None,
         branch=issue.get("branch") or None,
@@ -2474,7 +2553,7 @@ def _queue_orchestrator_recovery(
     current = cast(dict[str, str], next_ledger["current"])
     issue = cast(dict[str, str], next_ledger["issue"])
     artifacts = cast(dict[str, str], next_ledger.get("artifacts", {}))
-    _ = write_checkpoint_file(
+    _write_checkpoint_if_present(
         checkpoint_path,
         issue_number=issue.get("number") or None,
         branch=issue.get("branch") or None,
@@ -2579,6 +2658,9 @@ def reconcile_ledger(
     _sync_session_result(ledger, session_result_path)
     base_dir = artifact_base_dir or ROOT
     ensure_control_plane_db(base_dir)
+    automation = cast(dict[str, object], ledger.get("automation", {}))
+    if not str(automation.get("primaryWorkspaceRoot") or ""):
+        automation["primaryWorkspaceRoot"] = str(base_dir)
     issue = cast(dict[str, str], ledger["issue"])
     ensure_issue_row(base_dir, issue_number=issue["number"], updated_at=timestamp)
     _sync_runtime_phase_metadata(
@@ -3154,6 +3236,13 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(json.dumps(session_result, ensure_ascii=False))
         return 0
+
+    if cast(str, args.command) == "reconcile-issue":
+        return _run_reconcile_issue_cli(
+            base_dir=Path(cast(str, args.base_dir)).resolve(),
+            issue_number=cast(str, args.issue_number),
+            updated_at=cast(str | None, args.updated_at),
+        )
 
     if cast(str, args.command) == "redispatch-quarantined":
         ledger_path = Path(cast(str, args.ledger))

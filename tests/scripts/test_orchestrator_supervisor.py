@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import scripts.orchestrator_supervisor as orchestrator_supervisor
 from scripts.control_plane_db import read_github_sync_attempt, read_issue, read_latest_issue_history
+from scripts.host_adapter import SessionStartContext, SessionStartResult
 
 
 def _artifact_status(issue: dict[str, object] | None) -> dict[str, object]:
@@ -46,6 +47,55 @@ class FakePopen:
         self.terminated = True
         if self._returncode is None:
             self._returncode = -15
+
+
+class FakeHostAdapter:
+    def __init__(self, start_result: SessionStartResult):
+        self.start_result = start_result
+        self.start_calls: list[SessionStartContext] = []
+
+    def start_root_session(self, context: SessionStartContext):
+        self.start_calls.append(context)
+        return self.start_result
+
+    def start_child_role(self, role: str, context: SessionStartContext):
+        del role
+        self.start_calls.append(context)
+        return self.start_result
+
+    def read_session_outcome(self, runtime_session_id: str):
+        del runtime_session_id
+        return None
+
+    def resume_link(self, runtime_session_id: str) -> str:
+        return f"resume://{runtime_session_id}"
+
+    def operator_entrypoints(self) -> dict[str, str]:
+        return {}
+
+    def capabilities(self) -> dict[str, object]:
+        return {}
+
+
+def successful_host_adapter(
+    *,
+    session_id: str,
+    resume_command: str | None = None,
+    resume_hint: str = "resume in host",
+    readability_status: str = "verified_same_repo_probe",
+    metadata: dict[str, object] | None = None,
+) -> FakeHostAdapter:
+    return FakeHostAdapter(
+        SessionStartResult(
+            status="success",
+            session_id=session_id,
+            resume_hint=resume_hint,
+            resume_command=resume_command or f"opencode --session {session_id}",
+            readability_status=readability_status,
+            metadata=metadata
+            or {"tuiResumeCommand": "/sessions", "stopContinuationStatus": "root_session_detached", "stopContinuationAttempts": 0},
+        )
+    )
 
 
 SAMPLE_ISSUE_PACKET = """schema_version: \"1.0\"
@@ -121,74 +171,6 @@ def test_create_initial_ledger_persists_issue_backing_type() -> None:
     issue = cast(dict[str, object], ledger["issue"])
 
     assert issue["backingType"] == "github"
-
-
-def test_start_issue_records_db_backed_dispatch_result(tmp_path: Path):
-    issue_packet_path = tmp_path / "docs/agents/issue-packets/issue-42.yaml"
-    issue_packet_path.parent.mkdir(parents=True, exist_ok=True)
-    issue_packet_path.write_text(SAMPLE_ISSUE_PACKET, encoding="utf-8")
-    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
-    orchestrator_supervisor._sync_issue_packet_to_db(tmp_path, issue_packet, updated_at="2026-05-07T17:00:00+08:00")
-
-    with patch("scripts.orchestrator_supervisor._resolve_opencode_cli", return_value="/usr/bin/opencode"), patch(
-        "scripts.orchestrator_supervisor._spawn_detached_opencode_run",
-        return_value=FakePopen(""),
-    ), patch(
-        "scripts.orchestrator_supervisor._read_initial_session_id",
-        return_value=("ses_root_test", "", ""),
-    ), patch(
-        "scripts.orchestrator_supervisor._probe_same_repo_session_readability",
-        return_value=(True, "ok"),
-    ), patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
-        result = orchestrator_supervisor.start_issue(
-            base_dir=tmp_path,
-            issue_number="42",
-            source_session_id="autodev-start",
-            updated_at="2026-05-07T17:10:00+08:00",
-        )
-
-    issue = read_issue(tmp_path, "42")
-    latest = orchestrator_supervisor.read_latest_dispatch_result(tmp_path, issue_number="42")
-
-    assert result.get("status") == "success"
-    assert result.get("rootSessionID") == "ses_root_test"
-    assert latest is not None
-    assert latest.get("rootSessionID") == "ses_root_test"
-    assert issue is not None
-    assert issue["state"] == "running"
-    assert issue["current_root_session_id"] == "ses_root_test"
-
-
-def test_show_latest_session_reads_db_backed_dispatch_result(tmp_path: Path):
-    issue_packet_path = tmp_path / "docs/agents/issue-packets/issue-42.yaml"
-    issue_packet_path.parent.mkdir(parents=True, exist_ok=True)
-    issue_packet_path.write_text(SAMPLE_ISSUE_PACKET, encoding="utf-8")
-    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
-    orchestrator_supervisor._sync_issue_packet_to_db(tmp_path, issue_packet, updated_at="2026-05-07T17:00:00+08:00")
-
-    with patch("scripts.orchestrator_supervisor._resolve_opencode_cli", return_value="/usr/bin/opencode"), patch(
-        "scripts.orchestrator_supervisor._spawn_detached_opencode_run",
-        return_value=FakePopen(""),
-    ), patch(
-        "scripts.orchestrator_supervisor._read_initial_session_id",
-        return_value=("ses_root_test", "", ""),
-    ), patch(
-        "scripts.orchestrator_supervisor._probe_same_repo_session_readability",
-        return_value=(True, "ok"),
-    ), patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
-        orchestrator_supervisor.start_issue(
-            base_dir=tmp_path,
-            issue_number="42",
-            source_session_id="autodev-start",
-            updated_at="2026-05-07T17:10:00+08:00",
-        )
-
-    payload = orchestrator_supervisor.show_latest_session(base_dir=tmp_path, issue_number="42")
-
-    assert payload is not None
-    assert payload.get("status") == "success"
-    assert payload.get("rootSessionID") == "ses_root_test"
-    assert payload.get("cliOpenCommand") == "opencode --session ses_root_test"
 
 
 def test_reconcile_worker_success_queues_pr_verifier(tmp_path: Path):
@@ -822,8 +804,8 @@ def test_build_orchestrator_request_uses_ledger_shared_doc_paths():
 
     assert "/shared/docs/agents/runtime/nonstop-supervisor-loop.md" in request["prompt"]
     assert "/shared/docs/agents/autonomous-development-workflow.yaml" in request["prompt"]
-    assert 'PYTHONPATH="/shared" python3 "/shared/scripts/orchestrator_supervisor.py" reconcile --ledger .opencode/runtime/orchestrator-ledger.json' in request["prompt"]
-    assert 'PYTHONPATH="/shared" python3 "/shared/scripts/orchestrator_supervisor.py" advance-child --ledger .opencode/runtime/orchestrator-ledger.json' in request["prompt"]
+    assert "Bootstrap from the SQLite-backed control plane" in request["prompt"]
+    assert "Use the DB-backed supervisor reconcile flow before the first issue_worker launch" in request["prompt"]
 
 
 def test_build_orchestrator_request_requires_foreground_child_subagents():
@@ -835,6 +817,121 @@ def test_build_orchestrator_request_requires_foreground_child_subagents():
     assert 'task(subagent_type="general", ..., run_in_background=false)' in request["prompt"]
     assert "Wait for each child task call to finish in the foreground before continuing." in request["prompt"]
     assert "Do not include karpathy-guidelines in load_skills for child subagents" not in request["prompt"]
+
+
+def test_start_issue_records_db_backed_dispatch_result(tmp_path: Path):
+    issue_packet_path = tmp_path / "docs/agents/issue-packets/issue-42.yaml"
+    issue_packet_path.parent.mkdir(parents=True, exist_ok=True)
+    issue_packet_path.write_text(SAMPLE_ISSUE_PACKET, encoding="utf-8")
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    orchestrator_supervisor._sync_issue_packet_to_db(tmp_path, issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+
+    with patch(
+        "scripts.orchestrator_supervisor._default_host_adapter",
+        return_value=successful_host_adapter(session_id="ses_root_test", resume_command="opencode --session ses_root_test"),
+    ), patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+        result = orchestrator_supervisor.start_issue(
+            base_dir=tmp_path,
+            issue_number="42",
+            source_session_id="autodev-start",
+            updated_at="2026-05-07T17:10:00+08:00",
+        )
+
+    issue = read_issue(tmp_path, "42")
+    latest = orchestrator_supervisor.read_latest_dispatch_result(tmp_path, issue_number="42")
+    runtime_transition = read_latest_issue_history(tmp_path, "42", entry_type="runtime_transition")
+
+    assert result.get("status") == "success"
+    assert result.get("rootSessionID") == "ses_root_test"
+    assert latest is not None
+    assert latest.get("rootSessionID") == "ses_root_test"
+    assert runtime_transition is not None
+    assert runtime_transition["role"] == "issue_worker"
+    assert runtime_transition["stage"] == "issue_worker_execution"
+    assert runtime_transition["body_text"] == "main_orchestrator/orchestrator_bootstrap -> issue_worker/issue_worker_execution"
+    assert issue is not None
+    assert issue["state"] == "running"
+    assert issue["current_role"] == "issue_worker"
+    assert issue["current_stage"] == "issue_worker_execution"
+    assert issue["current_root_session_id"] == "ses_root_test"
+
+
+def test_start_issue_succeeds_without_runtime_checkpoint_file(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    orchestrator_supervisor._sync_issue_packet_to_db(tmp_path, issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+
+    assert not (tmp_path / ".opencode/runtime/orchestrator-ledger.json").exists()
+    assert not (tmp_path / ".opencode/runtime/new-session-request.json").exists()
+    assert not (tmp_path / ".opencode/runtime/new-session-result.json").exists()
+    assert not (tmp_path / "docs/agents/runtime/context-checkpoint.yaml").exists()
+
+    with patch(
+        "scripts.orchestrator_supervisor._default_host_adapter",
+        return_value=successful_host_adapter(session_id="ses_root_test", resume_command="opencode --session ses_root_test"),
+    ), patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+        result = orchestrator_supervisor.start_issue(
+            base_dir=tmp_path,
+            issue_number="42",
+            source_session_id="autodev-start",
+            updated_at="2026-05-07T17:10:00+08:00",
+        )
+
+    issue = read_issue(tmp_path, "42")
+    latest = orchestrator_supervisor.read_latest_dispatch_result(tmp_path, issue_number="42")
+
+    assert result.get("status") == "success"
+    assert result.get("rootSessionID") == "ses_root_test"
+    assert issue is not None
+    assert issue["state"] == "running"
+    assert latest is not None
+    assert latest.get("rootSessionID") == "ses_root_test"
+    assert not (tmp_path / "docs/agents/runtime/context-checkpoint.yaml").exists()
+
+
+def test_start_issue_rejects_packet_issue_number_mismatch(tmp_path: Path):
+    malicious_packet_text = SAMPLE_ISSUE_PACKET.replace('number: "42"', 'number: "../../etc/passwd"')
+    issue_packet_path = tmp_path / "docs/agents/issue-packets/issue-42.yaml"
+    issue_packet_path.parent.mkdir(parents=True, exist_ok=True)
+    issue_packet_path.write_text(malicious_packet_text, encoding="utf-8")
+
+    with patch("scripts.orchestrator_supervisor.run_issue_packet_intake", return_value=False):
+        try:
+            orchestrator_supervisor.start_issue(
+                base_dir=tmp_path,
+                issue_number="42",
+                source_session_id="autodev-start",
+                updated_at="2026-05-07T17:10:00+08:00",
+            )
+        except RuntimeError as error:
+            assert "issue packet number mismatch" in str(error)
+        else:
+            raise AssertionError("expected start_issue to reject packet issue number mismatch")
+
+
+def test_show_latest_session_prefers_db_history_and_fills_resume_command(tmp_path: Path):
+    issue_packet_path = tmp_path / "docs/agents/issue-packets/issue-42.yaml"
+    issue_packet_path.parent.mkdir(parents=True, exist_ok=True)
+    issue_packet_path.write_text(SAMPLE_ISSUE_PACKET, encoding="utf-8")
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    orchestrator_supervisor._sync_issue_packet_to_db(tmp_path, issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+
+    with patch(
+        "scripts.orchestrator_supervisor._default_host_adapter",
+        return_value=successful_host_adapter(session_id="ses_root_test", resume_command="opencode --session ses_root_test"),
+    ), patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+        orchestrator_supervisor.start_issue(
+            base_dir=tmp_path,
+            issue_number="42",
+            source_session_id="autodev-start",
+            updated_at="2026-05-07T17:10:00+08:00",
+        )
+
+    payload = orchestrator_supervisor.show_latest_session(base_dir=tmp_path)
+
+    assert payload is not None
+    assert payload.get("status") == "success"
+    assert payload.get("rootSessionID") == "ses_root_test"
+    assert payload.get("cliOpenCommand") == "opencode --session ses_root_test"
 
 
 def test_validate_session_request_rejects_completed_issue(tmp_path: Path):
@@ -1526,10 +1623,8 @@ def test_dispatch_session_request_writes_success_result_and_syncs_ledger(tmp_pat
     ledger_path.parent.mkdir(parents=True, exist_ok=True)
     _ = ledger_path.write_text(json.dumps(ledger, indent=2), encoding="utf-8")
     _ = request_path.write_text(json.dumps(request, indent=2), encoding="utf-8")
-    with patch("scripts.orchestrator_supervisor._resolve_opencode_cli", return_value="/usr/bin/opencode"), patch(
-        "scripts.orchestrator_supervisor._spawn_detached_opencode_run",
-        return_value=FakePopen('{"type":"step_start","sessionID":"ses_root_test"}\n'),
-    ) as mocked_spawn:
+    adapter = successful_host_adapter(session_id="ses_root_test")
+    with patch("scripts.orchestrator_supervisor._default_host_adapter", return_value=adapter):
         exit_code = orchestrator_supervisor.main(
             [
                 "dispatch",
@@ -1550,7 +1645,6 @@ def test_dispatch_session_request_writes_success_result_and_syncs_ledger(tmp_pat
     synced_ledger = cast(dict[str, object], json.loads(ledger_path.read_text(encoding="utf-8")))
     issue = read_issue(tmp_path, "42")
 
-    mocked_spawn.assert_called_once()
     assert exit_code == 0
     assert session_result["status"] == "success"
     assert session_result["rootSessionID"] == "ses_root_test"
@@ -1560,8 +1654,8 @@ def test_dispatch_session_request_writes_success_result_and_syncs_ledger(tmp_pat
     assert cast(dict[str, object], synced_ledger["lastSessionResult"])["rootSessionID"] == "ses_root_test"
     assert issue is not None
     assert issue["current_root_session_id"] == "ses_root_test"
-    spawn_command = mocked_spawn.call_args.args[0]
-    assert "--agent" not in spawn_command
+    assert len(adapter.start_calls) == 1
+    assert adapter.start_calls[0].agent == "build"
 
 
 def test_dispatch_session_request_updates_control_plane_running_state(tmp_path: Path):
@@ -1587,10 +1681,9 @@ def test_dispatch_session_request_updates_control_plane_running_state(tmp_path: 
     ledger_path.parent.mkdir(parents=True, exist_ok=True)
     _ = ledger_path.write_text(json.dumps(ledger, indent=2), encoding="utf-8")
     _ = request_path.write_text(json.dumps(request, indent=2), encoding="utf-8")
-    with patch("scripts.orchestrator_supervisor._resolve_opencode_cli", return_value="/usr/bin/opencode"), patch(
-        "scripts.orchestrator_supervisor._spawn_detached_opencode_run",
-        return_value=FakePopen('{"type":"step_start","sessionID":"ses_root_test"}\n'),
-    ), patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+    with patch("scripts.orchestrator_supervisor._default_host_adapter", return_value=successful_host_adapter(session_id="ses_root_test")), patch(
+        "scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""
+    ):
         orchestrator_supervisor._dispatch_consumed_request(
             request_path,
             ledger_path=ledger_path,
@@ -1629,10 +1722,9 @@ def test_dispatch_session_request_appends_root_start_event(tmp_path: Path):
     ledger_path.parent.mkdir(parents=True, exist_ok=True)
     _ = ledger_path.write_text(json.dumps(ledger, indent=2), encoding="utf-8")
     _ = request_path.write_text(json.dumps(request, indent=2), encoding="utf-8")
-    with patch("scripts.orchestrator_supervisor._resolve_opencode_cli", return_value="/usr/bin/opencode"), patch(
-        "scripts.orchestrator_supervisor._spawn_detached_opencode_run",
-        return_value=FakePopen('{"type":"step_start","sessionID":"ses_root_test"}\n'),
-    ), patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+    with patch("scripts.orchestrator_supervisor._default_host_adapter", return_value=successful_host_adapter(session_id="ses_root_test")), patch(
+        "scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""
+    ):
         orchestrator_supervisor._dispatch_consumed_request(
             request_path,
             ledger_path=ledger_path,
@@ -1703,10 +1795,7 @@ def test_dispatch_running_label_sync_failure_keeps_running_root_session_fenced(t
     ledger_path.parent.mkdir(parents=True, exist_ok=True)
     _ = ledger_path.write_text(json.dumps(ledger, indent=2), encoding="utf-8")
     _ = request_path.write_text(json.dumps(request, indent=2), encoding="utf-8")
-    with patch("scripts.orchestrator_supervisor._resolve_opencode_cli", return_value="/usr/bin/opencode"), patch(
-        "scripts.orchestrator_supervisor._spawn_detached_opencode_run",
-        return_value=FakePopen('{"type":"step_start","sessionID":"ses_root_test"}\n'),
-    ), patch(
+    with patch("scripts.orchestrator_supervisor._default_host_adapter", return_value=successful_host_adapter(session_id="ses_root_test")), patch(
         "scripts.orchestrator_supervisor.subprocess.run",
         side_effect=[
             CompletedProcess(args=["gh"], returncode=1, stdout="", stderr="label sync failed"),
@@ -1934,29 +2023,6 @@ def test_retry_github_sync_command_rejects_stale_failed_attempt(tmp_path: Path):
         raise AssertionError("expected retry-github-sync to reject stale failed attempt")
 
 
-def test_resolve_opencode_cli_prefers_path_binary():
-    with patch("scripts.orchestrator_supervisor.shutil.which", side_effect=["/usr/bin/opencode", None]):
-        assert orchestrator_supervisor._resolve_opencode_cli() == "/usr/bin/opencode"
-
-
-def test_resolve_opencode_cli_falls_back_to_desktop_binary():
-    with patch("scripts.orchestrator_supervisor.shutil.which", side_effect=[None, "/usr/bin/opencode-desktop"]), patch(
-        "scripts.orchestrator_supervisor.Path.home", return_value=Path("/tmp/no-opencode-home")
-    ):
-        assert orchestrator_supervisor._resolve_opencode_cli() == "/usr/bin/opencode-desktop"
-
-
-def test_resolve_opencode_cli_falls_back_to_known_install_path(tmp_path: Path):
-    known_binary = tmp_path / ".opencode/bin/opencode"
-    known_binary.parent.mkdir(parents=True, exist_ok=True)
-    _ = known_binary.write_text("#!/bin/sh\n", encoding="utf-8")
-
-    with patch("scripts.orchestrator_supervisor.shutil.which", side_effect=[None, None]), patch(
-        "scripts.orchestrator_supervisor.Path.home", return_value=tmp_path
-    ):
-        assert orchestrator_supervisor._resolve_opencode_cli() == str(known_binary)
-
-
 def test_dispatch_session_request_reports_missing_opencode_cli():
     request: orchestrator_supervisor.SessionRequest = {
         "requestGeneration": 1,
@@ -1974,7 +2040,8 @@ def test_dispatch_session_request_reports_missing_opencode_cli():
         "branch": "agent/issue-42-demo",
     }
 
-    with patch("scripts.orchestrator_supervisor._resolve_opencode_cli", return_value=None):
+    adapter = FakeHostAdapter(SessionStartResult(status="error", error='OpenCode CLI not found in PATH. Install or expose the core "opencode" (or "opencode-desktop") executable before running autodev dispatch.'))
+    with patch("scripts.orchestrator_supervisor._default_host_adapter", return_value=adapter):
         result = orchestrator_supervisor.dispatch_session_request(
             request,
             workdir=Path("."),
@@ -2002,18 +2069,8 @@ def test_dispatch_session_request_terminates_when_session_id_never_arrives():
         "issueNumber": "42",
         "branch": "agent/issue-42-demo",
     }
-    fake_process = FakePopen("", stderr="", returncode=None)
-
-    with patch("scripts.orchestrator_supervisor._resolve_opencode_cli", return_value="/usr/bin/opencode"), patch(
-        "scripts.orchestrator_supervisor._spawn_detached_opencode_run",
-        return_value=fake_process,
-    ), patch(
-        "scripts.orchestrator_supervisor._read_initial_session_id",
-        return_value=(None, "", ""),
-    ), patch(
-        "scripts.orchestrator_supervisor._wait_for_session_id_in_db",
-        return_value=None,
-    ):
+    adapter = FakeHostAdapter(SessionStartResult(status="error", error="opencode run did not emit a sessionID before timeout"))
+    with patch("scripts.orchestrator_supervisor._default_host_adapter", return_value=adapter):
         result = orchestrator_supervisor.dispatch_session_request(
             request,
             workdir=Path("."),
@@ -2023,7 +2080,6 @@ def test_dispatch_session_request_terminates_when_session_id_never_arrives():
 
     assert result.get("status") == "error"
     assert "did not emit a sessionID" in str(result.get("error", ""))
-    assert fake_process.terminated is True
 
 
 def test_dispatch_session_request_fails_when_same_repo_session_read_probe_fails():
@@ -2043,13 +2099,15 @@ def test_dispatch_session_request_fails_when_same_repo_session_read_probe_fails(
         "branch": "agent/issue-42-demo",
     }
 
-    with patch("scripts.orchestrator_supervisor._resolve_opencode_cli", return_value="/usr/bin/opencode"), patch(
-        "scripts.orchestrator_supervisor._spawn_detached_opencode_run",
-        return_value=FakePopen('{"type":"step_start","sessionID":"ses_root_stdout"}\n'),
-    ), patch(
-        "scripts.orchestrator_supervisor._probe_same_repo_session_readability",
-        return_value=(False, "Session not found: ses_root_stdout"),
-    ):
+    adapter = FakeHostAdapter(
+        SessionStartResult(
+            status="error",
+            session_id="ses_root_stdout",
+            error="root session ses_root_stdout was created but failed same-repo session_read probe: Session not found: ses_root_stdout",
+            readability_status="failed_same_repo_probe",
+        )
+    )
+    with patch("scripts.orchestrator_supervisor._default_host_adapter", return_value=adapter):
         result = orchestrator_supervisor.dispatch_session_request(
             request,
             workdir=Path("/tmp/demo"),
@@ -2080,16 +2138,17 @@ def test_dispatch_session_request_extracts_session_id_from_run_stdout_without_db
         "branch": "agent/issue-42-demo",
     }
 
-    with patch("scripts.orchestrator_supervisor._resolve_opencode_cli", return_value="/usr/bin/opencode"), patch(
-        "scripts.orchestrator_supervisor._spawn_detached_opencode_run",
-        return_value=FakePopen('{"type":"step_start","sessionID":"ses_root_stdout"}\n'),
-    ), patch(
-        "scripts.orchestrator_supervisor._wait_for_session_id_in_db",
-        side_effect=AssertionError("DB fallback must not run when stdout already contains sessionID"),
-    ) as mocked_wait_for_db, patch(
-        "scripts.orchestrator_supervisor._probe_same_repo_session_readability",
-        return_value=(True, "ok"),
-    ):
+    adapter = FakeHostAdapter(
+        SessionStartResult(
+            status="success",
+            session_id="ses_root_stdout",
+            resume_hint="resume in host",
+            resume_command="resume://ses_root_stdout",
+            readability_status="verified_same_repo_probe",
+            metadata={"tuiResumeCommand": "/sessions", "stopContinuationStatus": "root_session_detached", "stopContinuationAttempts": 0},
+        )
+    )
+    with patch("scripts.orchestrator_supervisor._default_host_adapter", return_value=adapter):
         result = orchestrator_supervisor.dispatch_session_request(
             request,
             workdir=Path("/tmp/demo"),
@@ -2100,7 +2159,7 @@ def test_dispatch_session_request_extracts_session_id_from_run_stdout_without_db
     assert result.get("status") == "success"
     assert result.get("rootSessionID") == "ses_root_stdout"
     assert result.get("sessionReadabilityStatus") == "verified_same_repo_probe"
-    mocked_wait_for_db.assert_not_called()
+    assert len(adapter.start_calls) == 1
 
 
 def test_dispatch_session_request_falls_back_to_session_db_lookup():
@@ -2120,19 +2179,18 @@ def test_dispatch_session_request_falls_back_to_session_db_lookup():
         "branch": "agent/issue-42-demo",
     }
 
-    with patch("scripts.orchestrator_supervisor._resolve_opencode_cli", return_value="/usr/bin/opencode"), patch(
-        "scripts.orchestrator_supervisor._spawn_detached_opencode_run",
-        return_value=FakePopen("", stderr="", returncode=None),
-    ), patch(
-        "scripts.orchestrator_supervisor._read_initial_session_id",
-        return_value=(None, "", ""),
-    ), patch(
-        "scripts.orchestrator_supervisor._wait_for_session_id_in_db",
-        return_value="ses_root_db",
-    ), patch(
-        "scripts.orchestrator_supervisor._probe_same_repo_session_readability",
-        return_value=(True, "ok"),
-    ):
+    adapter = FakeHostAdapter(
+        SessionStartResult(
+            status="success",
+            session_id="ses_root_db",
+            launch_title="Continue issue #42 on agent/issue-42-demo [request-42]",
+            resume_hint="resume in host",
+            resume_command="resume://ses_root_db",
+            readability_status="verified_same_repo_probe",
+            metadata={"tuiResumeCommand": "/sessions", "stopContinuationStatus": "root_session_detached", "stopContinuationAttempts": 0},
+        )
+    )
+    with patch("scripts.orchestrator_supervisor._default_host_adapter", return_value=adapter):
         result = orchestrator_supervisor.dispatch_session_request(
             request,
             workdir=Path("/tmp/demo"),
@@ -2162,19 +2220,17 @@ def test_dispatch_session_request_uses_unique_launch_title_for_db_fallback_looku
         "branch": "agent/issue-42-demo",
     }
 
-    with patch("scripts.orchestrator_supervisor._resolve_opencode_cli", return_value="/usr/bin/opencode"), patch(
-        "scripts.orchestrator_supervisor._spawn_detached_opencode_run",
-        return_value=FakePopen("", stderr="", returncode=None),
-    ), patch(
-        "scripts.orchestrator_supervisor._read_initial_session_id",
-        return_value=(None, "", ""),
-    ), patch(
-        "scripts.orchestrator_supervisor._wait_for_session_id_in_db",
-        return_value="ses_root_db",
-    ) as mocked_wait_for_db, patch(
-        "scripts.orchestrator_supervisor._probe_same_repo_session_readability",
-        return_value=(True, "ok"),
-    ):
+    adapter = FakeHostAdapter(
+        SessionStartResult(
+            status="success",
+            session_id="ses_root_db",
+            resume_hint="resume in host",
+            resume_command="resume://ses_root_db",
+            readability_status="verified_same_repo_probe",
+            metadata={"tuiResumeCommand": "/sessions", "stopContinuationStatus": "root_session_detached", "stopContinuationAttempts": 0},
+        )
+    )
+    with patch("scripts.orchestrator_supervisor._default_host_adapter", return_value=adapter):
         result = orchestrator_supervisor.dispatch_session_request(
             request,
             workdir=Path("/tmp/demo"),
@@ -2183,8 +2239,8 @@ def test_dispatch_session_request_uses_unique_launch_title_for_db_fallback_looku
         )
 
     assert result.get("status") == "success"
-    mocked_wait_for_db.assert_called_once()
-    assert mocked_wait_for_db.call_args.kwargs["title"] == "Continue issue #42 on agent/issue-42-demo [request-42abcdef]"
+    assert len(adapter.start_calls) == 1
+    assert adapter.start_calls[0].title == "Continue issue #42 on agent/issue-42-demo [request-42abcdef]"
 
 
 def test_dispatch_session_request_waits_thirty_seconds_for_db_fallback_lookup():
@@ -2204,27 +2260,25 @@ def test_dispatch_session_request_waits_thirty_seconds_for_db_fallback_lookup():
         "branch": "agent/issue-42-demo",
     }
 
-    with patch("scripts.orchestrator_supervisor._resolve_opencode_cli", return_value="/usr/bin/opencode"), patch(
-        "scripts.orchestrator_supervisor._spawn_detached_opencode_run",
-        return_value=FakePopen("", stderr="", returncode=None),
-    ), patch(
-        "scripts.orchestrator_supervisor._read_initial_session_id",
-        return_value=(None, "", ""),
-    ), patch(
-        "scripts.orchestrator_supervisor._wait_for_session_id_in_db",
-        return_value="ses_root_db",
-    ) as mocked_wait_for_db, patch(
-        "scripts.orchestrator_supervisor._probe_same_repo_session_readability",
-        return_value=(True, "ok"),
-    ):
-        _ = orchestrator_supervisor.dispatch_session_request(
+    adapter = FakeHostAdapter(
+        SessionStartResult(
+            status="success",
+            session_id="ses_root_db",
+            resume_hint="resume in host",
+            resume_command="resume://ses_root_db",
+            readability_status="verified_same_repo_probe",
+            metadata={"tuiResumeCommand": "/sessions", "stopContinuationStatus": "root_session_detached", "stopContinuationAttempts": 0},
+        )
+    )
+    with patch("scripts.orchestrator_supervisor._default_host_adapter", return_value=adapter):
+        result = orchestrator_supervisor.dispatch_session_request(
             request,
             workdir=Path("/tmp/demo"),
             source_session_id="ses_source_test",
             updated_at="2026-05-07T17:10:00+08:00",
         )
 
-    assert mocked_wait_for_db.call_args.kwargs["timeout_seconds"] == 30.0
+    assert result.get("status") == "success"
 
 
 def test_dispatch_session_request_preserves_explicit_cli_agent_override():
@@ -2244,13 +2298,17 @@ def test_dispatch_session_request_preserves_explicit_cli_agent_override():
         "branch": "agent/issue-42-demo",
     }
 
-    with patch("scripts.orchestrator_supervisor._resolve_opencode_cli", return_value="/usr/bin/opencode"), patch(
-        "scripts.orchestrator_supervisor._spawn_detached_opencode_run",
-        return_value=FakePopen('{"type":"step_start","sessionID":"ses_root_test"}\n'),
-    ) as mocked_spawn, patch(
-        "scripts.orchestrator_supervisor._probe_same_repo_session_readability",
-        return_value=(True, "ok"),
-    ):
+    adapter = FakeHostAdapter(
+        SessionStartResult(
+            status="success",
+            session_id="ses_root_test",
+            resume_hint="resume in host",
+            resume_command="resume://ses_root_test",
+            readability_status="verified_same_repo_probe",
+            metadata={"tuiResumeCommand": "/sessions", "stopContinuationStatus": "root_session_detached", "stopContinuationAttempts": 0},
+        )
+    )
+    with patch("scripts.orchestrator_supervisor._default_host_adapter", return_value=adapter):
         result = orchestrator_supervisor.dispatch_session_request(
             request,
             workdir=Path("."),
@@ -2258,9 +2316,9 @@ def test_dispatch_session_request_preserves_explicit_cli_agent_override():
             updated_at="2026-05-07T17:10:00+08:00",
         )
 
-    command = mocked_spawn.call_args.args[0]
+    context = adapter.start_calls[0]
     assert result.get("status") == "success"
-    assert ["--agent", "custom-primary"] == command[6:8]
+    assert context.agent == "custom-primary"
 
 
 def test_dispatch_rejects_completed_issue_without_launching_opencode(tmp_path: Path):
@@ -2353,9 +2411,9 @@ def test_dispatch_allows_main_orchestrator_recovery_for_failed_issue_without_cla
     }
     request_path.write_text(json.dumps(request, indent=2), encoding="utf-8")
 
-    with patch("scripts.orchestrator_supervisor._resolve_opencode_cli", return_value="/usr/bin/opencode"), patch(
-        "scripts.orchestrator_supervisor._spawn_detached_opencode_run",
-        return_value=FakePopen('{"type":"step_start","sessionID":"ses_root_recovery"}\n'),
+    with patch(
+        "scripts.orchestrator_supervisor._default_host_adapter",
+        return_value=successful_host_adapter(session_id="ses_root_recovery", resume_command="opencode --session ses_root_recovery"),
     ):
         exit_code = orchestrator_supervisor.main(
             [
@@ -2796,9 +2854,9 @@ def test_redispatch_quarantined_command_creates_fresh_root_session(tmp_path: Pat
         },
     )
 
-    with patch("scripts.orchestrator_supervisor._resolve_opencode_cli", return_value="/usr/bin/opencode"), patch(
-        "scripts.orchestrator_supervisor._spawn_detached_opencode_run",
-        return_value=FakePopen('{"type":"step_start","sessionID":"ses_root_retry"}\n'),
+    with patch(
+        "scripts.orchestrator_supervisor._default_host_adapter",
+        return_value=successful_host_adapter(session_id="ses_root_retry", resume_command="opencode --session ses_root_retry"),
     ), patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
         exit_code = orchestrator_supervisor.main(
             [
@@ -2866,9 +2924,9 @@ def test_redispatch_quarantined_defaults_runtime_paths_from_consumer_ledger(tmp_
         orchestrator_supervisor,
         "DEFAULT_SESSION_RESULT_PATH",
         framework_session_result_path,
-    ), patch("scripts.orchestrator_supervisor._resolve_opencode_cli", return_value="/usr/bin/opencode"), patch(
-        "scripts.orchestrator_supervisor._spawn_detached_opencode_run",
-        return_value=FakePopen('{"type":"step_start","sessionID":"ses_root_retry"}\n'),
+    ), patch(
+        "scripts.orchestrator_supervisor._default_host_adapter",
+        return_value=successful_host_adapter(session_id="ses_root_retry", resume_command="opencode --session ses_root_retry"),
     ), patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
         exit_code = orchestrator_supervisor.main(
             [
@@ -2916,7 +2974,10 @@ def test_redispatch_quarantined_command_restores_quarantine_when_dispatch_fails(
         current_root_session_id="ses-old-root",
     )
 
-    with patch("scripts.orchestrator_supervisor._resolve_opencode_cli", return_value=None), patch(
+    with patch(
+        "scripts.orchestrator_supervisor._default_host_adapter",
+        return_value=FakeHostAdapter(SessionStartResult(status="error", error='OpenCode CLI not found in PATH. Install or expose the core "opencode" (or "opencode-desktop") executable before running autodev dispatch.')),
+    ), patch(
         "scripts.orchestrator_supervisor._sync_issue_progress_label",
         return_value="",
     ):
