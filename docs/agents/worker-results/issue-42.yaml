@@ -14,13 +14,25 @@ failure_classification: {kind: "none", retryable: true, routed_to: "pr_verifier"
 
 summary:
   objective: "Demo issue for orchestrator bootstrap validation. Validate that the nonstop supervisor loop correctly bootstraps a fresh main_orchestrator session, runs reconcile, and dispatches an issue_worker subagent."
-  outcome: "Recorded the repair-attempt result artifacts after confirming the canonical SQLite control plane now contains a persisted bootstrap -> issue_worker_execution runtime transition and the existing branch/PR metadata for PR #1 remains available for verifier re-checking."
+  outcome: "Pushed the AC1 repair stack to agent/issue-42-demo, restoring DB-backed bootstrap delegation and persisting the canonical SQLite bootstrap -> issue_worker_execution runtime transition before the first issue_worker launch; PR #1 now points at the repaired branch for verifier re-checking."
 
 files_changed:
+  - path: "scripts/host_adapter.py"
+    summary: "Introduced the host-adapter session boundary used by the DB-backed orchestrator flow."
+  - path: "scripts/opencode_host_adapter.py"
+    summary: "Moved OpenCode-specific session launch, resume, and readability probing behind the host adapter implementation."
+  - path: "scripts/orchestrator_sessions.py"
+    summary: "Exposed the shared host-adapter facade for orchestrator runtime code."
+  - path: "scripts/control_plane_db.py"
+    summary: "Expanded control-plane persistence so runtime history, latest refs, and current session state are stored in SQLite."
+  - path: "scripts/orchestrator_supervisor.py"
+    summary: "Restored runtime-transition recording and DB-backed reconcile/start flows so bootstrap persists issue_worker_execution evidence before dispatch."
+  - path: "tests/scripts/test_orchestrator_supervisor.py"
+    summary: "Added regressions covering the persisted bootstrap runtime transition and DB-backed start behavior."
   - path: "docs/agents/worker-results/issue-42.yaml"
-    summary: "Updated the compact worker artifact for repair attempt 2 with canonical SQLite bootstrap-transition evidence and existing PR metadata."
+    summary: "Recorded the final pushed repair state, PR metadata, and canonical SQLite evidence for issue 42."
   - path: "docs/agents/handoffs/issue-42.yaml"
-    summary: "Updated the issue handoff summary so the orchestrator and verifier can trace AC1 to the SQLite control-plane evidence."
+    summary: "Updated the verifier handoff summary to point AC1 at the repaired SQLite control-plane evidence."
 
 test_case_repair:
   applies: false
@@ -38,11 +50,11 @@ verification:
     - command: "python3 -m pytest tests/scripts/test_orchestrator_bootstrap_runner.py tests/scripts/test_orchestrator_supervisor.py tests/scripts/test_control_plane_db.py -q"
       result: "pass"
       evidence_ref: "local:focused-control-plane-regressions"
-      summary: "Focused orchestrator bootstrap, supervisor, and control-plane DB regressions passed (118 tests)."
+      summary: "Focused orchestrator bootstrap, supervisor, and control-plane DB regressions passed (102 tests in the focused bootstrap/supervisor slice and 136 tests in the broader repair suite)."
     - command: "python3 - <<'PY' ... query issue_history runtime_transition for issue 42 ... PY"
       result: "pass"
-      evidence_ref: ".opencode/runtime/control-plane.sqlite3#issue_history:37"
-      summary: "Canonical SQLite issue_history row 37 records main_orchestrator/orchestrator_bootstrap -> issue_worker/issue_worker_execution for issue 42."
+      evidence_ref: ".opencode/runtime/control-plane.sqlite3#issue_history:102"
+      summary: "Canonical SQLite issue_history row 102 records main_orchestrator/orchestrator_bootstrap -> issue_worker/issue_worker_execution for issue 42."
   final_acceptance_claim: false
 
 evidence_packet_refs:
@@ -74,4 +86,4 @@ handoff:
 metadata:
   worker: "issue_worker"
   worker_session_id: "current:issue_worker"
-  completed_at: "2026-05-14T20:30:00+08:00"
+  completed_at: "2026-05-14T20:16:53+08:00"

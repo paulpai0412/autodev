@@ -5,9 +5,9 @@ raw_evidence_policy: index_only
 
 issue_identity: {number: "42", title: "Issue 42 (demo)", branch: "agent/issue-42-demo", url: "https://github.com/example/issues/42"}
 acceptance_criteria_evidence:
-  - {id: "AC1", status: "documented", evidence_ref: ".opencode/runtime/control-plane.sqlite3#issue_history:37"}
+  - {id: "AC1", status: "documented", evidence_ref: ".opencode/runtime/control-plane.sqlite3#issue_history:102"}
   - {id: "AC2", status: "pass", evidence_ref: "docs/agents/worker-results/issue-42.yaml"}
-compact_verification_summary: "Repair attempt 2 confirmed canonical SQLite runtime_transition evidence for bootstrap -> issue_worker_execution and refreshed the worker artifact while leaving final acceptance to pr_verifier."
+compact_verification_summary: "Repair attempt 2 pushed the AC1 code fix, confirmed canonical SQLite runtime_transition evidence at issue_history:102 for bootstrap -> issue_worker_execution, and refreshed the worker artifact while leaving final acceptance to pr_verifier."
 evidence_packet_refs:
   - "docs/agents/evidence/issue-42-pr-1.yaml"
 files_changed_summary:
