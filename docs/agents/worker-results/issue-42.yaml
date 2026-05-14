@@ -1,0 +1,77 @@
+schema_version: "1.0"
+kind: worker_result
+line_cap: 80
+raw_evidence_policy: index_only_refs_no_raw_logs_or_transcripts
+
+issue:
+  number: "42"
+  title: "Issue 42 (demo)"
+  url: "https://github.com/example/issues/42"
+
+branch: "agent/issue-42-demo"
+status: "success"
+failure_classification: {kind: "none", retryable: true, routed_to: "pr_verifier", root_cause_signature: "none"}
+
+summary:
+  objective: "Demo issue for orchestrator bootstrap validation. Validate that the nonstop supervisor loop correctly bootstraps a fresh main_orchestrator session, runs reconcile, and dispatches an issue_worker subagent."
+  outcome: "Recorded the repair-attempt result artifacts after confirming the canonical SQLite control plane now contains a persisted bootstrap -> issue_worker_execution runtime transition and the existing branch/PR metadata for PR #1 remains available for verifier re-checking."
+
+files_changed:
+  - path: "docs/agents/worker-results/issue-42.yaml"
+    summary: "Updated the compact worker artifact for repair attempt 2 with canonical SQLite bootstrap-transition evidence and existing PR metadata."
+  - path: "docs/agents/handoffs/issue-42.yaml"
+    summary: "Updated the issue handoff summary so the orchestrator and verifier can trace AC1 to the SQLite control-plane evidence."
+
+test_case_repair:
+  applies: false
+  test_case_id: ""
+  attempted_target_case: false
+  repaired_categories: ["none"]
+  failure_signature: "none"
+  assertion_changed: false
+  expected_outcome_changed: false
+
+verification:
+  note: "Worker self-checks support implementation feedback only; final acceptance belongs to pr_verifier."
+  gates: {tdd_gate: "not_applicable", implementation_self_check_gate: "pass", git_gate: "pass"}
+  implementation_self_checks:
+    - command: "python3 -m pytest tests/scripts/test_orchestrator_bootstrap_runner.py tests/scripts/test_orchestrator_supervisor.py tests/scripts/test_control_plane_db.py -q"
+      result: "pass"
+      evidence_ref: "local:focused-control-plane-regressions"
+      summary: "Focused orchestrator bootstrap, supervisor, and control-plane DB regressions passed (118 tests)."
+    - command: "python3 - <<'PY' ... query issue_history runtime_transition for issue 42 ... PY"
+      result: "pass"
+      evidence_ref: ".opencode/runtime/control-plane.sqlite3#issue_history:37"
+      summary: "Canonical SQLite issue_history row 37 records main_orchestrator/orchestrator_bootstrap -> issue_worker/issue_worker_execution for issue 42."
+  final_acceptance_claim: false
+
+evidence_packet_refs:
+  worker_artifact_bundle: ""
+  verifier_packet: "docs/agents/evidence/issue-42-pr-1.yaml"
+  raw_evidence_policy: "stored_outside_main_agent_context"
+
+role_boundary:
+  actor_role: "issue_worker"
+  may_execute_implementation_self_checks: true
+  may_execute_final_acceptance_qa: false
+  may_emit_final_verification: false
+  verifier_packet_required_for_completion: true
+
+pr:
+  number: "1"
+  url: "https://github.com/paulpai0412/autodev/pull/1"
+  ready_for_review: true
+
+blockers:
+  - "none"
+
+next_recommended_step: "Return issue #42 to pr_verifier so it can re-check AC1 against the canonical SQLite runtime_transition evidence and refresh the evidence packet for PR #1."
+
+handoff:
+  repo_path: "docs/agents/handoffs/issue-42.yaml"
+  github_summary_posted: false
+
+metadata:
+  worker: "issue_worker"
+  worker_session_id: "current:issue_worker"
+  completed_at: "2026-05-14T20:30:00+08:00"

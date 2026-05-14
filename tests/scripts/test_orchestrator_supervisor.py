@@ -123,6 +123,74 @@ def test_create_initial_ledger_persists_issue_backing_type() -> None:
     assert issue["backingType"] == "github"
 
 
+def test_start_issue_records_db_backed_dispatch_result(tmp_path: Path):
+    issue_packet_path = tmp_path / "docs/agents/issue-packets/issue-42.yaml"
+    issue_packet_path.parent.mkdir(parents=True, exist_ok=True)
+    issue_packet_path.write_text(SAMPLE_ISSUE_PACKET, encoding="utf-8")
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    orchestrator_supervisor._sync_issue_packet_to_db(tmp_path, issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+
+    with patch("scripts.orchestrator_supervisor._resolve_opencode_cli", return_value="/usr/bin/opencode"), patch(
+        "scripts.orchestrator_supervisor._spawn_detached_opencode_run",
+        return_value=FakePopen(""),
+    ), patch(
+        "scripts.orchestrator_supervisor._read_initial_session_id",
+        return_value=("ses_root_test", "", ""),
+    ), patch(
+        "scripts.orchestrator_supervisor._probe_same_repo_session_readability",
+        return_value=(True, "ok"),
+    ), patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+        result = orchestrator_supervisor.start_issue(
+            base_dir=tmp_path,
+            issue_number="42",
+            source_session_id="autodev-start",
+            updated_at="2026-05-07T17:10:00+08:00",
+        )
+
+    issue = read_issue(tmp_path, "42")
+    latest = orchestrator_supervisor.read_latest_dispatch_result(tmp_path, issue_number="42")
+
+    assert result.get("status") == "success"
+    assert result.get("rootSessionID") == "ses_root_test"
+    assert latest is not None
+    assert latest.get("rootSessionID") == "ses_root_test"
+    assert issue is not None
+    assert issue["state"] == "running"
+    assert issue["current_root_session_id"] == "ses_root_test"
+
+
+def test_show_latest_session_reads_db_backed_dispatch_result(tmp_path: Path):
+    issue_packet_path = tmp_path / "docs/agents/issue-packets/issue-42.yaml"
+    issue_packet_path.parent.mkdir(parents=True, exist_ok=True)
+    issue_packet_path.write_text(SAMPLE_ISSUE_PACKET, encoding="utf-8")
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    orchestrator_supervisor._sync_issue_packet_to_db(tmp_path, issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+
+    with patch("scripts.orchestrator_supervisor._resolve_opencode_cli", return_value="/usr/bin/opencode"), patch(
+        "scripts.orchestrator_supervisor._spawn_detached_opencode_run",
+        return_value=FakePopen(""),
+    ), patch(
+        "scripts.orchestrator_supervisor._read_initial_session_id",
+        return_value=("ses_root_test", "", ""),
+    ), patch(
+        "scripts.orchestrator_supervisor._probe_same_repo_session_readability",
+        return_value=(True, "ok"),
+    ), patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+        orchestrator_supervisor.start_issue(
+            base_dir=tmp_path,
+            issue_number="42",
+            source_session_id="autodev-start",
+            updated_at="2026-05-07T17:10:00+08:00",
+        )
+
+    payload = orchestrator_supervisor.show_latest_session(base_dir=tmp_path, issue_number="42")
+
+    assert payload is not None
+    assert payload.get("status") == "success"
+    assert payload.get("rootSessionID") == "ses_root_test"
+    assert payload.get("cliOpenCommand") == "opencode --session ses_root_test"
+
+
 def test_reconcile_worker_success_queues_pr_verifier(tmp_path: Path):
     issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
     checkpoint_path = tmp_path / "docs/agents/runtime/context-checkpoint.yaml"

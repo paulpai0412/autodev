@@ -28,6 +28,7 @@ from scripts.control_plane_db import (
     issue_rows_with_packets,
     issues_in_states,
     ready_issues_for_selection,
+    read_latest_issue_history,
     read_issue_packet,
     record_admin_decision,
     read_latest_decision,
@@ -328,6 +329,238 @@ class SessionResult(TypedDict, total=False):
     issueNumber: str
     branch: str
     recordedAt: str
+
+
+def _record_dispatch_request_history(
+    *,
+    base_dir: Path,
+    request: SessionRequest,
+    created_at: str,
+) -> int:
+    request_id = str(request.get("requestID") or "")
+    return append_issue_history(
+        base_dir,
+        issue_number=request["issueNumber"],
+        entry_type="dispatch_request",
+        created_at=created_at,
+        role=request["role"],
+        stage=request["stage"],
+        status="queued",
+        request_id=request_id,
+        command_id=request_id,
+        summary=request["reason"],
+        payload=dict(request),
+        unique_key=f"dispatch-request:{request_id or created_at}",
+    )
+
+
+def _record_dispatch_result_history(
+    *,
+    base_dir: Path,
+    session_result: SessionResult,
+) -> int:
+    issue_number = str(session_result.get("issueNumber") or "")
+    recorded_at = str(session_result.get("recordedAt") or "")
+    request_id = str(session_result.get("sourceSessionID") or "")
+    root_session_id = str(session_result.get("rootSessionID") or "")
+    status = str(session_result.get("status") or "")
+    if not issue_number or not recorded_at:
+        return 0
+    return append_issue_history(
+        base_dir,
+        issue_number=issue_number,
+        entry_type="dispatch_result",
+        created_at=recorded_at,
+        role=str(session_result.get("role") or ""),
+        stage=str(session_result.get("stage") or ""),
+        status=status,
+        session_id=root_session_id,
+        request_id=request_id,
+        command_id=request_id,
+        summary=str(session_result.get("reason") or status),
+        payload=dict(session_result),
+        unique_key=f"dispatch-result:{request_id or recorded_at}",
+    )
+
+
+def read_latest_dispatch_result(base_dir: Path, *, issue_number: str | None = None) -> SessionResult | None:
+    if issue_number is None:
+        return None
+    row = read_latest_issue_history(base_dir, issue_number, entry_type="dispatch_result")
+    if row is None:
+        return None
+    payload = row.get("payload_json")
+    if isinstance(payload, dict):
+        return cast(SessionResult, cast(object, payload))
+    if isinstance(payload, str):
+        try:
+            parsed = json.loads(payload)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(parsed, dict):
+            return cast(SessionResult, cast(object, parsed))
+    return None
+
+
+def show_latest_session(*, base_dir: Path, issue_number: str | None = None) -> SessionResult | None:
+    if issue_number is not None:
+        return read_latest_dispatch_result(base_dir, issue_number=issue_number)
+    issue_rows = issue_rows_with_packets(base_dir)
+    for issue_row in issue_rows:
+        candidate_issue_number = str(issue_row.get("issue_number") or "")
+        if not candidate_issue_number:
+            continue
+        result = read_latest_dispatch_result(base_dir, issue_number=candidate_issue_number)
+        if result is not None:
+            return result
+    return None
+
+
+def start_issue(
+    *,
+    base_dir: Path,
+    issue_number: str,
+    source_session_id: str,
+    approval_override_mode: str | None = None,
+    override_source: str | None = None,
+    human_approval_skipped: bool | None = None,
+    updated_at: str | None = None,
+) -> SessionResult:
+    ensure_control_plane_db(base_dir)
+    normalized_issue_number = issue_number.strip().removeprefix("#").removeprefix("issue-")
+    packet = _load_issue_packet_from_db(base_dir, normalized_issue_number)
+    if packet is None:
+        issue_packet_path = base_dir / "docs/agents/issue-packets" / f"issue-{normalized_issue_number}.yaml"
+        if not issue_packet_path.exists() and not run_issue_packet_intake(base_dir):
+            raise RuntimeError(f"issue packet not found for issue #{normalized_issue_number}")
+        if not issue_packet_path.exists():
+            raise RuntimeError(f"issue packet not found for issue #{normalized_issue_number}: {issue_packet_path}")
+        packet = parse_issue_packet_text(issue_packet_path.read_text(encoding="utf-8"), str(issue_packet_path.relative_to(base_dir)))
+        _sync_issue_packet_to_db(base_dir, packet, updated_at=updated_at)
+
+    issue_number = packet.issue_number
+    issue_state = read_issue(base_dir, issue_number)
+    state = str(issue_state.get("state") or "ready") if issue_state else "ready"
+    if state != "ready":
+        current_root_session_id = str(issue_state.get("current_root_session_id") or "") if issue_state else ""
+        resume_suffix = f" Resume with: opencode --session {current_root_session_id}." if current_root_session_id else ""
+        raise RuntimeError(f"issue #{issue_number} is already {state}; refusing duplicate start.{resume_suffix}")
+
+    timestamp = _now(updated_at)
+    _clear_issue_runtime_artifacts(base_dir=base_dir, issue_number=issue_number)
+    ensure_issue_row(base_dir, issue_number=issue_number, updated_at=timestamp)
+    _ = upsert_issue_state(
+        base_dir=base_dir,
+        issue_number=issue_number,
+        state="claimed",
+        command_id=f"start-issue:{issue_number}:claimed",
+        updated_at=timestamp,
+    )
+    sync_error = _sync_issue_progress_label(
+        base_dir=base_dir,
+        issue_number=issue_number,
+        add_labels=[AGENT_DISPATCHING_LABEL],
+        remove_labels=[READY_FOR_AGENT_LABEL, AGENT_IN_PROGRESS_LABEL, QUARANTINED_LABEL],
+        command_id=f"start-issue:{issue_number}:labels",
+        updated_at=timestamp,
+    )
+    if sync_error:
+        _ = upsert_issue_state(
+            base_dir,
+            issue_number=issue_number,
+            state="ready",
+            command_id=f"start-issue:{issue_number}:labels-rollback",
+            updated_at=timestamp,
+            current_root_session_id="",
+        )
+        raise RuntimeError(f"failed to sync GitHub in-progress state for issue #{issue_number}: {sync_error}")
+
+    ledger = create_initial_ledger(
+        issue_packet=packet,
+        checkpoint_path=str(base_dir / DEFAULT_CHECKPOINT_PATH),
+        workflow_policy_path=DEFAULT_WORKFLOW_POLICY_PATH,
+        primary_workspace_root=str(base_dir),
+        root_session_agent=DEFAULT_ROOT_SESSION_AGENT,
+        updated_at=timestamp,
+    )
+    workflow = cast(dict[str, object], ledger["workflow"])
+    workflow["runtimeControls"] = {
+        "approval_override_mode": approval_override_mode or "",
+        "default_merge_approval_mode": "human_required",
+        "override_source": override_source or "none",
+        "human_approval_skipped": bool(human_approval_skipped),
+    }
+    _ = sync_issue_runtime_context(
+        base_dir,
+        issue_number=issue_number,
+        updated_at=timestamp,
+        resume_snapshot={
+            "workflow_start_runtime_controls": cast(dict[str, object], workflow["runtimeControls"]),
+        },
+    )
+    request = build_orchestrator_request(ledger)
+    _record_dispatch_request_history(base_dir=base_dir, request=request, created_at=str(request.get("createdAt") or timestamp))
+    dispatch_command_id = str(request.get("requestID") or uuid4().hex)
+    _transition_issue_state_if_possible(
+        base_dir=base_dir,
+        issue_number=issue_number,
+        to_state="dispatching",
+        command_id=dispatch_command_id,
+        updated_at=timestamp,
+        reason=f"Dispatch root session request for issue #{issue_number}.",
+        from_state="claimed",
+    )
+    session_result = dispatch_session_request(
+        request,
+        workdir=base_dir,
+        source_session_id=source_session_id,
+        updated_at=timestamp,
+    )
+    if session_result.get("status") == "success":
+        root_session_id = str(session_result.get("rootSessionID") or "")
+        recorded_at = str(session_result.get("recordedAt") or timestamp)
+        _transition_issue_state_if_possible(
+            base_dir=base_dir,
+            issue_number=issue_number,
+            to_state="running",
+            command_id=f"{dispatch_command_id}:running",
+            updated_at=recorded_at,
+            reason=f"Root session {root_session_id} acknowledged for issue #{issue_number}.",
+            from_state="dispatching",
+            current_root_session_id=root_session_id,
+        )
+        _append_root_issue_event(
+            base_dir=base_dir,
+            issue_number=issue_number,
+            root_session_id=root_session_id,
+            event_type="root_session_started",
+            created_at=recorded_at,
+            payload=cast(JsonObject, cast(object, dict(session_result))),
+            session_seq=1,
+        )
+        sync_error = _sync_issue_progress_label(
+            base_dir=base_dir,
+            issue_number=issue_number,
+            add_labels=[AGENT_IN_PROGRESS_LABEL],
+            remove_labels=[AGENT_DISPATCHING_LABEL],
+            command_id=f"start-issue:{issue_number}:running-labels",
+            updated_at=recorded_at,
+        )
+        if sync_error:
+            session_result["recommendedAction"] = (
+                f"Open /sessions in OpenCode TUI and switch to {root_session_id}, or run opencode --session {root_session_id}. "
+                f"GitHub running-label sync failed and may need retry: {sync_error}"
+            )
+    else:
+        failure_updated_at = str(session_result.get("recordedAt") or timestamp)
+        release_issue_execution(
+            base_dir=base_dir,
+            issue_number=issue_number,
+            restore_ready_for_agent=True,
+            updated_at=failure_updated_at,
+        )
+    _record_dispatch_result_history(base_dir=base_dir, session_result=session_result)
+    return session_result
 
 
 class SupervisorDecision(TypedDict):
@@ -2756,6 +2989,33 @@ def build_parser() -> argparse.ArgumentParser:
     _ = dispatch_parser.add_argument("--source-session-id", default="manual_dispatch", help="Source session id to record in the session result")
     _ = dispatch_parser.add_argument("--updated-at")
 
+    start_issue_parser = subparsers.add_parser(
+        "start-issue",
+        help="Start a root orchestrator session from DB-backed issue state",
+    )
+    _ = start_issue_parser.add_argument("--issue-number", required=True, help="Issue number to dispatch")
+    _ = start_issue_parser.add_argument(
+        "--source-session-id",
+        default="supervisor_start_issue",
+        help="Source session id to record in the dispatch result",
+    )
+    _ = start_issue_parser.add_argument("--approval-override-mode", help="Workflow-start merge approval override mode")
+    _ = start_issue_parser.add_argument("--override-source", help="Workflow-start approval override source")
+    _ = start_issue_parser.add_argument(
+        "--human-approval-skipped",
+        action="store_true",
+        help="Record that human approval is intentionally skipped for this workflow run",
+    )
+    _ = start_issue_parser.add_argument("--base-dir", default=".", help="Consumer project root")
+    _ = start_issue_parser.add_argument("--updated-at")
+
+    show_session_parser = subparsers.add_parser(
+        "show-session",
+        help="Show the latest DB-backed dispatch result for an issue or workspace",
+    )
+    _ = show_session_parser.add_argument("--base-dir", default=".", help="Consumer project root")
+    _ = show_session_parser.add_argument("--issue-number", help="Optional issue number filter")
+
     quarantine_parser = subparsers.add_parser("quarantine", help="Move an issue into quarantined state")
     _ = quarantine_parser.add_argument("--ledger", default=str(DEFAULT_LEDGER_PATH), help="Path to orchestrator-ledger.json")
     _ = quarantine_parser.add_argument("--issue-number", help="Explicit issue number override")
@@ -2867,6 +3127,32 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"wrote session result {session_result_path}")
         print(json.dumps(session_result, indent=2, ensure_ascii=False))
+        return 0
+
+    if cast(str, args.command) == "start-issue":
+        base_dir = Path(cast(str, args.base_dir)).resolve()
+        session_result = start_issue(
+            base_dir=base_dir,
+            issue_number=cast(str, args.issue_number),
+            source_session_id=cast(str, args.source_session_id),
+            approval_override_mode=cast(str | None, getattr(args, "approval_override_mode", None)),
+            override_source=cast(str | None, getattr(args, "override_source", None)),
+            human_approval_skipped=cast(bool, getattr(args, "human_approval_skipped", False)),
+            updated_at=cast(str | None, args.updated_at),
+        )
+        print(json.dumps(session_result, indent=2, ensure_ascii=False))
+        return 0
+
+    if cast(str, args.command) == "show-session":
+        base_dir = Path(cast(str, args.base_dir)).resolve()
+        session_result = show_latest_session(
+            base_dir=base_dir,
+            issue_number=cast(str | None, getattr(args, "issue_number", None)),
+        )
+        if session_result is None:
+            print(json.dumps({"status": "missing", "error": "no DB-backed dispatch result found"}, ensure_ascii=False))
+            return 1
+        print(json.dumps(session_result, ensure_ascii=False))
         return 0
 
     if cast(str, args.command) == "redispatch-quarantined":
