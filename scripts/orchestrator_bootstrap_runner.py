@@ -50,6 +50,22 @@ def _normalize_issue_number(issue_number: str) -> str:
     return normalized
 
 
+def _canonical_issue_packets_dir(*, base_dir: Path) -> Path:
+    return (base_dir / "docs/agents/issue-packets").resolve()
+
+
+def _require_canonical_issue_packet_path(issue_packet_path: Path, *, base_dir: Path) -> Path:
+    resolved_packet_path = issue_packet_path.resolve()
+    canonical_dir = _canonical_issue_packets_dir(base_dir=base_dir)
+    try:
+        resolved_packet_path.relative_to(canonical_dir)
+    except ValueError as error:
+        raise RuntimeError(
+            f"issue packet path must live under {canonical_dir}, got {resolved_packet_path}"
+        ) from error
+    return resolved_packet_path
+
+
 def resolve_issue_packet_path(issue_number: str, *, base_dir: Path | None = None) -> Path:
     normalized = _normalize_issue_number(issue_number)
     actual_base_dir = base_dir or ROOT
@@ -80,11 +96,12 @@ def run_orchestrator_bootstrap(
     updated_at: str | None = None,
 ) -> RunnerResult:
     del checkpoint_path, new_session_request_path, dispatch_now, workflow_policy_path
+    base_dir = _infer_artifact_base_dir(ledger_path)
+    issue_packet_path = _require_canonical_issue_packet_path(issue_packet_path, base_dir=base_dir)
     issue_packet = parse_issue_packet_text(
         issue_packet_path.read_text(encoding="utf-8"),
         _normalize_issue_packet_ref(issue_packet_path),
     )
-    base_dir = _infer_artifact_base_dir(ledger_path)
     _sync_issue_packet_to_db(base_dir, issue_packet, updated_at=updated_at)
     session_result = start_issue(
         base_dir=base_dir,

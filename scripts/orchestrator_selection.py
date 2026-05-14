@@ -63,10 +63,8 @@ def resolve_artifact_path(path_text: str, *, base_dir: Path, root: Path) -> Path
     path = Path(path_text)
     if path.is_absolute():
         return path
-    candidate = base_dir / path
-    if candidate.exists():
-        return candidate
-    return root / path
+    del root
+    return base_dir / path
 
 
 def infer_artifact_base_dir(ledger_path: Path, *, root: Path) -> Path:
