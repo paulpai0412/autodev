@@ -1,36 +1,22 @@
 #!/usr/bin/env python3
-"""Run the orchestrator checkpoint-to-new-session bootstrap for a selected AFK issue."""
+"""Compatibility wrapper that delegates legacy bootstrap calls into DB-backed startup."""
 
 from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
-import json
 from typing import cast
 
 from scripts.orchestrator_supervisor import (
-    DEFAULT_ROOT_SESSION_AGENT,
     DEFAULT_LEDGER_PATH,
     _infer_artifact_base_dir,
-    _dispatch_consumed_request,
     _sync_issue_packet_to_db,
-    build_orchestrator_request,
-    claim_issue_execution,
-    create_initial_ledger,
-    default_session_result_path_for_request,
     parse_issue_packet_text,
     run_issue_packet_intake,
-    write_ledger_file,
-    write_session_request,
+    start_issue,
 )
-from scripts.orchestrator_compact_payload import (
-    DEFAULT_CHECKPOINT_PATH,
-    DEFAULT_WORKFLOW_POLICY_PATH,
-    derive_compact_payload,
-    parse_checkpoint_text,
-    write_checkpoint_file,
-)
+from scripts.orchestrator_compact_payload import DEFAULT_CHECKPOINT_PATH, DEFAULT_WORKFLOW_POLICY_PATH
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,26 +24,12 @@ DEFAULT_NEW_SESSION_REQUEST_PATH = ROOT / ".opencode/runtime/new-session-request
 DEFAULT_ISSUE_PACKETS_DIR = ROOT / "docs/agents/issue-packets"
 
 
-def _clear_issue_runtime_artifacts(*, base_dir: Path, issue_number: str) -> None:
-    artifact_paths = [
-        base_dir / "docs/agents/worker-results" / f"issue-{issue_number}.yaml",
-        base_dir / "docs/agents/handoffs" / f"issue-{issue_number}.yaml",
-    ]
-    artifact_paths.extend((base_dir / "docs/agents/evidence").glob(f"issue-{issue_number}-pr-*.yaml"))
-    artifact_paths.extend((base_dir / "docs/agents/release-results").glob(f"issue-{issue_number}-pr-*.yaml"))
-    for artifact_path in artifact_paths:
-        artifact_path.unlink(missing_ok=True)
-
-
 @dataclass
 class RunnerResult:
-    checkpoint_path: Path
-    ledger_path: Path
-    new_session_request_path: Path
     issue_number: str
     branch: str
     immediate_next_action: str
-    new_session_result_path: Path | None = None
+    session_result: dict[str, object]
 
 
 def _normalize_issue_packet_ref(issue_packet_path: Path) -> str:
@@ -107,69 +79,28 @@ def run_orchestrator_bootstrap(
     human_approval_skipped: bool | None = None,
     updated_at: str | None = None,
 ) -> RunnerResult:
+    del checkpoint_path, new_session_request_path, dispatch_now, workflow_policy_path
     issue_packet = parse_issue_packet_text(
         issue_packet_path.read_text(encoding="utf-8"),
         _normalize_issue_packet_ref(issue_packet_path),
     )
     base_dir = _infer_artifact_base_dir(ledger_path)
-    _clear_issue_runtime_artifacts(base_dir=base_dir, issue_number=issue_packet.issue_number)
     _sync_issue_packet_to_db(base_dir, issue_packet, updated_at=updated_at)
-    claim_issue_execution(
+    session_result = start_issue(
         base_dir=base_dir,
         issue_number=issue_packet.issue_number,
-        branch=issue_packet.branch,
         source_session_id=source_session_id,
-        updated_at=updated_at,
-    )
-
-    _ = write_checkpoint_file(
-        checkpoint_path,
-        issue_number=issue_packet.issue_number,
-        branch=issue_packet.branch,
-        role="main_orchestrator",
-        agent=DEFAULT_ROOT_SESSION_AGENT,
-        issue_packet=issue_packet.issue_packet_path,
-        handoff=issue_packet.prior_handoff,
         approval_override_mode=approval_override_mode,
         override_source=override_source,
         human_approval_skipped=human_approval_skipped,
-        workflow_policy_path=workflow_policy_path,
         updated_at=updated_at,
     )
-
-    checkpoint_record = parse_checkpoint_text(checkpoint_path.read_text(encoding="utf-8"))
-    payload = derive_compact_payload(checkpoint_record, workflow_policy_path=workflow_policy_path)
-    ledger = create_initial_ledger(
-        issue_packet=issue_packet,
-        checkpoint_path=str(checkpoint_path),
-        workflow_policy_path=workflow_policy_path,
-        primary_workspace_root=str(base_dir),
-        root_session_agent=DEFAULT_ROOT_SESSION_AGENT,
-        updated_at=updated_at,
-    )
-    write_ledger_file(ledger_path, ledger)
-    request = build_orchestrator_request(ledger)
-    write_session_request(new_session_request_path, request)
-    new_session_result_path: Path | None = None
-    if dispatch_now:
-        resolved_session_result_path = default_session_result_path_for_request(new_session_request_path)
-        _ = _dispatch_consumed_request(
-            new_session_request_path,
-            ledger_path=ledger_path,
-            session_result_path=resolved_session_result_path,
-            source_session_id=source_session_id,
-            updated_at=updated_at,
-        )
-        new_session_result_path = resolved_session_result_path
 
     return RunnerResult(
-        checkpoint_path=checkpoint_path,
-        ledger_path=ledger_path,
-        new_session_request_path=new_session_request_path,
         issue_number=issue_packet.issue_number,
         branch=issue_packet.branch,
-        immediate_next_action=payload["immediate_next_action"],
-        new_session_result_path=new_session_result_path,
+        immediate_next_action="Inspect the DB-backed root session via scripts.orchestrator_supervisor show-session or /autodev-show-session.",
+        session_result=cast(dict[str, object], cast(object, dict(session_result))),
     )
 
 
@@ -232,16 +163,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: {error}")
         return 1
 
-    print(f"orchestrator bootstrap: updated checkpoint {result.checkpoint_path}")
-    print(f"orchestrator bootstrap: wrote supervisor ledger {result.ledger_path}")
-    print(f"orchestrator bootstrap: wrote continuation request {result.new_session_request_path}")
-    if result.new_session_result_path is not None:
-        session_result = cast(dict[str, object], json.loads(result.new_session_result_path.read_text(encoding="utf-8")))
-        status = str(session_result.get("status", "unknown"))
-        if status == "success":
-            print(f"orchestrator bootstrap: dispatched fresh root session and wrote session result {result.new_session_result_path}")
-        else:
-            print(f"orchestrator bootstrap: dispatch recorded {status} session result {result.new_session_result_path}")
+    status = str(result.session_result.get("status", "unknown"))
+    if status == "success":
+        print(f"orchestrator bootstrap: delegated to DB-backed start-issue for issue #{result.issue_number}")
+    else:
+        print(f"orchestrator bootstrap: DB-backed start recorded {status} for issue #{result.issue_number}")
     print(f"orchestrator bootstrap: next action -> {result.immediate_next_action}")
     return 0
 
