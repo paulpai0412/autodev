@@ -5,36 +5,42 @@ raw_evidence_policy: index_only_refs_no_raw_logs_or_transcripts
 
 issue:
   number: "42"
-  title: "Issue 42 (demo)"
+  title: "Demo issue"
   url: "https://github.com/example/issues/42"
 
 branch: "agent/issue-42-demo"
 status: "success"
 
 summary:
-  objective: "Publish the demo issue packet, worker result, and handoff artifacts for issue #42."
-  outcome: "Published the demo issue artifacts, pushed the branch, and opened PR #1 without claiming final acceptance QA."
+  objective: "Delegate bootstrap startup through the DB-backed supervisor start path for issue #42."
+  outcome: "Replaced the legacy file-backed bootstrap flow with DB-backed start-issue delegation and added focused regression coverage without claiming final acceptance QA."
 
 files_changed:
-  - path: "docs/agents/issue-packets/issue-42.yaml"
-    summary: "Canonical demo issue packet for issue #42."
-  - path: "docs/agents/worker-results/issue-42.yaml"
-    summary: "Worker artifact for the demo issue."
-  - path: "docs/agents/handoffs/issue-42.yaml"
-    summary: "Compact issue handoff for orchestrator follow-up."
+  - path: "scripts/orchestrator_bootstrap_runner.py"
+    summary: "Turned the bootstrap runner into a thin wrapper around DB-backed supervisor startup."
+  - path: "scripts/orchestrator_supervisor.py"
+    summary: "Added DB-backed start-issue and show-session support plus dispatch history recording."
+  - path: "tests/scripts/test_orchestrator_bootstrap_runner.py"
+    summary: "Replaced legacy file-flow assertions with DB-backed bootstrap delegation coverage."
+  - path: "tests/scripts/test_orchestrator_supervisor.py"
+    summary: "Added focused coverage for supervisor start_issue and show_latest_session behavior."
 
 verification:
   note: "Worker self-checks support implementation feedback only; final acceptance belongs to pr_verifier."
   gates: {tdd_gate: "not_applicable", implementation_self_check_gate: "pass", git_gate: "pass"}
   implementation_self_checks:
-    - command: "python3 -m pytest tests/scripts/test_orchestrator_bootstrap_runner.py -q"
+    - command: "python3 -m pytest tests/scripts/test_orchestrator_bootstrap_runner.py tests/scripts/test_orchestrator_supervisor.py -q"
       result: "pass"
-      evidence_ref: "local:test_orchestrator_bootstrap_runner"
-      summary: "Focused bootstrap runner regression suite passed (6 tests)."
-    - command: "python3 scripts/agent_context_budget_check.py"
-      result: "fail"
-      evidence_ref: "local:agent_context_budget_check"
-      summary: "Pre-existing unrelated docs gate failure in docs/agents/issue-tracker.md; issue #42 artifacts not implicated."
+      evidence_ref: "local:focused-bootstrap-supervisor"
+      summary: "Focused DB-backed bootstrap and supervisor suites passed (103 tests)."
+    - command: "python3 -m pytest tests/scripts/test_orchestrator_bootstrap_runner.py tests/scripts/test_orchestrator_supervisor.py tests/scripts/test_autodev_project.py -q"
+      result: "pass"
+      evidence_ref: "local:related-orchestrator-regressions"
+      summary: "Related orchestrator regressions passed (119 tests)."
+    - command: "lsp_diagnostics scripts/orchestrator_bootstrap_runner.py scripts/orchestrator_supervisor.py tests/scripts/test_orchestrator_bootstrap_runner.py tests/scripts/test_orchestrator_supervisor.py"
+      result: "pass"
+      evidence_ref: "local:lsp-self-check"
+      summary: "No LSP errors on changed files; remaining warnings are pre-existing private-usage and broad typing noise."
   final_acceptance_claim: false
 
 pr:
