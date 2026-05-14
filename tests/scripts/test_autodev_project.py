@@ -91,22 +91,23 @@ def test_init_dry_run_writes_nothing(tmp_path: Path):
 
 def test_install_commands_writes_autodev_prefixed_global_commands(tmp_path: Path):
     commands_dir = tmp_path / "commands"
+    entrypoints = autodev_project._operator_entrypoints()
 
     exit_code = autodev_project.main(
         ["install-commands", "--commands-dir", str(commands_dir)]
     )
 
     assert exit_code == 0
-    start_command = read(commands_dir / "autodev-start.md")
+    start_command = read(commands_dir / entrypoints["start"])
     assert "description: Start autodev workflow" in start_command
     assert "scripts/autodev_project.py start" in start_command
     assert '--issue-number "$1"' in start_command
     assert 'AUTODEV_HOME="${AUTODEV_HOME:-$HOME/apps/autodev}"' in start_command
     assert 'PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" start' in start_command
     assert str(tmp_path) not in start_command
-    assert (commands_dir / "autodev-reconcile.md").exists()
-    assert (commands_dir / "autodev-show-session.md").exists()
-    assert (commands_dir / "autodev-doctor.md").exists()
+    assert (commands_dir / entrypoints["reconcile"]).exists()
+    assert (commands_dir / entrypoints["inspect"]).exists()
+    assert (commands_dir / entrypoints["doctor"]).exists()
 
 
 def test_repo_local_commands_use_autodev_project_wrappers():
@@ -246,6 +247,25 @@ def test_init_reports_origin_mismatch_without_force(tmp_path: Path, capsys: Capt
     assert "origin remote points to https://github.com/example/old.git; expected https://github.com/paulpai0412/autodev-demo-todo.git" in captured.out
 
 
+def test_init_rejects_invalid_github_repo_slug(tmp_path: Path):
+    write(tmp_path / "AGENTS.md", "# AGENTS.md\n")
+
+    try:
+        autodev_project.main(
+            [
+                "init",
+                "--project-root",
+                str(tmp_path),
+                "--github-repo",
+                "bad slug",
+            ]
+        )
+    except ValueError as error:
+        assert "github_repo must be owner/repo" in str(error)
+    else:
+        raise AssertionError("expected invalid github_repo slug to be rejected")
+
+
 def test_main_reports_json_when_requested(tmp_path: Path, capsys: CaptureFixture[str]):
     exit_code = autodev_project.main(
         ["doctor", "--project-root", str(tmp_path), "--json"]
@@ -270,16 +290,14 @@ def test_start_uses_consumer_project_artifact_paths(tmp_path: Path):
     assert exit_code == 0
     command = run.call_args.args[0]
     kwargs = run.call_args.kwargs
-    assert command[:3] == ["python3", "-m", "scripts.orchestrator_bootstrap_runner"]
-    assert ["--issue-number", "34"] == command[3:5]
-    assert "--issue-packet" not in command
-    assert str(tmp_path / "docs/agents/runtime/context-checkpoint.yaml") in command
-    assert str(tmp_path / ".opencode/runtime/orchestrator-ledger.json") in command
-    assert str(autodev_project.ROOT / "docs/agents/autonomous-development-workflow.yaml") in command
+    assert command[:4] == ["python3", "-m", "scripts.orchestrator_supervisor", "start-issue"]
+    assert ["--base-dir", str(tmp_path)] in [command[i:i+2] for i in range(len(command)-1)]
+    assert ["--issue-number", "34"] in [command[i:i+2] for i in range(len(command)-1)]
+    assert ["--source-session-id", "autodev-start"] in [command[i:i+2] for i in range(len(command)-1)]
     assert ["--approval-override-mode", "bypass_approval"] in [command[i:i+2] for i in range(len(command)-1)]
     assert ["--override-source", "user_requested_autodev_start"] in [command[i:i+2] for i in range(len(command)-1)]
     assert "--human-approval-skipped" in command
-    assert (tmp_path / "docs/agents/runtime/context-checkpoint.yaml").exists()
+    assert not (tmp_path / "docs/agents/runtime/context-checkpoint.yaml").exists()
     assert kwargs["cwd"] == tmp_path
     assert kwargs["env"]["PYTHONPATH"].split(autodev_project.os.pathsep)[0] == str(autodev_project.ROOT)
 
@@ -296,13 +314,9 @@ def test_reconcile_uses_consumer_project_runtime_paths_and_dispatches_next_sessi
     assert exit_code == 0
     command = run.call_args.args[0]
     kwargs = run.call_args.kwargs
-    assert command[:4] == ["python3", "-m", "scripts.orchestrator_supervisor", "reconcile"]
-    assert ".opencode/runtime/orchestrator-ledger.json" in command
-    assert ".opencode/runtime/new-session-request.json" in command
-    assert ".opencode/runtime/new-session-result.json" in command
-    assert "--write-request" in command
-    assert "--dispatch-now" in command
-    assert ["--source-session-id", "autodev-reconcile"] == command[-2:]
+    assert command[:4] == ["python3", "-m", "scripts.orchestrator_supervisor", "reconcile-issue"]
+    assert ["--base-dir", str(tmp_path)] in [command[i:i+2] for i in range(len(command)-1)]
+    assert ["--issue-number", "42"] in [command[i:i+2] for i in range(len(command)-1)]
     assert kwargs["cwd"] == tmp_path
     assert kwargs["env"]["PYTHONPATH"].split(autodev_project.os.pathsep)[0] == str(autodev_project.ROOT)
 
@@ -324,10 +338,9 @@ def test_start_resolves_consumer_project_root_from_nested_directory(tmp_path: Pa
     kwargs = run.call_args.kwargs
     command = run.call_args.args[0]
     assert kwargs["cwd"] == tmp_path
-    assert str(tmp_path / "docs/agents/runtime/context-checkpoint.yaml") in command
-    assert str(tmp_path / ".opencode/runtime/orchestrator-ledger.json") in command
+    assert ["--base-dir", str(tmp_path)] in [command[i:i+2] for i in range(len(command)-1)]
     assert not (nested / "docs").exists()
-    assert (tmp_path / "docs/agents/runtime/context-checkpoint.yaml").exists()
+    assert not (tmp_path / "docs/agents/runtime/context-checkpoint.yaml").exists()
 
 
 def test_reconcile_resolves_consumer_project_root_from_nested_directory(tmp_path: Path):
@@ -349,13 +362,12 @@ def test_show_session_resolves_consumer_project_root_from_nested_directory(tmp_p
     nested = tmp_path / "packages/app"
     nested.mkdir(parents=True)
     write(tmp_path / ".autodev.yaml", 'schema_version: "1.0"\nproject:\n  name: demo\n')
-    write(tmp_path / ".opencode/runtime/new-session-result.json", '{"status":"success"}\n')
-
-    exit_code = autodev_project.main(["show-session", "--project-root", str(nested)])
-    captured = capsys.readouterr()
+    with patch("scripts.autodev_project.show_latest_session", return_value={"status": "success"}):
+        exit_code = autodev_project.main(["show-session", "--project-root", str(nested)])
+        captured = capsys.readouterr()
 
     assert exit_code == 0
-    assert captured.out == '{"status":"success"}\n'
+    assert captured.out == '{"status": "success"}\n'
 
 
 def test_doctor_resolves_consumer_project_root_from_nested_directory(tmp_path: Path, capsys: CaptureFixture[str]):

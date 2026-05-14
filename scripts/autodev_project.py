@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -16,6 +17,8 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.control_plane_db import ensure_control_plane_db
+from scripts.orchestrator_supervisor import show_latest_session
+from scripts.orchestrator_sessions import default_host_adapter
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -52,10 +55,24 @@ ARTIFACT_DIRS = [
     ".opencode/runtime",
 ]
 
+
+def _host_adapter():
+    return default_host_adapter()
+
+
+def _operator_entrypoints() -> dict[str, str]:
+    entrypoints = _host_adapter().operator_entrypoints()
+    return {str(key): str(value) for key, value in entrypoints.items()}
+
 def _command_templates() -> dict[str, str]:
     autodev_home = '${AUTODEV_HOME:-$HOME/apps/autodev}'
+    entrypoints = _operator_entrypoints()
+    start_filename = entrypoints.get("start", "autodev-start.md")
+    reconcile_filename = entrypoints.get("reconcile", "autodev-reconcile.md")
+    inspect_filename = entrypoints.get("inspect", "autodev-show-session.md")
+    doctor_filename = entrypoints.get("doctor", "autodev-doctor.md")
     return {
-        "autodev-start.md": f"""---
+        start_filename: f"""---
 description: Start autodev workflow for the current project and issue number
 agent: build
 subtask: false
@@ -72,7 +89,7 @@ Notes:
 - Override `AUTODEV_HOME` first if the shared workflow repo is not installed at `~/apps/autodev`.
 - Entrypoint: `scripts/autodev_project.py start`.
 """,
-        "autodev-reconcile.md": f"""---
+        reconcile_filename: f"""---
 description: Reconcile autodev runtime state for the current project
 agent: build
 subtask: false
@@ -85,7 +102,7 @@ Report the supervisor decision and whether it requires a subagent or fresh main 
 
 Set `AUTODEV_HOME` first if the shared workflow repo is not installed at `~/apps/autodev`.
 """,
-        "autodev-show-session.md": f"""---
+        inspect_filename: f"""---
 description: Show the latest autodev root session for the current project
 agent: build
 subtask: false
@@ -98,7 +115,7 @@ Report how to inspect or resume the latest root session.
 
 Set `AUTODEV_HOME` first if the shared workflow repo is not installed at `~/apps/autodev`.
 """,
-        "autodev-doctor.md": f"""---
+        doctor_filename: f"""---
 description: Check whether the current project is ready for autodev
 agent: build
 subtask: false
@@ -157,6 +174,13 @@ def _run_command(args: list[str], *, cwd: Path | None = None, check: bool = True
 
 def _repo_https_url(github_repo: str) -> str:
     return f"https://github.com/{github_repo}.git"
+
+
+def _validate_github_repo(github_repo: str) -> str:
+    normalized = github_repo.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", normalized):
+        raise ValueError(f"github_repo must be owner/repo, got {github_repo!r}")
+    return normalized
 
 
 def _is_git_repo(root: Path) -> bool:
@@ -325,6 +349,7 @@ def _replace_managed_block(original: str, block: str) -> str:
 
 
 def init_project(root: Path, *, github_repo: str, dry_run: bool, check: bool, force: bool) -> ActionReport:
+    github_repo = _validate_github_repo(github_repo)
     report = ActionReport(actions=[], findings=[])
     config_path = root / ".autodev.yaml"
     expected_config = _config_text(root, github_repo)
@@ -424,6 +449,13 @@ def doctor_project(root: Path) -> ActionReport:
     return report
 
 
+def _show_session_result(project_root: Path) -> tuple[int, str]:
+    payload = show_latest_session(base_dir=project_root)
+    if payload is None:
+        return 1, "no DB-backed autodev session found\n"
+    return 0, f"{json.dumps(payload, ensure_ascii=False)}\n"
+
+
 def _print_report(report: ActionReport, *, json_output: bool) -> None:
     if json_output:
         print(json.dumps({"status": "fail" if report.has_findings() else "pass", "actions": report.actions, "findings": report.findings}, ensure_ascii=False))
@@ -439,17 +471,11 @@ def _print_report(report: ActionReport, *, json_output: bool) -> None:
 def _bootstrap_args(project_root: Path, issue_number: str) -> list[str]:
     normalized = issue_number.strip().removeprefix("#").removeprefix("issue-")
     return [
+        "start-issue",
+        "--base-dir",
+        str(project_root),
         "--issue-number",
         normalized,
-        "--checkpoint",
-        str(project_root / "docs/agents/runtime/context-checkpoint.yaml"),
-        "--ledger",
-        str(project_root / ".opencode/runtime/orchestrator-ledger.json"),
-        "--new-session-request",
-        str(project_root / ".opencode/runtime/new-session-request.json"),
-        "--workflow-policy-path",
-        str(ROOT / "docs/agents/autonomous-development-workflow.yaml"),
-        "--dispatch-now",
         "--source-session-id",
         "autodev-start",
         "--approval-override-mode",
@@ -480,7 +506,7 @@ def build_parser() -> argparse.ArgumentParser:
     _ = init.add_argument("--force", action="store_true")
     _ = init.add_argument("--json", action="store_true")
 
-    install = subparsers.add_parser("install-commands", help="Install autodev-owned global OpenCode commands")
+    install = subparsers.add_parser("install-commands", help="Install autodev-owned global host commands")
     _ = install.add_argument("--commands-dir", default=str(DEFAULT_COMMANDS_DIR))
     _ = install.add_argument("--dry-run", action="store_true")
     _ = install.add_argument("--force", action="store_true")
@@ -528,9 +554,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if report.has_findings() else 0
     if command == "start":
         project_root = _consumer_project_root(cast(str, args.project_root))
-        _ensure_checkpoint_file(project_root)
         return subprocess.run(
-            ["python3", "-m", "scripts.orchestrator_bootstrap_runner", *_bootstrap_args(project_root, cast(str, args.issue_number))],
+            ["python3", "-m", "scripts.orchestrator_supervisor", *_bootstrap_args(project_root, cast(str, args.issue_number))],
             cwd=project_root,
             env=_shared_workflow_env(),
         ).returncode
@@ -541,28 +566,19 @@ def main(argv: list[str] | None = None) -> int:
                 "python3",
                 "-m",
                 "scripts.orchestrator_supervisor",
-                "reconcile",
-                "--ledger",
-                ".opencode/runtime/orchestrator-ledger.json",
-                "--request",
-                ".opencode/runtime/new-session-request.json",
-                "--session-result",
-                ".opencode/runtime/new-session-result.json",
-                "--write-request",
-                "--dispatch-now",
-                "--source-session-id",
-                "autodev-reconcile",
+                "reconcile-issue",
+                "--base-dir",
+                str(project_root),
+                "--issue-number",
+                "42",
             ],
             cwd=project_root,
             env=_shared_workflow_env(),
         ).returncode
     if command == "show-session":
-        result_path = _consumer_project_root(cast(str, args.project_root)) / ".opencode/runtime/new-session-result.json"
-        if not result_path.exists():
-            print(f"no autodev session result found: {result_path}")
-            return 1
-        print(_read_text(result_path), end="")
-        return 0
+        exit_code, output = _show_session_result(_consumer_project_root(cast(str, args.project_root)))
+        print(output, end="")
+        return exit_code
     return 2
 
 
