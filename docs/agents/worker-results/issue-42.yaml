@@ -1,0 +1,60 @@
+schema_version: "1.0"
+kind: worker_result
+line_cap: 80
+raw_evidence_policy: index_only_refs_no_raw_logs_or_transcripts
+
+issue:
+  number: "42"
+  title: "Issue 42 (demo)"
+  url: "https://github.com/example/issues/42"
+
+branch: "agent/issue-42-demo"
+status: "blocked"
+
+summary:
+  objective: "Publish the demo issue packet, worker result, and handoff artifacts for issue #42."
+  outcome: "Prepared the issue-scoped artifacts and verified focused checks, but PR metadata is not finalized yet."
+
+files_changed:
+  - path: "docs/agents/issue-packets/issue-42.yaml"
+    summary: "Canonical demo issue packet for issue #42."
+  - path: "docs/agents/worker-results/issue-42.yaml"
+    summary: "Worker artifact for the demo issue."
+  - path: "docs/agents/handoffs/issue-42.yaml"
+    summary: "Compact issue handoff for orchestrator follow-up."
+
+verification:
+  note: "Worker self-checks support implementation feedback only; final acceptance belongs to pr_verifier."
+  gates: {tdd_gate: "not_applicable", implementation_self_check_gate: "pass", git_gate: "fail"}
+  implementation_self_checks:
+    - command: "python3 -m pytest tests/scripts/test_orchestrator_bootstrap_runner.py -q"
+      result: "pass"
+      evidence_ref: "local:test_orchestrator_bootstrap_runner"
+      summary: "Focused bootstrap runner regression suite passed (6 tests)."
+    - command: "python3 scripts/agent_context_budget_check.py"
+      result: "fail"
+      evidence_ref: "local:agent_context_budget_check"
+      summary: "Pre-existing unrelated docs gate failure in docs/agents/issue-tracker.md; issue #42 artifacts not implicated."
+  final_acceptance_claim: false
+
+pr:
+  number: ""
+  url: ""
+  ready_for_review: false
+
+blockers:
+  - "Push and PR creation still pending. status: success is forbidden until pr.number and pr.url exist."
+
+next_recommended_step: "Stage only the issue #42 artifacts, push agent/issue-42-demo, create the PR, then finalize this worker result."
+
+evidence_packet_refs:
+  worker_artifact_bundle: ""
+  verifier_packet: ""
+  raw_evidence_policy: "stored_outside_main_agent_context"
+
+role_boundary:
+  actor_role: "issue_worker"
+  may_execute_implementation_self_checks: true
+  may_execute_final_acceptance_qa: false
+  may_emit_final_verification: false
+  verifier_packet_required_for_completion: true

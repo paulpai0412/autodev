@@ -1,0 +1,68 @@
+schema_version: "1.0"
+kind: issue_packet
+line_cap: 80
+raw_evidence_policy: index_only_refs_no_raw_logs_or_transcripts
+
+issue:
+  number: "42"
+  title: "Issue 42 (demo)"
+  url: "https://github.com/example/issues/42"
+  labels: ["ready-for-agent"]
+  parent: {type: "github-issue", reference: "https://github.com/example/issues/1"}
+
+branch: {name: "agent/issue-42-demo", base: "main"}
+objective: "Demo issue for orchestrator bootstrap validation. Validate that the nonstop supervisor loop correctly bootstraps a fresh main_orchestrator session, runs reconcile, and dispatches an issue_worker subagent."
+
+acceptance_criteria:
+  - {id: "AC1", text: "Supervisor reconcile persists bootstrap->issue_worker_execution transition in SQLite before first issue_worker launch.", evidence_hint: "Worker confirms reconcile ran and DB state is issue_worker_execution/running."}
+  - {id: "AC2", text: "issue_worker subagent executes and returns a structured worker result.", evidence_hint: "Worker result artifact written to docs/agents/worker-results/issue-42.yaml."}
+
+test_case:
+  applies: false
+  id: ""
+  source: {type: "none", ref: ""}
+  surface: "none"
+  scenario: ""
+  expected_outcome: ""
+  regression_bucket: []
+
+scope:
+  in: ["docs/agents/worker-results/issue-42.yaml", "docs/agents/handoffs/issue-42.yaml"]
+  out: ["Product code changes", "Database writes", "External API calls"]
+
+bootstrap_context:
+  required_reads:
+    - "AGENTS.md"
+    - "docs/agents/autonomous-development-workflow.yaml"
+    - "docs/agents/runtime/nonstop-supervisor-loop.md"
+  relevant_paths:
+    - ".opencode/runtime/orchestrator-ledger.json"
+    - ".opencode/runtime/control-plane.sqlite3"
+    - "docs/agents/runtime/context-checkpoint.yaml"
+  prior_handoff: "none"
+  context_budget: {checkpoint_warning_at_percent: 45, stop_and_rotate_at_percent: 50}
+
+implementation_notes:
+  constraints:
+    - "This is a demo issue. No product code changes required."
+    - "Worker must write a valid worker result artifact and return structured result."
+    - "Do not implement real issue scope — write the worker-result artifact only."
+  risks: ["None — demo issue only."]
+  dependencies: ["none"]
+
+verification_plan:
+  worker_self_checks:
+    - {command: "cat docs/agents/worker-results/issue-42.yaml", purpose: "Confirm artifact was written", success_criteria: "File exists with required fields."}
+  verifier_acceptance_checks:
+    required_gates: ["diagnostics_and_build_gate"]
+    automated_checks:
+      - {command: "cat docs/agents/worker-results/issue-42.yaml", success_criteria: "All required worker_result fields present."}
+  verifier_manual_qa: {owner: "pr_verifier", surface: "cli", happy_path: "Worker result artifact exists with status success.", refusal_or_error_path: "N/A"}
+
+handoff_contract:
+  repo_path: "docs/agents/handoffs/issue-42.yaml"
+  github_summary_required: false
+
+result_contract:
+  template_path: "docs/agents/worker-result-template.yaml"
+  required_fields: ["issue", "branch", "status", "summary", "files_changed", "verification", "pr", "blockers", "next_recommended_step", "evidence_packet_refs", "role_boundary"]

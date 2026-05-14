@@ -1,0 +1,17 @@
+schema_version: "1.0"
+kind: issue_handoff
+line_cap: 35
+raw_evidence_policy: index_only
+
+issue_identity: {number: "42", title: "Issue 42 (demo)", branch: "agent/issue-42-demo", url: "https://github.com/example/issues/42"}
+acceptance_criteria_evidence:
+  - {id: "AC1", status: "pending_pr", evidence_ref: "docs/agents/worker-results/issue-42.yaml"}
+  - {id: "AC2", status: "pass", evidence_ref: "docs/agents/worker-results/issue-42.yaml"}
+compact_verification_summary: "Focused bootstrap runner tests passed. Worker artifact is written. PR metadata is still pending, so the worker result remains blocked."
+evidence_packet_refs: []
+files_changed_summary:
+  - "docs/agents/issue-packets/issue-42.yaml"
+  - "docs/agents/worker-results/issue-42.yaml"
+  - "docs/agents/handoffs/issue-42.yaml"
+blockers_or_risks: "Success is blocked until the branch is pushed and the PR exists with finalized metadata."
+next_recommended_step: "Push the issue branch, create the PR, then update the worker result to status success and hand off to pr_verifier."
