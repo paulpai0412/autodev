@@ -18,6 +18,7 @@ from scripts.control_plane_db import (
     transition_issue_state,
     upsert_issue_state,
 )
+from scripts.orchestrator_sessions import default_host_adapter
 
 
 JsonObject = dict[str, object]
@@ -32,6 +33,13 @@ READY_FOR_AGENT_LABEL = "ready-for-agent"
 AGENT_DISPATCHING_LABEL = "agent-dispatching"
 AGENT_IN_PROGRESS_LABEL = "agent-in-progress"
 QUARANTINED_LABEL = "quarantined"
+
+
+def _resume_hint_for_session(session_id: str) -> str:
+    normalized = session_id.strip()
+    if not normalized:
+        return ""
+    return f" Resume with: {default_host_adapter().resume_link(normalized)}."
 
 
 def _issue_backing_type(base_dir: Path, issue_number: str) -> str:
@@ -53,8 +61,7 @@ def transition_issue_state_if_possible(
     updated_at: str,
     reason: str,
     from_state: str | None = None,
-    current_root_session_id: str | None = None,
-    current_verifier_session_id: str | None = None,
+    current_session_id: str | None = None,
 ) -> None:
     transition_issue_state(
         base_dir,
@@ -65,8 +72,7 @@ def transition_issue_state_if_possible(
         reason=reason,
         updated_at=updated_at,
         from_state=from_state,
-        current_root_session_id=current_root_session_id,
-        current_verifier_session_id=current_verifier_session_id,
+        current_session_id=current_session_id,
     )
 
 
@@ -138,8 +144,7 @@ def clear_issue_session_ids(*, base_dir: Path, issue_number: str, updated_at: st
         state=str((read_issue(base_dir, issue_number) or {}).get("state") or "ready"),
         command_id=f"clear-session-ids:{issue_number}:{updated_at}",
         updated_at=updated_at,
-        current_root_session_id="",
-        current_verifier_session_id="",
+        current_session_id="",
     )
 
 
@@ -253,10 +258,8 @@ def claim_issue_execution(
         existing = read_issue_lock(lock_path)
         holder = str(existing.get("rootSessionID") or existing.get("sourceSessionID") or "unknown-session")
         created_at = str(existing.get("createdAt") or existing.get("recordedAt") or "unknown-time")
-        resume_hint = ""
         root_session_id = str(existing.get("rootSessionID") or "")
-        if root_session_id:
-            resume_hint = f" Resume with: opencode --session {root_session_id}."
+        resume_hint = _resume_hint_for_session(root_session_id)
         raise RuntimeError(
             f"issue #{issue_number} is already in progress via {holder} since {created_at}; refusing duplicate start.{resume_hint}"
         )
@@ -276,7 +279,7 @@ def claim_issue_execution(
             or existing_issue.get("updated_at")
             or "unknown-time"
         )
-        resume_hint = f" Resume with: opencode --session {holder}." if holder else ""
+        resume_hint = _resume_hint_for_session(holder)
         raise RuntimeError(
             f"issue #{issue_number} is already in progress via {holder} since {created_at}; refusing duplicate start.{resume_hint}"
         )
@@ -410,13 +413,12 @@ def release_issue_execution(
                 base_dir=base_dir,
                 issue_number=issue_number,
                 to_state="failed",
-                command_id=f"{command_id}:failed",
-                updated_at=timestamp,
-                reason=f"Release issue #{issue_number} into failed terminal state.",
-                from_state="quarantined",
-                current_root_session_id="",
-                current_verifier_session_id="",
-            )
+            command_id=f"{command_id}:failed",
+            updated_at=timestamp,
+            reason=f"Release issue #{issue_number} into failed terminal state.",
+            from_state="quarantined",
+            current_session_id="",
+        )
         else:
             clear_issue_session_ids(base_dir=base_dir, issue_number=issue_number, updated_at=timestamp)
         return
@@ -428,8 +430,7 @@ def release_issue_execution(
             state="failed",
             command_id=command_id,
             updated_at=timestamp,
-            current_root_session_id="",
-            current_verifier_session_id="",
+            current_session_id="",
         )
         record_admin_decision(
             base_dir,
@@ -452,8 +453,7 @@ def release_issue_execution(
             updated_at=timestamp,
             reason=f"Release issue #{issue_number} into completed terminal state.",
             from_state="verifying",
-            current_root_session_id="",
-            current_verifier_session_id="",
+            current_session_id="",
         )
         return
 
@@ -464,8 +464,7 @@ def release_issue_execution(
             state="completed",
             command_id=command_id,
             updated_at=timestamp,
-            current_root_session_id="",
-            current_verifier_session_id="",
+            current_session_id="",
         )
         record_admin_decision(
             base_dir,
@@ -571,8 +570,7 @@ def redispatch_quarantined_issue_execution(
         updated_at=timestamp,
         reason=reason,
         from_state="quarantined",
-        current_root_session_id="",
-        current_verifier_session_id="",
+        current_session_id="",
     )
     lock_payload: JsonObject = {
         "issueNumber": issue_number,
@@ -611,8 +609,7 @@ def redispatch_quarantined_issue_execution(
             state="quarantined",
             command_id=f"{command_id}:rollback",
             updated_at=timestamp,
-            current_root_session_id="",
-            current_verifier_session_id="",
+            current_session_id="",
         )
         raise RuntimeError(f"failed to sync GitHub redispatch labels for issue #{issue_number}: {sync_error}")
 

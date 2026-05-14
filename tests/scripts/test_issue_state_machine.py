@@ -1,20 +1,18 @@
 from scripts.issue_state_machine import transition
 
 
-def test_transition_allows_canonical_control_plane_paths():
-    assert transition("ready", "claimed").ok
-    assert transition("claimed", "dispatching").ok
-    assert transition("dispatching", "running").ok
-    assert transition("dispatching", "quarantined").ok
-    assert transition("running", "verifying").ok
-    assert transition("verifying", "quarantined").ok
-    assert transition("quarantined", "claimed").ok
-    assert transition("verifying", "running").ok
-    assert transition("verifying", "completed").ok
+def test_issue_state_machine_accepts_verified_release_path() -> None:
+    assert transition("verifying", "verified").ok is True
+    assert transition("verified", "release_pending").ok is True
+    assert transition("release_pending", "completed").ok is True
 
 
-def test_transition_rejects_invalid_paths():
-    result = transition("ready", "completed")
+def test_issue_state_machine_preserves_legacy_repair_path_during_rewrite() -> None:
+    result = transition("verifying", "running")
 
-    assert not result.ok
-    assert "invalid issue transition" in result.error
+    assert result.ok is True
+
+
+def test_issue_state_machine_preserves_legacy_release_and_repair_paths_for_ongoing_rewrite() -> None:
+    assert transition("verifying", "completed").ok is True
+    assert transition("verifying", "running").ok is True

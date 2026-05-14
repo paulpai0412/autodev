@@ -16,7 +16,7 @@ WriteJson = Callable[[Path, JsonObject], None]
 
 
 def _shared_runtime_root(ledger: JsonObject, *, fallback_workflow_policy_path: str) -> str:
-    workflow = cast(dict[str, str], ledger.get("workflow", {}))
+    workflow = cast(dict[str, object], ledger.get("workflow", {}))
     policy_path = Path(str(workflow.get("workflowPolicyPath") or fallback_workflow_policy_path))
     if policy_path.is_absolute():
         try:
@@ -26,13 +26,17 @@ def _shared_runtime_root(ledger: JsonObject, *, fallback_workflow_policy_path: s
     return ""
 
 
+def _runtime_controls(ledger: JsonObject) -> dict[str, object]:
+    workflow = cast(dict[str, object], ledger.get("workflow", {}))
+    runtime_controls = workflow.get("runtimeControls", {})
+    return runtime_controls if isinstance(runtime_controls, dict) else {}
+
+
 def build_common_prompt_lines(ledger: JsonObject, *, default_supervisor_doc_path: str) -> list[str]:
     issue = cast(dict[str, str], ledger["issue"])
-    workflow = cast(dict[str, str], ledger["workflow"])
+    workflow = cast(dict[str, object], ledger["workflow"])
     return [
-        "Bootstrap from checkpoint and runtime artifacts only.",
-        f"Read {workflow['checkpointPath']} first.",
-        "Read .opencode/runtime/orchestrator-ledger.json second.",
+        "Bootstrap from the SQLite-backed control plane, not from runtime JSON/YAML artifacts.",
         f"Read {workflow['workflowPolicyPath']} for role boundaries and gates.",
         f"Read {default_supervisor_doc_path} for the nonstop supervisor contract.",
         f"Active issue: #{issue['number']} on branch {issue['branch']}.",
@@ -50,10 +54,14 @@ def build_prompt(
     default_release_result_template_path: str,
 ) -> str:
     issue = cast(dict[str, str], ledger["issue"])
-    workflow = cast(dict[str, str], ledger["workflow"])
+    workflow = cast(dict[str, object], ledger["workflow"])
     issue_backing_type = str(issue.get("backingType") or "github")
     artifacts = cast(dict[str, str], ledger["artifacts"])
     automation = cast(dict[str, object], ledger.get("automation", {}))
+    runtime_controls = _runtime_controls(ledger)
+    approval_override_mode = str(runtime_controls.get("approval_override_mode") or "")
+    override_source = str(runtime_controls.get("override_source") or "none")
+    human_approval_skipped = bool(runtime_controls.get("human_approval_skipped") or False)
     primary_workspace_root = str(automation.get("primaryWorkspaceRoot") or "")
     shared_runtime_root = _shared_runtime_root(ledger, fallback_workflow_policy_path=default_supervisor_doc_path)
     queued_next_issue = cast(dict[str, object], ledger.get("queuedNextIssue", {}))
@@ -91,7 +99,7 @@ def build_prompt(
             ),
             "Do not implement issue scope directly.",
             "You own orchestration for the whole selected issue inside this root session.",
-            "Before launching the first child subagent, run the supervisor reconcile command once in this same turn so the bootstrap -> issue_worker_execution transition is persisted to the on-disk ledger.",
+            "Before launching the first child subagent, run the supervisor reconcile path once in this same turn so the bootstrap -> issue_worker_execution transition is persisted to the DB-backed control plane.",
             'Run issue_worker, pr_verifier, and release_worker as subagents from this root orchestrator session with task(subagent_type="general", ..., run_in_background=false). Wait for each child task call to finish in the foreground before continuing.',
             "Choose child load_skills normally for the task at hand.",
             (
@@ -104,10 +112,7 @@ def build_prompt(
                 if default_supervisor_doc_path
                 else ""
             ),
-            "Run this reconcile command before the first issue_worker launch:",
-            f"{shared_runtime_command('scripts/orchestrator_supervisor.py')} reconcile --ledger .opencode/runtime/orchestrator-ledger.json",
-            "After each child artifact is written, advance the queued child role with:",
-            f"{shared_runtime_command('scripts/orchestrator_supervisor.py')} advance-child --ledger .opencode/runtime/orchestrator-ledger.json",
+            "Use the DB-backed supervisor reconcile flow before the first issue_worker launch and again after each child artifact is written.",
             "Use the first supervisor decision to confirm the issue_worker dispatch before you create or switch the issue branch and launch that first child subagent.",
             "Use the supervisor decision to choose the next subagent role. Only main_orchestrator recovery or next-issue handoff may create another root session.",
         ]
@@ -147,9 +152,14 @@ def build_prompt(
                 if issue_backing_type == "local_seeded"
                 else "This issue is GitHub-backed. Apply the normal GitHub issue close/update workflow after merge when appropriate."
             ),
-            "Read the runtime_controls block in the checkpoint and treat it as the workflow-start source of truth for merge approval override.",
+            "Read the workflow-start runtime controls from the DB-backed control-plane context and treat them as the source of truth for merge approval override.",
             'If `approval_override_mode` is `"bypass_approval"`, skip only the human approval requirement while still enforcing verifier pass, required checks, PR mergeability, review gate, diagnostics/build gate, surface QA gate, and workspace hygiene.',
             'When bypassing approval, record `merge_approval_mode`, `human_approval_skipped`, `override_source`, and `override_scope` in the release result summary or metadata fields.',
+            (
+                f"Current workflow-start override: approval_override_mode={approval_override_mode or 'none'}, override_source={override_source}, human_approval_skipped={'true' if human_approval_skipped else 'false'}."
+                if approval_override_mode or human_approval_skipped or override_source != 'none'
+                else "Current workflow-start override: approval_override_mode=none, override_source=none, human_approval_skipped=false."
+            ),
             f"Write {release_result_path} using {default_release_result_template_path}.",
             "If release is blocked or fails, include failure_classification with kind, retryable, routed_to, and root_cause_signature.",
             "Respect required checks, mergeability, approval policy, and workspace hygiene.",
@@ -170,17 +180,17 @@ def build_prompt(
                         f"{queued_next_issue_branch or 'unknown'} via {canonical_artifact_path(queued_next_issue_packet)}."
                     ),
                     "Do not recompute selection from the live queue or rerun intake unless this exact selected issue is now invalid.",
-                    "Bootstrap exactly this selected issue with:",
-                    f"{shared_runtime_command('scripts/orchestrator_bootstrap_runner.py')} --issue-packet {canonical_artifact_path(queued_next_issue_packet)} --dispatch-now",
+                    "Bootstrap exactly this selected issue through the DB-backed supervisor start path.",
+                    f"{shared_runtime_command('scripts/orchestrator_supervisor.py')} start-issue --issue-number {queued_next_issue_number}",
                     "If that exact issue is now invalid, report the contract violation compactly instead of silently picking a different issue.",
                 ]
             )
         else:
             lines.extend(
                 [
-                    "If another issue is ready, run orchestrator bootstrap for it directly with:",
-                    f"{shared_runtime_command('scripts/orchestrator_bootstrap_runner.py')} --issue-packet <path-to-selected-issue-packet> --dispatch-now",
-                    "That command will refresh the checkpoint, supervisor ledger, and create the next main_orchestrator root session.",
+                    "If another issue is ready, start it through the DB-backed supervisor start path.",
+                    f"{shared_runtime_command('scripts/orchestrator_supervisor.py')} start-issue --issue-number <selected-issue-number>",
+                    "That path should create the next main_orchestrator root session from SQLite state without treating checkpoint or runtime JSON files as control-plane truth.",
                     "If no issue is ready, stop cleanly and report the blocking reason in compact form.",
                 ]
             )
@@ -243,7 +253,7 @@ def build_orchestrator_request(ledger: JsonObject, *, build_session_request: Bui
         reason=f"orchestrator bootstrap continuation for issue #{issue['number']}",
         title=f"Continue issue #{issue['number']} on {issue['branch']}",
         decision_summary=(
-            "Fresh orchestrator session must validate the selected issue target and run the initial supervisor reconcile so the on-disk ledger advances to issue_worker_execution before launching the first issue_worker subagent "
+            "Fresh orchestrator session must validate the selected issue target and run the initial supervisor reconcile so the DB-backed control plane advances to issue_worker_execution before launching the first issue_worker subagent "
             f"without waiting for a human reply. Immediate next action: {immediate_next_action}"
         ),
     )

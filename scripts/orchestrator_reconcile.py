@@ -694,7 +694,7 @@ def reconcile_release_worker(
         )
         set_failure_func(ledger, kind="contract_invalid", summary=summary, retryable=True)
         return queue_orchestrator_recovery_func(ledger, base_dir=base_dir, updated_at=updated_at, summary=summary)
-    verifier_session_id = str(issue_state.get("current_verifier_session_id") or "") if issue_state else ""
+    verifier_session_id = str(issue_state.get("current_session_id") or "") if issue_state else ""
     status = cast(str, persisted_release.get("status") or release["status"])
     if status == "success":
         if issue_state and issue_state.get("state") == "running":
@@ -706,7 +706,7 @@ def reconcile_release_worker(
                 updated_at=updated_at,
                 reason=f"Issue #{issue['number']} still occupies capacity until verifier-backed completion is recorded.",
                 from_state="running",
-                current_verifier_session_id=verifier_session_id or None,
+                current_session_id=verifier_session_id or None,
             )
         if read_issue(base_dir, issue["number"]):
             transition_issue_state_if_possible(
@@ -717,7 +717,7 @@ def reconcile_release_worker(
                 updated_at=updated_at,
                 reason=f"Release worker completed issue #{issue['number']} after verifier-owned evidence passed.",
                 from_state="verifying",
-                current_verifier_session_id=verifier_session_id or None,
+                current_session_id=verifier_session_id or None,
             )
         summary = (
             f"Release worker completed issue #{issue['number']}. Hand off to main_orchestrator to select the next ready issue and keep the workflow moving."
@@ -753,7 +753,7 @@ def reconcile_release_worker(
             command_id=uuid4().hex,
             updated_at=updated_at,
             reason=f"Retry release_worker for issue #{issue['number']} after transient release blocker {blocked_reason}.",
-            current_verifier_session_id=verifier_session_id or None,
+            current_session_id=verifier_session_id or None,
         )
         queue_transition_func(
             ledger,

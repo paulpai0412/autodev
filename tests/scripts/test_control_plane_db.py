@@ -18,14 +18,17 @@ from scripts.control_plane_db import (
     read_github_sync_attempt_by_command_id,
     read_issue,
     read_issue_packet,
+    read_latest_ref,
     read_latest_decision,
     read_latest_github_sync_attempt,
     read_latest_issue_history,
+    read_runtime_context,
     ready_issues_for_selection,
     record_admin_decision,
     record_github_sync_attempt,
     sync_issue_runtime_context,
     transition_issue_state,
+    upsert_issue_state,
     upsert_issue_ranking,
 )
 
@@ -53,11 +56,14 @@ def test_describe_control_plane_schema_exposes_real_issue_columns(tmp_path: Path
     history_columns = [column["name"] for column in schema["tables"]["issue_history"]["columns"]]
 
     assert schema["dbPath"] == str(control_plane_db_path(tmp_path))
-    assert "artifact_refs_json" in issue_columns
-    assert "artifact_status_json" in issue_columns
+    assert "current_session_id" in issue_columns
+    assert "runtime_context_json" in issue_columns
+    assert "latest_refs_json" in issue_columns
     assert "issue_packet_json" in issue_columns
     assert "history_id" in history_columns
     assert "payload_json" in history_columns
+    assert "body_text" in history_columns
+    assert "content_hash" in history_columns
 
 
 def test_transition_issue_state_records_issue_and_history(tmp_path: Path):
@@ -81,6 +87,7 @@ def test_transition_issue_state_records_issue_and_history(tmp_path: Path):
     assert issue is not None
     assert issue["state"] == "claimed"
     assert issue["claimed_at"] == "2026-05-11T10:00:00+08:00"
+    assert issue["current_session_id"] == ""
     assert decision is not None
     assert decision["from_state"] == "ready"
     assert decision["to_state"] == "claimed"
@@ -129,6 +136,8 @@ def test_append_issue_event_is_deduplicated_by_event_id_and_session_seq(tmp_path
         connection.close()
 
     assert count == 1
+    latest_ref = read_latest_ref(tmp_path, "42", "root_event")
+    assert latest_ref["session_id"] == "ses-root"
 
 
 def test_record_github_sync_attempt_tracks_status(tmp_path: Path):
@@ -146,10 +155,13 @@ def test_record_github_sync_attempt_tracks_status(tmp_path: Path):
     )
 
     attempt = read_github_sync_attempt(tmp_path, "cmd-gh")
+    latest_ref = read_latest_ref(tmp_path, "42", "github_sync")
 
     assert attempt is not None
     assert attempt["status"] == "failed"
     assert attempt["last_error"] == "boom"
+    assert latest_ref["command_id"] == "cmd-gh"
+    assert latest_ref["status"] == "failed"
 
 
 def test_issues_in_states_returns_only_matching_runtime_rows(tmp_path: Path):
@@ -247,10 +259,6 @@ def test_read_latest_rows_return_newest_issue_decision_and_sync(tmp_path: Path):
 
 def test_upsert_issue_ranking_and_ready_selection_sort_by_rank_score(tmp_path: Path):
     ensure_control_plane_db(tmp_path)
-    issue_packets_dir = tmp_path / "docs/agents/issue-packets"
-    issue_packets_dir.mkdir(parents=True, exist_ok=True)
-    (issue_packets_dir / "issue-41.yaml").write_text("issue 41", encoding="utf-8")
-    (issue_packets_dir / "issue-42.yaml").write_text("issue 42", encoding="utf-8")
     _ = ingest_issue_packet(
         tmp_path,
         issue_number="41",
@@ -258,7 +266,6 @@ def test_upsert_issue_ranking_and_ready_selection_sort_by_rank_score(tmp_path: P
             "issue_number": "41",
             "title": "Issue 41",
             "branch": "agent/issue-41-demo",
-            "issue_packet_path": "docs/agents/issue-packets/issue-41.yaml",
             "labels": ["ready-for-agent"],
             "parent_reference": "none",
             "dependencies": [],
@@ -272,7 +279,6 @@ def test_upsert_issue_ranking_and_ready_selection_sort_by_rank_score(tmp_path: P
             "issue_number": "42",
             "title": "Issue 42",
             "branch": "agent/issue-42-demo",
-            "issue_packet_path": "docs/agents/issue-packets/issue-42.yaml",
             "labels": ["ready-for-agent"],
             "parent_reference": "none",
             "dependencies": [],
@@ -299,11 +305,8 @@ def test_upsert_issue_ranking_and_ready_selection_sort_by_rank_score(tmp_path: P
     assert [row["issue_number"] for row in rows] == ["42", "41"]
 
 
-def test_ready_issues_for_selection_requires_materialized_local_issue_packet(tmp_path: Path):
+def test_ready_issues_for_selection_requires_canonical_packet_fields(tmp_path: Path):
     ensure_control_plane_db(tmp_path)
-    issue_packets_dir = tmp_path / "docs/agents/issue-packets"
-    issue_packets_dir.mkdir(parents=True, exist_ok=True)
-    (issue_packets_dir / "issue-42.yaml").write_text("issue 42", encoding="utf-8")
     _ = ingest_issue_packet(
         tmp_path,
         issue_number="41",
@@ -311,7 +314,6 @@ def test_ready_issues_for_selection_requires_materialized_local_issue_packet(tmp
             "issue_number": "41",
             "title": "Issue 41",
             "branch": "agent/issue-41-demo",
-            "issue_packet_path": "docs/agents/issue-packets/issue-41.yaml",
             "labels": ["ready-for-agent"],
             "parent_reference": "none",
             "dependencies": [],
@@ -323,9 +325,8 @@ def test_ready_issues_for_selection_requires_materialized_local_issue_packet(tmp
         issue_number="42",
         issue_packet={
             "issue_number": "42",
-            "title": "Issue 42",
+            "title": "",
             "branch": "agent/issue-42-demo",
-            "issue_packet_path": "docs/agents/issue-packets/issue-42.yaml",
             "labels": ["ready-for-agent"],
             "parent_reference": "none",
             "dependencies": [],
@@ -349,7 +350,7 @@ def test_ready_issues_for_selection_requires_materialized_local_issue_packet(tmp
 
     rows = ready_issues_for_selection(tmp_path)
 
-    assert [row["issue_number"] for row in rows] == ["42"]
+    assert [row["issue_number"] for row in rows] == ["41"]
 
 
 def test_record_admin_decision_persists_latest_decision(tmp_path: Path):
@@ -365,10 +366,12 @@ def test_record_admin_decision_persists_latest_decision(tmp_path: Path):
     )
 
     decision = read_latest_decision(tmp_path, "42")
+    latest_ref = read_latest_ref(tmp_path, "42", "admin_action")
 
     assert decision is not None
     assert decision["command_id"] == "cmd-gh:retry"
     assert decision["decision_type"] == "admin_github_sync_retry"
+    assert latest_ref["command_id"] == "cmd-gh:retry"
 
 
 def test_ingest_issue_packet_and_runtime_context_store_on_issue_row(tmp_path: Path):
@@ -381,7 +384,6 @@ def test_ingest_issue_packet_and_runtime_context_store_on_issue_row(tmp_path: Pa
             "issue_number": "42",
             "title": "Demo issue",
             "branch": "agent/issue-42-demo",
-            "issue_packet_path": "docs/agents/issue-packets/issue-42.yaml",
             "labels": ["ready-for-agent"],
             "parent_reference": "https://github.com/example/issues/1",
             "dependencies": [],
@@ -397,18 +399,136 @@ def test_ingest_issue_packet_and_runtime_context_store_on_issue_row(tmp_path: Pa
         current_status="queued",
         attempts={"issue_worker": 1},
         limits={"issue_worker": 3},
+        runtime_context={"dispatch_request": {"request_id": "req-42"}},
         artifact_refs={"workerResultPath": "docs/agents/worker-results/issue-42.yaml"},
     )
 
     packet = read_issue_packet(tmp_path, "42")
     rows = issue_rows_with_packets(tmp_path)
     issue = read_issue(tmp_path, "42")
+    runtime_context = read_runtime_context(tmp_path, "42")
+    latest_ref = read_latest_ref(tmp_path, "42", "issue_packet")
 
     assert packet["branch"] == "agent/issue-42-demo"
     assert [row["issue_number"] for row in rows] == ["42"]
     assert issue is not None
+    assert issue["title"] == "Demo issue"
+    assert issue["branch"] == "agent/issue-42-demo"
     assert issue["current_role"] == "issue_worker"
     assert issue["current_stage"] == "issue_worker_execution"
+    assert runtime_context["dispatch_request"]["request_id"] == "req-42"
+    assert runtime_context["artifact_refs"]["workerResultPath"] == "docs/agents/worker-results/issue-42.yaml"
+    assert latest_ref["status"] == "ingested"
+
+
+def test_ingest_issue_packet_records_history_before_snapshot_ref(tmp_path: Path):
+    ensure_control_plane_db(tmp_path)
+
+    issue = ingest_issue_packet(
+        tmp_path,
+        issue_number="42",
+        issue_packet={
+            "issue_number": "42",
+            "title": "Demo issue",
+            "branch": "agent/issue-42-demo",
+            "raw_text": "issue: 42\ntitle: Demo issue\n",
+        },
+        updated_at="2026-05-11T10:00:00+08:00",
+    )
+    latest_history = read_latest_issue_history(tmp_path, "42", entry_type="issue_packet")
+    latest_ref = read_latest_ref(tmp_path, "42", "issue_packet")
+
+    assert latest_history is not None
+    assert issue["last_history_id"] == latest_history["history_id"]
+    assert latest_ref["history_id"] == latest_history["history_id"]
+    assert latest_history["body_text"] == "issue: 42\ntitle: Demo issue\n"
+
+
+def test_upsert_issue_state_uses_single_current_session_id_with_compat_aliases(tmp_path: Path):
+    ensure_control_plane_db(tmp_path)
+
+    _ = transition_issue_state(
+        tmp_path,
+        issue_number="42",
+        to_state="claimed",
+        command_id="cmd-claim",
+        scheduler_id="scheduler:test",
+        reason="claim issue",
+        updated_at="2026-05-11T09:59:00+08:00",
+        from_state="ready",
+    )
+    _ = transition_issue_state(
+        tmp_path,
+        issue_number="42",
+        to_state="dispatching",
+        command_id="cmd-dispatch",
+        scheduler_id="scheduler:test",
+        reason="queue root session",
+        updated_at="2026-05-11T09:59:30+08:00",
+        from_state="claimed",
+    )
+    issue = transition_issue_state(
+        tmp_path,
+        issue_number="42",
+        to_state="running",
+        command_id="cmd-running",
+        scheduler_id="scheduler:test",
+        reason="start root session",
+        updated_at="2026-05-11T10:00:00+08:00",
+        from_state="dispatching",
+        current_root_session_id="ses-root-42",
+    )
+
+    assert issue["current_session_id"] == "ses-root-42"
+    assert issue["current_root_session_id"] == "ses-root-42"
+    assert issue["current_verifier_session_id"] == "ses-root-42"
+
+    _ = transition_issue_state(
+        tmp_path,
+        issue_number="42",
+        to_state="verifying",
+        command_id="cmd-verifying",
+        scheduler_id="scheduler:test",
+        reason="begin verifier stage",
+        updated_at="2026-05-11T10:03:00+08:00",
+        from_state="running",
+    )
+    verified = upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="verified",
+        command_id="cmd-verified",
+        updated_at="2026-05-11T10:05:00+08:00",
+        current_verifier_session_id="ses-verifier-42",
+    )
+
+    assert verified["current_session_id"] == "ses-verifier-42"
+    assert verified["current_root_session_id"] == "ses-verifier-42"
+    assert verified["current_verifier_session_id"] == "ses-verifier-42"
+    assert verified["verified_at"] == "2026-05-11T10:05:00+08:00"
+
+
+def test_append_issue_history_stores_body_text_and_content_hash(tmp_path: Path):
+    ensure_control_plane_db(tmp_path)
+
+    history_id = append_issue_history(
+        tmp_path,
+        issue_number="42",
+        entry_type="dispatch_result",
+        created_at="2026-05-11T10:00:00+08:00",
+        status="success",
+        summary="dispatch finished",
+        payload={"rootSessionID": "ses-root-42"},
+        body_text="rootSessionID: ses-root-42",
+        content_hash="sha256:demo",
+        unique_key="dispatch-result:42:1",
+    )
+    latest = read_latest_issue_history(tmp_path, "42", entry_type="dispatch_result")
+
+    assert history_id > 0
+    assert latest is not None
+    assert latest["body_text"] == "rootSessionID: ses-root-42"
+    assert latest["content_hash"] == "sha256:demo"
 
 
 def test_completed_issue_numbers_reads_completed_state_from_db(tmp_path: Path):
@@ -456,12 +576,22 @@ def test_completed_issue_numbers_reads_completed_state_from_db(tmp_path: Path):
     transition_issue_state(
         tmp_path,
         issue_number="42",
+        to_state="verified",
+        command_id="cmd-verified",
+        scheduler_id="scheduler:test",
+        reason="verifier accepted issue",
+        updated_at="2026-05-11T10:04:00+08:00",
+        from_state="verifying",
+    )
+    transition_issue_state(
+        tmp_path,
+        issue_number="42",
         to_state="completed",
         command_id="cmd-completed",
         scheduler_id="scheduler:test",
-        reason="complete issue",
-        updated_at="2026-05-11T10:04:00+08:00",
-        from_state="verifying",
+        reason="complete verified issue",
+        updated_at="2026-05-11T10:05:00+08:00",
+        from_state="verified",
     )
 
     assert completed_issue_numbers(tmp_path) == {"42"}
@@ -487,3 +617,25 @@ def test_append_issue_history_supports_generic_history_entries(tmp_path: Path):
     assert history_id > 0
     assert latest is not None
     assert latest["status"] == "success"
+
+
+def test_transition_issue_state_records_latest_ref_after_history_append(tmp_path: Path):
+    ensure_control_plane_db(tmp_path)
+
+    issue = transition_issue_state(
+        tmp_path,
+        issue_number="42",
+        to_state="claimed",
+        command_id="cmd-claim",
+        scheduler_id="scheduler:test",
+        reason="claim issue",
+        updated_at="2026-05-11T10:00:00+08:00",
+        from_state="ready",
+    )
+    latest_history = read_latest_issue_history(tmp_path, "42", entry_type="state_transition")
+    latest_ref = read_latest_ref(tmp_path, "42", "state_transition")
+
+    assert latest_history is not None
+    assert issue["last_history_id"] == latest_history["history_id"]
+    assert latest_ref["history_id"] == latest_history["history_id"]
+    assert latest_ref["command_id"] == "cmd-claim"

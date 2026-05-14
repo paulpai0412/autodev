@@ -30,9 +30,8 @@ def test_build_prompt_for_main_orchestrator_requires_foreground_child_subagents(
     )
 
     assert 'task(subagent_type="general", ..., run_in_background=false)' in prompt
-    assert "Before launching the first child subagent, run the supervisor reconcile command once" in prompt
-    assert "After each child artifact is written, advance the queued child role with:" in prompt
-    assert "advance-child --ledger .opencode/runtime/orchestrator-ledger.json" in prompt
+    assert "DB-backed control plane" in prompt
+    assert "Use the DB-backed supervisor reconcile flow before the first issue_worker launch" in prompt
     assert "Use the first supervisor decision to confirm the issue_worker dispatch" in prompt
     assert "Wait for each child task call to finish in the foreground before continuing." in prompt
     assert "Do not include karpathy-guidelines in load_skills for child subagents" not in prompt
@@ -64,8 +63,8 @@ def test_build_prompt_for_main_orchestrator_uses_authoritative_shared_runtime_pa
 
     assert "The authoritative shared workflow policy is /shared/autodev/docs/agents/autonomous-development-workflow.yaml." in prompt
     assert "The authoritative nonstop supervisor doc is /shared/autodev/docs/agents/runtime/nonstop-supervisor-loop.md." in prompt
-    assert 'PYTHONPATH="/shared/autodev" python3 "/shared/autodev/scripts/orchestrator_supervisor.py" reconcile --ledger .opencode/runtime/orchestrator-ledger.json' in prompt
-    assert 'PYTHONPATH="/shared/autodev" python3 "/shared/autodev/scripts/orchestrator_supervisor.py" advance-child --ledger .opencode/runtime/orchestrator-ledger.json' in prompt
+    assert "Bootstrap from the SQLite-backed control plane" in prompt
+    assert "Use the DB-backed supervisor reconcile flow before the first issue_worker launch" in prompt
 
 
 def test_build_prompt_uses_primary_workspace_absolute_artifact_paths() -> None:
@@ -119,6 +118,11 @@ def test_build_prompt_for_release_worker_mentions_workflow_start_approval_overri
         "workflow": {
             "checkpointPath": "docs/agents/runtime/context-checkpoint.yaml",
             "workflowPolicyPath": "docs/agents/autonomous-development-workflow.yaml",
+            "runtimeControls": {
+                "approval_override_mode": "bypass_approval",
+                "override_source": "user_requested_autodev_start",
+                "human_approval_skipped": True,
+            },
         },
         "artifacts": {
             "evidencePacketPath": "docs/agents/evidence/issue-7-pr-11.yaml",
@@ -135,7 +139,7 @@ def test_build_prompt_for_release_worker_mentions_workflow_start_approval_overri
         default_release_result_template_path="docs/agents/release-result-template.yaml",
     )
 
-    assert "Read the runtime_controls block in the checkpoint" in prompt
+    assert "Read the workflow-start runtime controls from the DB-backed control-plane context" in prompt
     assert "approval_override_mode" in prompt
     assert "bypass_approval" in prompt
     assert "human approval requirement" in prompt
