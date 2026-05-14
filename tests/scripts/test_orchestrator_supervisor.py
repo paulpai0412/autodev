@@ -1739,6 +1739,90 @@ def test_release_issue_execution_rejects_invalid_transition(tmp_path: Path):
         raise AssertionError("expected release_issue_execution to reject invalid running -> ready transition")
 
 
+def test_release_issue_execution_clears_session_ids_on_completed_terminal_state(tmp_path: Path):
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="verifying",
+        command_id="cmd-verifying",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_root_session_id="ses-root-42",
+        current_verifier_session_id="ses-v-42",
+    )
+    orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:00:00+08:00",
+        artifact_refs={
+            "issueNumber": "42",
+            "rootSessionID": "ses-root-42",
+            "verifierSessionID": "ses-v-42",
+            "status": "verifying",
+        },
+    )
+
+    orchestrator_supervisor.release_issue_execution(
+        base_dir=tmp_path,
+        issue_number="42",
+        restore_ready_for_agent=False,
+        final_state="completed",
+        updated_at="2026-05-07T17:01:00+08:00",
+    )
+
+    issue = read_issue(tmp_path, "42")
+
+    assert issue is not None
+    assert issue["state"] == "completed"
+    assert issue["current_root_session_id"] == ""
+    assert issue["current_verifier_session_id"] == ""
+    artifact_refs = json.loads(str(issue["artifact_refs_json"]))
+    assert "rootSessionID" not in artifact_refs
+    assert "verifierSessionID" not in artifact_refs
+    assert "status" not in artifact_refs
+
+
+def test_release_issue_execution_clears_session_ids_on_failed_terminal_state(tmp_path: Path):
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="running",
+        command_id="cmd-running",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_root_session_id="ses-root-42",
+        current_verifier_session_id="ses-v-42",
+    )
+    orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:00:00+08:00",
+        artifact_refs={
+            "issueNumber": "42",
+            "rootSessionID": "ses-root-42",
+            "verifierSessionID": "ses-v-42",
+            "status": "root_session_started",
+        },
+    )
+
+    orchestrator_supervisor.release_issue_execution(
+        base_dir=tmp_path,
+        issue_number="42",
+        restore_ready_for_agent=False,
+        final_state="failed",
+        updated_at="2026-05-07T17:01:00+08:00",
+    )
+
+    issue = read_issue(tmp_path, "42")
+
+    assert issue is not None
+    assert issue["state"] == "failed"
+    assert issue["current_root_session_id"] == ""
+    assert issue["current_verifier_session_id"] == ""
+    artifact_refs = json.loads(str(issue["artifact_refs_json"]))
+    assert "rootSessionID" not in artifact_refs
+    assert "verifierSessionID" not in artifact_refs
+    assert "status" not in artifact_refs
+
+
 def test_retry_github_sync_command_rejects_stale_failed_attempt(tmp_path: Path):
     issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
@@ -3189,7 +3273,7 @@ def test_reconcile_release_success_keeps_issue_completed(tmp_path: Path):
     assert request is not None
     assert issue is not None
     assert issue["state"] == "completed"
-    assert issue["current_verifier_session_id"] == "ses-v"
+    assert issue["current_verifier_session_id"] == ""
 
 
 def test_reconcile_ignores_stale_session_result_for_different_issue_after_queue_next_issue(tmp_path: Path):
@@ -3605,7 +3689,7 @@ def test_reconcile_release_blocked_exhaustion_marks_issue_failed(tmp_path: Path)
     assert request is not None
     assert issue is not None
     assert issue["state"] == "failed"
-    assert issue["current_verifier_session_id"] == "ses-v"
+    assert issue["current_verifier_session_id"] == ""
 
 
 def test_reconcile_late_successful_release_result_recovers_failed_issue_to_completed(tmp_path: Path):
@@ -3644,7 +3728,7 @@ def test_reconcile_late_successful_release_result_recovers_failed_issue_to_compl
     assert request is not None
     assert issue is not None
     assert issue["state"] == "completed"
-    assert issue["current_verifier_session_id"] == "ses-v"
+    assert issue["current_verifier_session_id"] == ""
     assert cast(dict[str, object], artifact_status["release_result"])["parse_ok"] is True
     assert cast(dict[str, object], artifact_status["release_result"])["status"] == "completed"
     assert cast(dict[str, object], artifact_status["release_result"])["blocked_reason"] == "none"
@@ -3798,7 +3882,7 @@ def test_reconcile_late_successful_release_result_recovers_ready_issue_to_comple
     assert request is not None
     assert issue is not None
     assert issue["state"] == "completed"
-    assert issue["current_verifier_session_id"] == "ses-v"
+    assert issue["current_verifier_session_id"] == ""
 
 
 def test_reconcile_issue_selection_or_recovery_queues_retryable_failed_issue_recovery(tmp_path: Path):

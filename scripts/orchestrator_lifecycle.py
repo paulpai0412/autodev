@@ -121,13 +121,25 @@ def clear_issue_execution_claim_projection(*, base_dir: Path, issue_number: str,
     issue_lock_path(base_dir, issue_number).unlink(missing_ok=True)
     issue = read_issue(base_dir, issue_number) or {}
     existing_artifacts = cast(dict[str, object], json.loads(str(issue.get("artifact_refs_json") or "{}"))) if issue else {}
-    for key in ["issueNumber", "branch", "sourceSessionID", "createdAt", "status", "rootSessionID", "recordedAt"]:
+    for key in ["issueNumber", "branch", "sourceSessionID", "createdAt", "status", "rootSessionID", "verifierSessionID", "recordedAt"]:
         existing_artifacts.pop(key, None)
     _ = sync_issue_runtime_context(
         base_dir,
         issue_number=issue_number,
         updated_at=updated_at,
         artifact_refs=existing_artifacts,
+    )
+
+
+def clear_issue_session_ids(*, base_dir: Path, issue_number: str, updated_at: str) -> None:
+    _ = upsert_issue_state(
+        base_dir,
+        issue_number=issue_number,
+        state=str((read_issue(base_dir, issue_number) or {}).get("state") or "ready"),
+        command_id=f"clear-session-ids:{issue_number}:{updated_at}",
+        updated_at=updated_at,
+        current_root_session_id="",
+        current_verifier_session_id="",
     )
 
 
@@ -360,8 +372,11 @@ def release_issue_execution(
         clear_issue_execution_claim_projection(base_dir=base_dir, issue_number=issue_number, updated_at=timestamp)
     elif target_state in {"failed", "completed"}:
         issue_lock_path(base_dir, issue_number).unlink(missing_ok=True)
+        clear_issue_execution_claim_projection(base_dir=base_dir, issue_number=issue_number, updated_at=timestamp)
 
     if current_state == target_state:
+        if target_state in {"failed", "completed"}:
+            clear_issue_session_ids(base_dir=base_dir, issue_number=issue_number, updated_at=timestamp)
         return
 
     if target_state == "ready" and current_state in {"claimed", "dispatching"}:
@@ -399,7 +414,11 @@ def release_issue_execution(
                 updated_at=timestamp,
                 reason=f"Release issue #{issue_number} into failed terminal state.",
                 from_state="quarantined",
+                current_root_session_id="",
+                current_verifier_session_id="",
             )
+        else:
+            clear_issue_session_ids(base_dir=base_dir, issue_number=issue_number, updated_at=timestamp)
         return
 
     if target_state == "failed" and current_state in {"ready", "claimed", "dispatching"}:
@@ -409,6 +428,8 @@ def release_issue_execution(
             state="failed",
             command_id=command_id,
             updated_at=timestamp,
+            current_root_session_id="",
+            current_verifier_session_id="",
         )
         record_admin_decision(
             base_dir,
@@ -431,6 +452,8 @@ def release_issue_execution(
             updated_at=timestamp,
             reason=f"Release issue #{issue_number} into completed terminal state.",
             from_state="verifying",
+            current_root_session_id="",
+            current_verifier_session_id="",
         )
         return
 
@@ -441,7 +464,8 @@ def release_issue_execution(
             state="completed",
             command_id=command_id,
             updated_at=timestamp,
-            current_verifier_session_id=str(issue_state.get("current_verifier_session_id") or "") or None,
+            current_root_session_id="",
+            current_verifier_session_id="",
         )
         record_admin_decision(
             base_dir,
