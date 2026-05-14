@@ -9,11 +9,11 @@ issue:
   url: "https://github.com/example/issues/42"
 
 branch: "agent/issue-42-demo"
-status: "blocked"
+status: "success"
 
 summary:
   objective: "Publish the demo issue packet, worker result, and handoff artifacts for issue #42."
-  outcome: "Prepared the issue-scoped artifacts and verified focused checks, but PR metadata is not finalized yet."
+  outcome: "Published the demo issue artifacts, pushed the branch, and opened PR #1 without claiming final acceptance QA."
 
 files_changed:
   - path: "docs/agents/issue-packets/issue-42.yaml"
@@ -25,7 +25,7 @@ files_changed:
 
 verification:
   note: "Worker self-checks support implementation feedback only; final acceptance belongs to pr_verifier."
-  gates: {tdd_gate: "not_applicable", implementation_self_check_gate: "pass", git_gate: "fail"}
+  gates: {tdd_gate: "not_applicable", implementation_self_check_gate: "pass", git_gate: "pass"}
   implementation_self_checks:
     - command: "python3 -m pytest tests/scripts/test_orchestrator_bootstrap_runner.py -q"
       result: "pass"
@@ -38,14 +38,14 @@ verification:
   final_acceptance_claim: false
 
 pr:
-  number: ""
-  url: ""
-  ready_for_review: false
+  number: "1"
+  url: "https://github.com/paulpai0412/autodev/pull/1"
+  ready_for_review: true
 
 blockers:
-  - "Push and PR creation still pending. status: success is forbidden until pr.number and pr.url exist."
+  - "none"
 
-next_recommended_step: "Stage only the issue #42 artifacts, push agent/issue-42-demo, create the PR, then finalize this worker result."
+next_recommended_step: "Hand off to pr_verifier for independent acceptance and evidence-packet generation."
 
 evidence_packet_refs:
   worker_artifact_bundle: ""
