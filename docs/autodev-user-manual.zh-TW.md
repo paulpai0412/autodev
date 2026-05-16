@@ -6,13 +6,13 @@
 
 ## 1. 系統定位
 
-`autodev` 是一套把 **GitHub issue → 自動派工 → 實作 → 驗證 → 發佈 / 收尾 → 恢復** 串成可恢復工作流的自治開發系統。
+`autodev` 是一套把 **GitHub issue → 自動派工 → 實作 → 驗證 → 發佈 / 收尾 → 恢復** 串成可恢復工作流的自治開發 harness。
 
 它不是單一 agent prompt，也不是單一排程腳本，而是一個由下列部分共同組成的執行系統：
 
 - `main_orchestrator` / `issue_worker` / `pr_verifier` / `release_worker` 角色分工
-- SQLite control plane
-- runtime JSON artifacts
+- SQLite control plane（`issues` / `issue_history`）
+- host adapter 與 operator 命令 surface
 - GitHub issue / label 協調面
 - operator recovery / quarantine / retry 命令
 
@@ -20,9 +20,12 @@
 
 - **SQLite 是唯一 canonical control plane**
 - GitHub 是協調面，不是主真相來源
-- runtime JSON / YAML artifacts 保留，但只作為 projection、evidence 或 dispatch handoff
+- runtime control 只允許存在於 SQLite `issues` / `issue_history`
+- 舊有 JSON / YAML runtime artifact 若仍存在，只能是歷史投影或 compatibility surface，不能成為 workflow progress 的必要條件
 - `main_orchestrator` 負責協調，不直接做 issue 實作
-- issue 執行是 **serial flow**：一次只處理一個 ready issue、一路走完同一條 orchestrator path
+- `issues.current_session_id` 是唯一 current session pointer
+- OpenCode 只是目前 shipped 的 default host adapter，不是 control-plane schema 的來源
+- 執行模型是 **bounded issue-scoped concurrency**：多個 issue 可並行，但同一 issue 永遠只能有一條 active root orchestrator / development path
 
 ---
 
@@ -36,7 +39,7 @@
 
 - 選擇可執行 issue
 - 啟動或恢復 root session
-- 委派 `issue_worker`、`pr_verifier`、`release_worker`
+- 委派 development loop 內的 `issue_worker`、`pr_verifier`
 - 驅動 `reconcile` / recovery / quarantine 路徑
 - 維持整體流程契約一致性
 
@@ -48,7 +51,7 @@
 
 - 修改程式碼
 - 補測試
-- 產出 worker result artifact
+- 產出 `worker_result` DB fact
 
 #### `pr_verifier`
 
@@ -56,7 +59,7 @@
 
 - 驗證 acceptance criteria 是否成立
 - 檢查 worker 產物是否達到要求
-- 產出 evidence packet
+- 產出 verifier-owned `evidence_packet` fact，並在驗收通過後擁有 formal PR creation
 
 #### `release_worker`
 
@@ -77,7 +80,7 @@
 
 ---
 
-### 2.2 控制平面與 runtime artifacts
+### 2.2 控制平面與歷史投影
 
 #### SQLite control plane（主真相）
 
@@ -89,40 +92,38 @@
 
 - issue lifecycle state
 - issue history / audit trail
-- root event / session request / session result
+- dispatch request / dispatch result / root event
 - GitHub sync attempt
 - issue ranking / selection 結果
-- runtime snapshot / artifact refs / issue packet projection
+- runtime context、artifact refs、issue packet 內容與歷史 payload
+- verifier-owned PR facts 與 release 決策
 
-#### runtime JSON artifacts（接縫與 handoff）
+#### 歷史 artifact 與 payload 投影（非 runtime 真相）
 
-系統仍保留以下 runtime 檔案：
+在 `db-only-control-plane` branch，唯一有效的控制平面是：
 
-- `.opencode/runtime/orchestrator-ledger.json`
-- `.opencode/runtime/new-session-request.json`
-- `.opencode/runtime/new-session-result.json`
+- `.opencode/runtime/control-plane.sqlite3`
+- `issues`
+- `issue_history`
 
-它們的用途是：
+`issue_history` 會保存過去分散在 packet / handoff / worker result / evidence / release result 中的 compact payload 與 audit fact。若 repo 內仍殘留對應檔案或模板，應只視為歷史投影或 compatibility surface。
 
-- 保存目前 orchestrator 上下文與 runtime snapshot
-- 作為新 root session dispatch 的 request / result handoff
-- 維持既有流程接縫，而不是取代 SQLite
+#### issue packet / handoff / result 類歷史投影
 
-#### issue packet / worker result / evidence / release result
-
-主要 artifact 目錄：
+若下列 artifact 目錄仍存在，應只視為歷史投影或 compatibility surface，不可作為 runtime progress 的必要條件：
 
 - `docs/agents/issue-packets/`
 - `docs/agents/handoffs/`
 - `docs/agents/worker-results/`
 - `docs/agents/evidence/`
 - `docs/agents/release-results/`
-- `docs/agents/runtime/`
 
 這些 artifact 採 **compact / index-only** 原則：
 
 - 可以保存摘要與 reference
 - 不應直接把 raw log、完整 trace、SQL log、截圖或 transcript 貼進 repo
+
+`docs/agents/runtime/` 是分支契約文件所在，不屬於 runtime state；真正的 runtime state 仍只在 SQLite。
 
 ---
 
@@ -133,18 +134,18 @@
 | 模組 | 作用 |
 |---|---|
 | `scripts/autodev_project.py` | consumer project 初始化、安裝全域命令、doctor、`start` / `reconcile` / `show-session` wrapper |
-| `scripts/orchestrator_bootstrap_runner.py` | 針對指定 issue 進行 bootstrap、checkpoint/ledger/request 建立與可選 dispatch |
+| `scripts/orchestrator_bootstrap_runner.py` | 針對指定 issue 進行 DB-backed bootstrap 與 root session dispatch |
 | `scripts/orchestrator_supervisor.py` | supervisor CLI surface、runtime reconcile 總控、operator commands |
-| `scripts/orchestrator_compact_payload.py` | checkpoint / compact payload 解析與生成 |
-| `scripts/issue_packet_intake.py` | 從 GitHub ready-for-agent issue materialize 成本地 issue packets |
+| `scripts/issue_packet_intake.py` | 從 GitHub ready-for-agent issue 同步 SQLite-backed intake inputs |
 
 #### supervisor 拆分後的 helper 模組
 
 | 模組 | 作用 |
 |---|---|
-| `scripts/orchestrator_artifacts.py` | issue packet / worker result / evidence packet / release result parsing |
-| `scripts/orchestrator_sessions.py` | detached `opencode run`、session ID 解析與 DB lookup |
-| `scripts/orchestrator_lifecycle.py` | issue claim / lock / lifecycle transition / GitHub label sync / quarantine |
+| `scripts/orchestrator_artifacts.py` | compact parsing / compatibility helper；不是 runtime source of truth |
+| `scripts/orchestrator_sessions.py` | host-neutral session facade，提供 default host adapter 與共用型別 |
+| `scripts/opencode_host_adapter.py` | 目前 shipped 的 OpenCode adapter 實作 |
+| `scripts/orchestrator_lifecycle.py` | issue claim / lifecycle transition / GitHub label sync / quarantine |
 | `scripts/orchestrator_requests.py` | prompt 與 session request builder |
 | `scripts/orchestrator_selection.py` | issue packet sync、selection、intake 協調 |
 | `scripts/orchestrator_reconcile.py` | transition / recovery helpers、role-specific branch handlers、main-orchestrator branch handlers |
@@ -157,23 +158,25 @@
 
 ### 2.4 高層執行流程
 
-1. GitHub 上標記為 `ready-for-agent` 的 issue 被 materialize 成本地 `issue-<n>.yaml`
-2. bootstrap runner 針對指定 issue 建立 checkpoint、ledger 與新 root session request
-3. `main_orchestrator` 被 dispatch
-4. fresh `main_orchestrator` 進入 issue flow 後，必須先跑一次 `orchestrator_supervisor.py reconcile --ledger ...`，把 bootstrap → `issue_worker_execution` transition 寫回 on-disk ledger，再開始派出第一個 `issue_worker`
-5. `main_orchestrator` 依序委派：
-   - `issue_worker`
-   - `pr_verifier`
-   - `release_worker`
-   - 以上子任務應以 `task(..., run_in_background=false)` 前景執行，讓同一個 root orchestrator session 逐一等待完成後再繼續
-   - 即使 issue scope 在 issue worktree 內執行，compact artifacts（worker result / evidence packet / release result）仍應回寫到 primary workspace 的 canonical repo 路徑，供 supervisor reconcile 使用
-   - `issue_worker` 只有在 branch push 與 PR 建立都完成，且 worker result 內已填入 `pr.number` / `pr.url` 後，才能寫出 `status: success`；否則必須誠實寫成 blocked / failed，避免 supervisor 過早把 issue 視為成功
-6. 每次有新 artifact 落地後，supervisor 執行 `reconcile`
-7. `reconcile` 會同步 SQLite control plane，判斷下一步是：
+1. GitHub 上標記為 `ready-for-agent` 的 issue 被 intake 到 SQLite control plane
+2. workspace reconcile 依 development capacity 從 `ready` issues 中做 deterministic selection，並以 `ready -> claimed` 作為 DB fence
+3. bootstrap runner 或 supervisor 為被選中的 issue 啟動 root session
+4. fresh `main_orchestrator` 進入 issue flow 後，由 DB-backed reconcile 推進 bootstrap → `issue_worker_execution`
+5. `main_orchestrator` 在同一個 root session 內依序委派 development loop 子任務：
+    - `issue_worker`
+    - `pr_verifier`
+    - 以上子任務應以 `task(..., run_in_background=false)` 前景執行，讓同一個 root orchestrator session 逐一等待完成後再繼續
+    - child role 的 outcome 必須用 `scripts/orchestrator_supervisor.py submit-artifact` 之類的 DB-backed submission 寫回 SQLite；repo-local artifact file 不是必要 runtime gate
+    - `issue_worker` 成功只代表 implementation-ready；formal PR creation 與 acceptance gate 由 verifier path 擁有
+6. `pr_verifier` 通過後 issue 停在 `verified`；PR merge / release 由獨立 `/autodev-release [issue-number]` 命令 claim 成 `release_pending` 後啟動 `release_worker`
+7. 每次有新的 DB-backed fact / artifact submission 後，supervisor 執行 `reconcile`
+8. `reconcile` 會同步 SQLite control plane，判斷下一步是：
    - 繼續派工
    - recovery
    - quarantine
+   - 進入 `verified` / `release_pending`
    - 完成 / 失敗
+9. 已 `verified` 或 `release_pending` 的 issue 不應阻塞其他 `ready` issue 進入 development loop
 
 ---
 
@@ -192,12 +195,13 @@
 - 自動建立 GitHub repository（必要時）
 - 自動補齊 autodev workflow labels
 
-### 3.2 全域 OpenCode 指令安裝
+### 3.2 全域 autodev host 命令安裝（目前預設 OpenCode adapter）
 
 `autodev_project.py install-commands` 會安裝以下全域命令：
 
 - `/autodev-start <issue-number>`
 - `/autodev-reconcile`
+- `/autodev-release [issue-number]`
 - `/autodev-show-session`
 - `/autodev-doctor`
 
@@ -206,7 +210,7 @@
 `issue_packet_intake.py` 會：
 
 - 從 GitHub 讀取 `ready-for-agent` issue
-- 產出 `docs/agents/issue-packets/issue-<n>.yaml`
+- 同步 issue 資訊到 SQLite-backed intake surface
 - 推導 branch name、parent reference、dependencies、acceptance criteria
 
 ### 3.4 嚴格 issue state machine
@@ -218,6 +222,8 @@
 - `dispatching`
 - `running`
 - `verifying`
+- `verified`
+- `release_pending`
 - `completed`
 - `failed`
 - `quarantined`
@@ -228,11 +234,7 @@
 
 duplicate-start 的 canonical 防護來自 SQLite `issues.state`，不是 lease table。
 
-另外，`.opencode/runtime/issue-locks/issue-<n>.json` 只保留為：
-
-- operator safety artifact
-- duplicate-start 訊息 projection
-- 已知 live session 的 resume hint 輔助
+此 branch 的 duplicate-start canonical 防護完全來自 SQLite state；issue-lock projection 檔不再是 active runtime contract。
 
 ### 3.6 GitHub coordination labels
 
@@ -262,7 +264,7 @@ GitHub 仍是 operator 協調面，但不是 canonical truth。
 - `issues` current state
 - `issue_history` append-only audit
 - GitHub sync attempt 記錄
-- runtime artifact refs
+- runtime artifact refs / PR facts / release decisions
 
 ---
 
@@ -310,7 +312,7 @@ PYTHONPATH=. python3 scripts/autodev_project.py init --project-root /path/to/pro
 - `--force`：必要時更新既有 remote / managed 內容
 - `--json`：以 JSON 方式輸出結果
 
-### 4.4 安裝全域 OpenCode 命令
+### 4.4 安裝全域 autodev host 命令（目前預設 OpenCode adapter）
 
 ```bash
 PYTHONPATH=. python3 scripts/autodev_project.py install-commands
@@ -345,9 +347,9 @@ autodev project: no changes needed
 
 ## 5. 使用方式（建議流程）
 
-### 5.1 同步 GitHub issue packets
+### 5.1 同步 GitHub ready issues 到 SQLite intake
 
-預設 tracker repo 是 `paulpai0412/wferp`。請把 intake 指到 consumer project，這樣 packet 會寫進該專案的 `docs/agents/issue-packets/`。若要指定其他 repo：
+預設 tracker repo 是 `paulpai0412/wferp`。請把 intake 指到 consumer project，這樣 ready issue 會直接同步進該專案的 SQLite-backed intake flow。若要指定其他 repo：
 
 ```bash
 AUTODEV_GITHUB_REPO=<owner/repo> PYTHONPATH=. python3 scripts/issue_packet_intake.py --project-root <project>
@@ -359,6 +361,8 @@ AUTODEV_GITHUB_REPO=<owner/repo> PYTHONPATH=. python3 scripts/issue_packet_intak
 PYTHONPATH=. python3 scripts/issue_packet_intake.py --issues-json /path/to/issues.json --output-dir /tmp/issue-packets
 ```
 
+其中 `--output-dir` 已是 deprecated compatibility flag；DB-backed intake 會忽略它，不再輸出 issue packet 檔案。
+
 ### 5.2 啟動指定 issue（高階 wrapper，建議用）
 
 ```bash
@@ -367,9 +371,8 @@ PYTHONPATH=. python3 scripts/autodev_project.py start --project-root <project> -
 
 這個 wrapper 會在目標 consumer project 內：
 
-- 確保 checkpoint 檔存在
 - 呼叫 `scripts/orchestrator_bootstrap_runner.py`
-- 寫入 checkpoint / ledger / request
+- 同步 DB-backed dispatch context
 - 直接 dispatch root session
 
 如果你已安裝全域命令，也可直接在 consumer project 內使用：
@@ -384,22 +387,13 @@ PYTHONPATH=. python3 scripts/autodev_project.py start --project-root <project> -
 PYTHONPATH=. python3 scripts/autodev_project.py reconcile --project-root <project>
 ```
 
-這個 wrapper 會實際呼叫：
+這個 wrapper 會以 DB-backed issue state 執行 workspace reconcile，先處理所有 active / fenced issues，再視 available development capacity 啟動新的 ready issue；整個流程不依賴任何本地 ledger / request / session-result artifact。
+
+若你需要直接使用低階命令，對應的是：
 
 ```bash
-python3 -m scripts.orchestrator_supervisor reconcile \
-  --ledger .opencode/runtime/orchestrator-ledger.json \
-  --request .opencode/runtime/new-session-request.json \
-  --session-result .opencode/runtime/new-session-result.json \
-  --write-request \
-  --dispatch-now \
-  --source-session-id autodev-reconcile
+PYTHONPATH=. python3 scripts/orchestrator_supervisor.py reconcile-workspace --base-dir <project>
 ```
-
-也就是說，它不只做 decision，還會：
-
-- 寫入下一個 request
-- 直接 dispatch 下一個 session（若需要）
 
 若已安裝全域命令，也可使用：
 
@@ -407,13 +401,21 @@ python3 -m scripts.orchestrator_supervisor reconcile \
 /autodev-reconcile
 ```
 
+若要讓 workspace 持續自動補位，可使用 watch wrapper：
+
+```bash
+PYTHONPATH=. python3 scripts/autodev_project.py reconcile-watch --project-root <project> --interval-seconds 30
+```
+
+`reconcile-watch` 不改變 supervisor 的核心排程邏輯；它只是定期重跑 DB-backed `reconcile-workspace`。測試或短期執行時可加上 `--iterations <n>` 限制輪數，若希望任何一輪失敗就停止，可加上 `--stop-on-error`。
+
 ### 5.4 查看目前 root session
 
 ```bash
 PYTHONPATH=. python3 scripts/autodev_project.py show-session --project-root <project>
 ```
 
-這會直接輸出 `.opencode/runtime/new-session-result.json` 的內容。
+這會從 SQLite control plane 輸出目前 issue 的 session / resume 資訊。
 
 若已安裝全域命令，也可使用：
 
@@ -421,7 +423,7 @@ PYTHONPATH=. python3 scripts/autodev_project.py show-session --project-root <pro
 /autodev-show-session
 ```
 
-當 session result 內有 `rootSessionID` 時，通常可以用：
+當目前 host adapter 是 OpenCode，且 session payload 內有 `rootSessionID` 時，通常可以用：
 
 ```bash
 opencode --session <rootSessionID>
@@ -448,52 +450,32 @@ PYTHONPATH=. python3 scripts/autodev_project.py doctor --project-root <project>
 ### 6.1 直接使用 bootstrap runner
 
 ```bash
-PYTHONPATH=. python3 scripts/orchestrator_bootstrap_runner.py --issue-number <n> --dispatch-now --source-session-id auto-dev
+PYTHONPATH=. python3 scripts/orchestrator_bootstrap_runner.py --base-dir <project> --issue-number <n> --source-session-id auto-dev
 ```
 
 這是 lower-level 啟動方式。它會：
 
-- 定位 issue packet
+- 從 SQLite control plane 取得 issue context
 - claim issue execution
-- 更新 checkpoint
-- 建立 ledger
-- 建立 new session request
-- 視需要直接 dispatch root session
+- 建立 DB-backed dispatch context
+- 直接 dispatch root session
 
 ### 6.2 直接使用 supervisor reconcile
 
-只做 reconcile decision：
-
 ```bash
-PYTHONPATH=. python3 scripts/orchestrator_supervisor.py reconcile --ledger .opencode/runtime/orchestrator-ledger.json
+PYTHONPATH=. python3 scripts/orchestrator_supervisor.py reconcile --base-dir <project> --issue-number <n>
 ```
 
-若要像高階 wrapper 一樣繼續往下寫 request 並 dispatch：
+這是單一 issue 的低階 reconcile。若要讓 supervisor 在整個 workspace 內先處理 active issues、再補滿 development capacity，請使用：
 
 ```bash
-PYTHONPATH=. python3 scripts/orchestrator_supervisor.py reconcile \
-  --ledger .opencode/runtime/orchestrator-ledger.json \
-  --request .opencode/runtime/new-session-request.json \
-  --session-result .opencode/runtime/new-session-result.json \
-  --write-request \
-  --dispatch-now \
-  --source-session-id supervisor-reconcile
+PYTHONPATH=. python3 scripts/orchestrator_supervisor.py reconcile-workspace --base-dir <project>
 ```
 
-### 6.3 直接 dispatch 已存在的 request
+### 6.3 inspect：檢查 control-plane 狀態
 
 ```bash
-PYTHONPATH=. python3 scripts/orchestrator_supervisor.py dispatch \
-  --request .opencode/runtime/new-session-request.json \
-  --session-result .opencode/runtime/new-session-result.json \
-  --ledger .opencode/runtime/orchestrator-ledger.json \
-  --source-session-id manual_dispatch
-```
-
-### 6.4 inspect：檢查 control-plane 狀態
-
-```bash
-PYTHONPATH=. python3 scripts/orchestrator_supervisor.py inspect --ledger .opencode/runtime/orchestrator-ledger.json
+PYTHONPATH=. python3 scripts/orchestrator_supervisor.py inspect --base-dir <project> --issue-number <n>
 ```
 
 輸出內容包含：
@@ -502,52 +484,54 @@ PYTHONPATH=. python3 scripts/orchestrator_supervisor.py inspect --ledger .openco
 - `latestDecision`
 - `latestGitHubSyncAttempt`
 
-### 6.5 quarantine：人工隔離 issue
+### 6.4 quarantine：人工隔離 issue
 
 ```bash
-PYTHONPATH=. python3 scripts/orchestrator_supervisor.py quarantine --ledger .opencode/runtime/orchestrator-ledger.json --reason <why>
+PYTHONPATH=. python3 scripts/orchestrator_supervisor.py quarantine --base-dir <project> --issue-number <n> --reason <why>
 ```
 
-### 6.6 resume-quarantined：恢復隔離 issue
+### 6.5 resume-quarantined：恢復隔離 issue
 
 ```bash
-PYTHONPATH=. python3 scripts/orchestrator_supervisor.py resume-quarantined --ledger .opencode/runtime/orchestrator-ledger.json --reason <why>
+PYTHONPATH=. python3 scripts/orchestrator_supervisor.py resume-quarantined --base-dir <project> --issue-number <n> --reason <why>
 ```
 
-### 6.7 fail-quarantined：將隔離 issue 判定為失敗
+### 6.6 fail-quarantined：將隔離 issue 判定為失敗
 
 ```bash
-PYTHONPATH=. python3 scripts/orchestrator_supervisor.py fail-quarantined --ledger .opencode/runtime/orchestrator-ledger.json --reason <why>
+PYTHONPATH=. python3 scripts/orchestrator_supervisor.py fail-quarantined --base-dir <project> --issue-number <n> --reason <why>
 ```
 
-### 6.8 retry-github-sync：重試 GitHub label 同步
+### 6.7 retry-github-sync：重試 GitHub label 同步
 
 ```bash
-PYTHONPATH=. python3 scripts/orchestrator_supervisor.py retry-github-sync --ledger .opencode/runtime/orchestrator-ledger.json --command-id <id>
+PYTHONPATH=. python3 scripts/orchestrator_supervisor.py retry-github-sync --base-dir <project> --issue-number <n> --command-id <id>
 ```
 
 這個指令只會重播**已記錄且最新的失敗 GitHub sync attempt**，不是任意重放所有歷史操作。
 
+### 6.8 retry-failed：重試可重試的 failed issue
+
+```bash
+PYTHONPATH=. python3 scripts/orchestrator_supervisor.py retry-failed --base-dir <project> --issue-number <n> --reason <why>
+```
+
+這個指令會把符合條件的 failed issue 移回可再調度狀態，並把操作記錄進 SQLite audit trail。
+
 ---
 
-## 7. 資料模型與 runtime 檔案
+## 7. 資料模型與歷史 artifact
 
-### 7.1 重要 runtime 檔案
+### 7.1 重要 runtime 儲存面
 
 - `.opencode/runtime/control-plane.sqlite3`
-- `.opencode/runtime/orchestrator-ledger.json`
-- `.opencode/runtime/new-session-request.json`
-- `.opencode/runtime/new-session-result.json`
-- `.opencode/runtime/issue-locks/issue-<n>.json`
-- `docs/agents/runtime/context-checkpoint.yaml`
+- `issues`
+- `issue_history`
 
-### 7.2 重要 artifact 類型
+### 7.2 歷史 artifact 類型
 
-- issue packet：`docs/agents/issue-packets/issue-<n>.yaml`
-- handoff：`docs/agents/handoffs/issue-<n>.yaml`
-- worker result：`docs/agents/worker-results/...`
-- evidence packet：`docs/agents/evidence/...`
-- release result：`docs/agents/release-results/...`
+- 若仍存在的 issue packet / handoff / worker result / evidence packet / release result 檔案，應只視為歷史投影或 compatibility artifact，而非 canonical runtime input
+- runtime progress 必須只依賴 SQLite `issues` / `issue_history`
 
 ### 7.3 SQLite 主要資料表
 
@@ -557,14 +541,14 @@ PYTHONPATH=. python3 scripts/orchestrator_supervisor.py retry-github-sync --ledg
 
 - `state`
 - `rank_score`
+- `lane`
 - `current_role`
 - `current_stage`
-- `current_root_session_id`
-- `current_verifier_session_id`
+- `current_session_id`
 - `attempts_json`
 - `limits_json`
 - `last_failure_json`
-- `artifact_refs_json`
+- `runtime_context_json`
 - `issue_packet_json`
 
 #### `issue_history`
@@ -573,9 +557,10 @@ append-only audit table，用來保存：
 
 - state transition
 - root event
-- session request / session result
+- dispatch / artifact / release / admin / github sync facts
 - GitHub sync attempt
 - admin decision
+- `pr_opened` 與其他 verifier-owned acceptance / release facts
 
 ---
 
@@ -588,6 +573,8 @@ append-only audit table，用來保存：
 - `dispatching`
 - `running`
 - `verifying`
+- `verified`
+- `release_pending`
 - `completed`
 - `failed`
 - `quarantined`
@@ -600,9 +587,15 @@ append-only audit table，用來保存：
 - `dispatching -> ready`
 - `running -> verifying`
 - `running -> quarantined`
-- `verifying -> completed`
+- `verifying -> verified`
 - `verifying -> failed`
+- `verifying -> quarantined`
+- `verified -> release_pending`
+- `verified -> completed`
+- `release_pending -> completed`
+- `release_pending -> failed`
 - `quarantined -> running`
+- `quarantined -> claimed`
 - `quarantined -> failed`
 
 ### 8.3 GitHub labels
@@ -634,7 +627,7 @@ PYTHONPATH=. python3 scripts/autodev_project.py init --project-root <project> --
 PYTHONPATH=. python3 scripts/autodev_project.py doctor --project-root <project>
 ```
 
-### 步驟 3：同步 GitHub issues 成 issue packets
+### 步驟 3：同步 GitHub issues 進 SQLite intake
 
 ```bash
 AUTODEV_GITHUB_REPO=<owner/repo> PYTHONPATH=. python3 scripts/issue_packet_intake.py --project-root <project>
@@ -656,7 +649,7 @@ PYTHONPATH=. python3 scripts/autodev_project.py reconcile --project-root <projec
 
 ```bash
 PYTHONPATH=. python3 scripts/autodev_project.py show-session --project-root <project>
-PYTHONPATH=. python3 scripts/orchestrator_supervisor.py inspect --ledger .opencode/runtime/orchestrator-ledger.json
+PYTHONPATH=. python3 scripts/orchestrator_supervisor.py inspect --base-dir <project> --issue-number <n>
 ```
 
 ---
@@ -677,7 +670,7 @@ python3 -m pytest tests/scripts/test_<script_name>.py -q
 
 ### 10.3 建議優先檢查的面向
 
-- bootstrap runner 是否能正確寫出 checkpoint / ledger / request
+- bootstrap runner 是否能正確建立 DB-backed dispatch context 並啟動 root session
 - reconcile 是否能推進 state machine
 - quarantine / resume / fail-quarantined 是否保持 canonical state 一致
 - GitHub label sync failure 是否可 retry 且可稽核
@@ -690,23 +683,27 @@ python3 -m pytest tests/scripts/test_<script_name>.py -q
 
 `main_orchestrator` 只做 orchestration 與 contract routing。
 
-### 11.2 同一 issue 不要啟動兩次
+### 11.2 同一 issue 不要啟動兩次；不同 issue 可並行
 
-目前設計是 issue-scoped serial flow。若 issue 已在：
+目前設計是 bounded issue-scoped concurrency。也就是說：
+
+- 不同 issue 可以在同一 workspace 內並行
+- 同一 issue 若已在下列任一狀態，就不應重複啟動：
 
 - `claimed`
 - `dispatching`
 - `running`
 - `verifying`
-- `quarantined`
 
-就不應重複啟動。
+`quarantined` issue 仍會被 fenced 避免 duplicate-start，但不應無限期佔用 development slot。
+
+SQLite `issues.state` 與 `issues.current_session_id` 是 duplicate-start fence 的 canonical 來源，不是 file lock。
 
 ### 11.3 GitHub 不是主真相來源
 
 若 GitHub label 和 SQLite DB 看起來不一致，請以 SQLite control plane 為準，再視情況執行 `inspect` / `retry-github-sync`。
 
-### 11.4 保持 artifacts 精簡
+### 11.4 保持歷史投影與 evidence 精簡
 
 不要把 raw logs、browser trace、完整 transcript 直接貼進 repo docs 或 issue comments。
 
@@ -732,12 +729,15 @@ consumer project 應保留：
 
 1. `README.md`
 2. `AGENTS.md`
-3. `docs/agents/autonomous-development-workflow.yaml`
-4. `docs/agents/runtime/orchestrator-control-plane-spec.md`
-5. `docs/agents/runtime/nonstop-supervisor-loop.md`
-6. `docs/agents/issue-tracker.md`
-7. `scripts/autodev_project.py`
-8. `scripts/orchestrator_bootstrap_runner.py`
-9. `scripts/orchestrator_supervisor.py`
+3. `docs/agents/runtime/db-only-control-plane-spec.md`
+4. `docs/agents/runtime/db-only-control-plane-implementation-plan.md`
+5. `docs/agents/runtime/host-adapter-strategy.md`
+6. `docs/agents/runtime/product-positioning.md`
+7. `docs/agents/runtime/multi-issue-concurrency.md`
+8. `docs/agents/autonomous-development-workflow.yaml`
+9. `docs/agents/issue-tracker.md`
+10. `scripts/autodev_project.py`
+11. `scripts/orchestrator_bootstrap_runner.py`
+12. `scripts/orchestrator_supervisor.py`
 
-這樣可以先理解「怎麼用」，再往下看到「系統為什麼這樣設計」。
+這樣可以先理解「怎麼用」，再往下看到這個 branch 的 DB-only runtime 為什麼這樣設計。

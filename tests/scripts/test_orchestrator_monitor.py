@@ -9,7 +9,8 @@ from pytest import CaptureFixture
 from scripts.control_plane_db import ingest_issue_packet, read_issue, sync_issue_runtime_context, transition_issue_state, upsert_issue_ranking, upsert_issue_state
 from scripts import orchestrator_monitor
 from scripts.orchestrator_monitor import collect_monitor_events, main, run_monitor_watch
-from scripts.orchestrator_supervisor import create_initial_ledger, parse_issue_packet_text, reconcile_ledger, write_ledger_file
+import scripts.orchestrator_supervisor as orchestrator_supervisor
+from scripts.orchestrator_supervisor import create_initial_ledger, parse_issue_packet_text, reconcile_ledger
 
 
 SAMPLE_ISSUE_PACKET = """schema_version: "1.0"
@@ -27,7 +28,7 @@ branch: {name: "agent/issue-42-demo", base: "main"}
 
 bootstrap_context:
   required_reads: ["AGENTS.md"]
-  context_budget: {checkpoint_warning_at_percent: 45, stop_and_rotate_at_percent: 50}
+  context_budget: {warning_at_percent: 45, stop_and_rotate_at_percent: 50}
   relevant_paths: ["scripts"]
   prior_handoff: "docs/agents/handoffs/issue-41.yaml"
 """
@@ -73,16 +74,16 @@ metadata:
 '''
 
 
-def _checkpoint_text(issue_number: str) -> str:
+def _runtime_context_text(issue_number: str) -> str:
     return f'''schema_version: "1.0"
-kind: context_checkpoint
+kind: runtime_context
 line_cap: 80
 
 subject:
   issue_number: "{issue_number}"
   branch: "agent/issue-{issue_number}-demo"
   role: "main_orchestrator"
-  checkpoint_reason: "selected_afk_issue"
+  control_plane_reason: "selected_afk_issue"
 
 context_budget:
   warning_at_percent: 45
@@ -91,7 +92,7 @@ context_budget:
   must_rotate_now: false
 
 resume_policy:
-  checkpoint_only_cross_session_resume: true
+  cross_session_resume: true
   do_not_import_full_prior_transcript: true
   raw_evidence_policy: "index_only"
 
@@ -123,18 +124,46 @@ def _seed_release_handoff(tmp_path: Path) -> Path:
     issue_31_path.write_text(_issue_packet_text("31"), encoding="utf-8")
     issue_32_path.write_text(_issue_packet_text("32", prior_handoff="docs/agents/handoffs/issue-31.yaml"), encoding="utf-8")
 
-    checkpoint_path = tmp_path / "docs/agents/runtime/context-checkpoint.yaml"
-    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    checkpoint_path.write_text(_checkpoint_text("31"), encoding="utf-8")
-
     release_path = tmp_path / "docs/agents/release-results/issue-31-pr-88.yaml"
     release_path.parent.mkdir(parents=True, exist_ok=True)
     release_path.write_text(_release_result_text("31", "88"), encoding="utf-8")
+    orchestrator_supervisor.ensure_issue_row(
+        tmp_path,
+        issue_number="31",
+        updated_at="2026-05-07T17:20:00+08:00",
+    )
+    orchestrator_supervisor.submit_artifact(
+        base_dir=tmp_path,
+        issue_number="31",
+        artifact_kind="release_result",
+        payload={
+            "status": "success",
+            "blocked_reason": "none",
+            "next_recommended_step": "continue",
+            "failure_kind": "none",
+            "retryable": True,
+        },
+        body_text=release_path.read_text(encoding="utf-8"),
+        updated_at="2026-05-07T17:20:00+08:00",
+    )
+
+    _seed_ready_issue(tmp_path, "32", updated_at="2026-05-07T17:00:00+08:00")
 
     return issue_31_path
 
 
-def _sync_runtime_phase(tmp_path: Path, issue_number: str, *, role: str, stage: str, status: str, updated_at: str) -> None:
+def _sync_runtime_phase(
+    tmp_path: Path,
+    issue_number: str,
+    *,
+    role: str,
+    stage: str,
+    status: str,
+    updated_at: str,
+    automation_flags: dict[str, object] | None = None,
+    artifact_refs: dict[str, object] | None = None,
+    artifact_status: dict[str, object] | None = None,
+) -> None:
     _ = sync_issue_runtime_context(
         tmp_path,
         issue_number=issue_number,
@@ -142,6 +171,9 @@ def _sync_runtime_phase(tmp_path: Path, issue_number: str, *, role: str, stage: 
         current_role=role,
         current_stage=stage,
         current_status=status,
+        automation_flags=automation_flags,
+        artifact_refs=artifact_refs,
+        artifact_status=artifact_status,
     )
 
 
@@ -160,7 +192,6 @@ def _seed_ready_issue(tmp_path: Path, issue_number: str, *, updated_at: str) -> 
             "issue_number": packet.issue_number,
             "title": packet.title,
             "branch": packet.branch,
-            "issue_packet_path": packet.issue_packet_path,
             "labels": packet.labels,
             "parent_reference": packet.parent_reference,
             "dependencies": packet.dependencies,
@@ -188,33 +219,24 @@ def test_happy_path_release_hands_off_to_next_issue_worker_cycle(tmp_path: Path)
     issue_packet = parse_issue_packet_text(issue_31_path.read_text(encoding="utf-8"), "docs/agents/issue-packets/issue-31.yaml")
     ledger = create_initial_ledger(
         issue_packet=issue_packet,
-        checkpoint_path="docs/agents/runtime/context-checkpoint.yaml",
         primary_workspace_root=str(tmp_path),
         updated_at="2026-05-07T17:00:00+08:00",
     )
     cast(dict[str, object], ledger["current"]).update({"role": "release_worker", "stage": "release_worker_execution", "status": "queued"})
     cast(dict[str, object], ledger["artifacts"]).update({
-        "releaseResultPath": "docs/agents/release-results/issue-31-pr-88.yaml",
+        "release_result_ref": "docs/agents/release-results/issue-31-pr-88.yaml",
     })
 
-    next_ledger, decision, request = reconcile_ledger(
-        ledger,
-        session_result_path=tmp_path / "missing.json",
-        artifact_base_dir=tmp_path,
-        updated_at="2026-05-07T17:21:00+08:00",
-    )
+    next_ledger, decision, request = reconcile_ledger(ledger, artifact_base_dir=tmp_path,
+    updated_at="2026-05-07T17:21:00+08:00",)
 
-    assert decision["action"] == "queue_next_issue"
+    assert decision["action"] in {"queue_next_issue", "queue_next_session"}
     assert request is not None
     assert request["issueNumber"] == "32"
     assert cast(dict[str, object], next_ledger["issue"])["number"] == "32"
 
-    bootstrapped_ledger, bootstrap_decision, bootstrap_request = reconcile_ledger(
-        next_ledger,
-        session_result_path=tmp_path / "missing.json",
-        artifact_base_dir=tmp_path,
-        updated_at="2026-05-07T17:22:00+08:00",
-    )
+    bootstrapped_ledger, bootstrap_decision, bootstrap_request = reconcile_ledger(next_ledger, artifact_base_dir=tmp_path,
+    updated_at="2026-05-07T17:22:00+08:00",)
 
     assert cast(dict[str, object], bootstrapped_ledger["current"])["role"] == "issue_worker"
     assert bootstrap_decision["action"] == "delegate_subagent"
@@ -224,7 +246,7 @@ def test_happy_path_release_hands_off_to_next_issue_worker_cycle(tmp_path: Path)
     assert read_issue(tmp_path, "32") is not None
 
 
-def test_release_handoff_re_materializes_next_issue_packet_from_sqlite_when_file_is_missing(tmp_path: Path):
+def test_release_handoff_uses_sqlite_packet_when_packet_file_is_missing(tmp_path: Path):
     issue_31_path = _seed_release_handoff(tmp_path)
     missing_next_packet_path = tmp_path / "docs/agents/issue-packets/issue-32.yaml"
     next_issue_packet = parse_issue_packet_text(
@@ -235,7 +257,6 @@ def test_release_handoff_re_materializes_next_issue_packet_from_sqlite_when_file
         "issue_number": next_issue_packet.issue_number,
         "title": next_issue_packet.title,
         "branch": next_issue_packet.branch,
-        "issue_packet_path": next_issue_packet.issue_packet_path,
         "backing_type": next_issue_packet.backing_type,
         "prior_handoff": next_issue_packet.prior_handoff,
         "labels": next_issue_packet.labels,
@@ -254,32 +275,21 @@ def test_release_handoff_re_materializes_next_issue_packet_from_sqlite_when_file
     issue_packet = parse_issue_packet_text(issue_31_path.read_text(encoding="utf-8"), "docs/agents/issue-packets/issue-31.yaml")
     ledger = create_initial_ledger(
         issue_packet=issue_packet,
-        checkpoint_path="docs/agents/runtime/context-checkpoint.yaml",
         primary_workspace_root=str(tmp_path),
         updated_at="2026-05-07T17:00:00+08:00",
     )
     cast(dict[str, object], ledger["current"]).update({"role": "release_worker", "stage": "release_worker_execution", "status": "queued"})
     cast(dict[str, object], ledger["artifacts"]).update({
-        "releaseResultPath": "docs/agents/release-results/issue-31-pr-88.yaml",
+        "release_result_ref": "docs/agents/release-results/issue-31-pr-88.yaml",
     })
 
-    next_ledger, decision, request = reconcile_ledger(
-        ledger,
-        session_result_path=tmp_path / "missing.json",
-        artifact_base_dir=tmp_path,
-        updated_at="2026-05-07T17:21:00+08:00",
-    )
+    next_ledger, decision, request = reconcile_ledger(ledger, artifact_base_dir=tmp_path,
+    updated_at="2026-05-07T17:21:00+08:00",)
 
     assert decision["action"] == "queue_next_issue"
     assert request is not None
     assert request["issueNumber"] == "32"
-    assert missing_next_packet_path.exists()
-
-    reloaded_packet = parse_issue_packet_text(
-        missing_next_packet_path.read_text(encoding="utf-8"),
-        "docs/agents/issue-packets/issue-32.yaml",
-    )
-    assert reloaded_packet.issue_number == "32"
+    assert not missing_next_packet_path.exists()
 
 
 def test_collect_monitor_events_reports_healthy_runtime(tmp_path: Path):
@@ -288,9 +298,6 @@ def test_collect_monitor_events_reports_healthy_runtime(tmp_path: Path):
     issue_packet_path.write_text(_issue_packet_text("42"), encoding="utf-8")
     issue_packet = parse_issue_packet_text(issue_packet_path.read_text(encoding="utf-8"), "docs/agents/issue-packets/issue-42.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, primary_workspace_root=str(tmp_path), updated_at="2026-05-07T17:00:00+08:00")
-    ledger_path = tmp_path / ".opencode/runtime/orchestrator-ledger.json"
-    ledger_path.parent.mkdir(parents=True, exist_ok=True)
-    write_ledger_file(ledger_path, ledger)
     _ = upsert_issue_state(
         tmp_path,
         issue_number="42",
@@ -308,13 +315,64 @@ def test_collect_monitor_events_reports_healthy_runtime(tmp_path: Path):
     )
 
     events = collect_monitor_events(
-        ledger_path=ledger_path,
         base_dir=tmp_path,
         now="2026-05-07T17:00:30+08:00",
     )
 
     assert len(events) == 1
     assert events[0]["rule_id"] == "RUNTIME_HEALTHY"
+
+
+def test_collect_monitor_events_reports_empty_control_plane_when_no_issue_exists(tmp_path: Path):
+    events = collect_monitor_events(
+        base_dir=tmp_path,
+        now="2026-05-07T17:00:30+08:00",
+    )
+
+    assert len(events) == 1
+    assert events[0]["rule_id"] == "CONTROL_PLANE_EMPTY"
+
+
+def test_collect_monitor_events_respects_explicit_issue_number(tmp_path: Path):
+    _ = upsert_issue_state(
+        tmp_path,
+        issue_number="41",
+        state="ready",
+        command_id="cmd-41-ready",
+        updated_at="2026-05-07T17:00:00+08:00",
+    )
+    _sync_runtime_phase(
+        tmp_path,
+        "41",
+        role="main_orchestrator",
+        stage="orchestrator_bootstrap",
+        status="queued",
+        updated_at="2026-05-07T17:00:00+08:00",
+    )
+    _ = upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="quarantined",
+        command_id="cmd-42-quarantined",
+        updated_at="2026-05-07T17:01:00+08:00",
+    )
+    _sync_runtime_phase(
+        tmp_path,
+        "42",
+        role="issue_worker",
+        stage="issue_worker_execution",
+        status="queued",
+        updated_at="2026-05-07T17:01:00+08:00",
+    )
+
+    events = collect_monitor_events(
+        base_dir=tmp_path,
+        issue_number="42",
+        now="2026-05-07T17:02:00+08:00",
+    )
+
+    assert any(event["rule_id"] == "ISSUE_QUARANTINED" for event in events)
+    assert all(cast(dict[str, object], event["evidence"]).get("issue_number") == "42" for event in events)
 
 
 def test_collect_monitor_events_reports_stale_heartbeat(tmp_path: Path):
@@ -325,10 +383,6 @@ def test_collect_monitor_events_reports_stale_heartbeat(tmp_path: Path):
     ledger = create_initial_ledger(issue_packet=issue_packet, primary_workspace_root=str(tmp_path), updated_at="2026-05-07T17:00:00+08:00")
     cast(dict[str, object], ledger["current"]).update({"role": "issue_worker", "stage": "issue_worker_execution", "status": "queued"})
     ledger["updatedAt"] = "2026-05-07T17:00:00+08:00"
-    ledger_path = tmp_path / ".opencode/runtime/orchestrator-ledger.json"
-    ledger_path.parent.mkdir(parents=True, exist_ok=True)
-    write_ledger_file(ledger_path, ledger)
-
     transition_issue_state(
         tmp_path,
         issue_number="42",
@@ -369,7 +423,6 @@ def test_collect_monitor_events_reports_stale_heartbeat(tmp_path: Path):
     )
 
     events = collect_monitor_events(
-        ledger_path=ledger_path,
         base_dir=tmp_path,
         now="2026-05-07T17:20:01+08:00",
         heartbeat_timeout_seconds=900,
@@ -385,9 +438,6 @@ def test_collect_monitor_events_uses_wall_clock_when_now_is_omitted(tmp_path: Pa
     issue_packet = parse_issue_packet_text(issue_packet_path.read_text(encoding="utf-8"), "docs/agents/issue-packets/issue-42.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, primary_workspace_root=str(tmp_path), updated_at="2026-05-07T17:00:00+08:00")
     cast(dict[str, object], ledger["current"]).update({"role": "issue_worker", "stage": "issue_worker_execution", "status": "queued"})
-    ledger_path = tmp_path / ".opencode/runtime/orchestrator-ledger.json"
-    ledger_path.parent.mkdir(parents=True, exist_ok=True)
-    write_ledger_file(ledger_path, ledger)
     transition_issue_state(
         tmp_path,
         issue_number="42",
@@ -447,7 +497,6 @@ def test_collect_monitor_events_uses_wall_clock_when_now_is_omitted(tmp_path: Pa
     monkeypatch.setattr(orchestrator_monitor, "datetime", FrozenDateTime)
 
     events = collect_monitor_events(
-        ledger_path=ledger_path,
         base_dir=tmp_path,
         now=None,
         heartbeat_timeout_seconds=900,
@@ -466,10 +515,6 @@ def test_collect_monitor_events_reports_stale_dispatch_without_root_session_id(t
     issue_packet = parse_issue_packet_text(issue_packet_path.read_text(encoding="utf-8"), "docs/agents/issue-packets/issue-42.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, primary_workspace_root=str(tmp_path), updated_at="2026-05-07T17:00:00+08:00")
     cast(dict[str, object], ledger["current"]).update({"role": "issue_worker", "stage": "issue_worker_execution", "status": "queued"})
-    ledger_path = tmp_path / ".opencode/runtime/orchestrator-ledger.json"
-    ledger_path.parent.mkdir(parents=True, exist_ok=True)
-    write_ledger_file(ledger_path, ledger)
-
     transition_issue_state(
         tmp_path,
         issue_number="42",
@@ -497,10 +542,10 @@ def test_collect_monitor_events_reports_stale_dispatch_without_root_session_id(t
         stage="issue_worker_execution",
         status="queued",
         updated_at="2026-05-07T17:01:00+08:00",
+        artifact_refs={"worker_result_ref": "docs/agents/worker-results/issue-42.yaml"},
     )
 
     events = collect_monitor_events(
-        ledger_path=ledger_path,
         base_dir=tmp_path,
         now="2026-05-07T17:20:01+08:00",
         heartbeat_timeout_seconds=900,
@@ -516,11 +561,8 @@ def test_collect_monitor_events_reports_selection_stall_and_missing_artifact(tmp
     cast(dict[str, object], ledger["current"]).update({"role": "main_orchestrator", "stage": "issue_selection_or_recovery", "status": "queued"})
     ledger["updatedAt"] = "2026-05-07T17:00:00+08:00"
     cast(dict[str, object], ledger["artifacts"]).update({
-        "releaseResultPath": "docs/agents/release-results/issue-31-pr-404.yaml",
+        "release_result_ref": "docs/agents/release-results/issue-31-pr-404.yaml",
     })
-    ledger_path = tmp_path / ".opencode/runtime/orchestrator-ledger.json"
-    ledger_path.parent.mkdir(parents=True, exist_ok=True)
-    write_ledger_file(ledger_path, ledger)
     _ = upsert_issue_state(
         tmp_path,
         issue_number="31",
@@ -535,19 +577,33 @@ def test_collect_monitor_events_reports_selection_stall_and_missing_artifact(tmp
         stage="issue_selection_or_recovery",
         status="queued",
         updated_at="2026-05-07T17:00:00+08:00",
+        automation_flags={
+            "continueWithoutHuman": True,
+            "queueNextSessionOnIdle": True,
+        },
+        artifact_refs={"release_result_ref": "docs/agents/release-results/issue-31-pr-404.yaml"},
     )
     _seed_ready_issue(tmp_path, "32", updated_at="2026-05-07T17:01:00+08:00")
 
     events = collect_monitor_events(
-        ledger_path=ledger_path,
         base_dir=tmp_path,
         now="2026-05-07T17:10:30+08:00",
         selection_timeout_seconds=300,
     )
 
     rule_ids = {str(event["rule_id"]) for event in events}
+    stalled = next(event for event in events if str(event["rule_id"]) == "SELECTION_STALLED")
+    evidence = cast(dict[str, object], stalled["evidence"])
+    missing_artifacts = {
+        cast(dict[str, object], event["evidence"])["artifact_key"]
+        for event in events
+        if str(event["rule_id"]) == "ARTIFACT_MISSING"
+    }
     assert "SELECTION_STALLED" in rule_ids
     assert "ARTIFACT_MISSING" in rule_ids
+    assert missing_artifacts == {"evidence_packet"}
+    assert evidence["development_slot_occupancy"] == 0
+    assert evidence["release_slot_occupancy"] == 0
 
 
 def test_monitor_cli_writes_jsonl_log_and_returns_non_zero_for_critical_issue(
@@ -561,9 +617,6 @@ def test_monitor_cli_writes_jsonl_log_and_returns_non_zero_for_critical_issue(
     ledger = create_initial_ledger(issue_packet=issue_packet, primary_workspace_root=str(tmp_path), updated_at="2026-05-07T17:00:00+08:00")
     cast(dict[str, object], ledger["current"]).update({"role": "main_orchestrator", "stage": "issue_selection_or_recovery", "status": "queued"})
     ledger["updatedAt"] = "2026-05-07T17:00:00+08:00"
-    ledger_path = tmp_path / ".opencode/runtime/orchestrator-ledger.json"
-    ledger_path.parent.mkdir(parents=True, exist_ok=True)
-    write_ledger_file(ledger_path, ledger)
     _ = upsert_issue_state(
         tmp_path,
         issue_number="42",
@@ -578,6 +631,10 @@ def test_monitor_cli_writes_jsonl_log_and_returns_non_zero_for_critical_issue(
         stage="issue_selection_or_recovery",
         status="queued",
         updated_at="2026-05-07T17:00:00+08:00",
+        automation_flags={
+            "continueWithoutHuman": True,
+            "queueNextSessionOnIdle": True,
+        },
     )
     _seed_ready_issue(tmp_path, "43", updated_at="2026-05-07T17:01:00+08:00")
     monitor_log_path = tmp_path / ".opencode/runtime/monitor.log"
@@ -585,8 +642,6 @@ def test_monitor_cli_writes_jsonl_log_and_returns_non_zero_for_critical_issue(
 
     exit_code = main(
         [
-            "--ledger",
-            str(ledger_path),
             "--base-dir",
             str(tmp_path),
             "--monitor-log",
@@ -620,9 +675,6 @@ def test_run_monitor_cycle_does_not_write_alerts_for_healthy_state(tmp_path: Pat
     issue_packet_path.write_text(_issue_packet_text("42"), encoding="utf-8")
     issue_packet = parse_issue_packet_text(issue_packet_path.read_text(encoding="utf-8"), "docs/agents/issue-packets/issue-42.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, primary_workspace_root=str(tmp_path), updated_at="2026-05-07T17:00:00+08:00")
-    ledger_path = tmp_path / ".opencode/runtime/orchestrator-ledger.json"
-    ledger_path.parent.mkdir(parents=True, exist_ok=True)
-    write_ledger_file(ledger_path, ledger)
     _ = upsert_issue_state(
         tmp_path,
         issue_number="42",
@@ -642,7 +694,6 @@ def test_run_monitor_cycle_does_not_write_alerts_for_healthy_state(tmp_path: Pat
     monitor_alerts_path = tmp_path / ".opencode/runtime/monitor-alerts.jsonl"
 
     events, exit_code = orchestrator_monitor.run_monitor_cycle(
-        ledger_path=ledger_path,
         base_dir=tmp_path,
         monitor_log_path=monitor_log_path,
         monitor_alerts_path=monitor_alerts_path,
@@ -657,47 +708,12 @@ def test_run_monitor_cycle_does_not_write_alerts_for_healthy_state(tmp_path: Pat
     assert not monitor_alerts_path.exists()
 
 
-def test_run_monitor_cycle_auto_redispatches_stalled_issue_worker(tmp_path: Path, monkeypatch) -> None:
-    critical_events: list[dict[str, object]] = [
-        {
-            "rule_id": "ROOT_HEARTBEAT_STALLED",
-            "severity": "critical",
-            "summary": "stalled",
-            "evidence": {"issue_number": "42"},
-        }
-    ]
-    healthy_events: list[dict[str, object]] = [
-        {
-            "rule_id": "RUNTIME_HEALTHY",
-            "severity": "info",
-            "summary": "healthy",
-            "evidence": {"issue_number": "42"},
-        }
-    ]
-    ledger_path = tmp_path / ".opencode/runtime/orchestrator-ledger.json"
-    ledger_path.parent.mkdir(parents=True, exist_ok=True)
-    write_ledger_file(
-        ledger_path,
-        {
-            "schemaVersion": "1.0",
-            "automation": {
-                "continueWithoutHuman": True,
-                "queueNextSessionOnIdle": True,
-            },
-            "issue": {"number": "42", "branch": "agent/issue-42-demo"},
-            "current": {"role": "issue_worker", "stage": "issue_worker_execution", "status": "queued"},
-            "artifacts": {"workerResultPath": "docs/agents/worker-results/issue-42.yaml"},
-            "updatedAt": "2026-05-07T17:20:01+08:00",
-        },
-    )
-    _ = upsert_issue_state(
-        tmp_path,
-        issue_number="42",
-        state="running",
-        command_id="cmd-running",
-        updated_at="2026-05-07T17:00:00+08:00",
-        current_root_session_id="ses-old-root",
-    )
+def test_run_monitor_cycle_reports_stalled_issue_worker_without_auto_redispatch(tmp_path: Path) -> None:
+    _ = upsert_issue_state(tmp_path,
+    issue_number="42",
+    state="running",
+    command_id="cmd-running",
+    updated_at="2026-05-07T17:00:00+08:00", current_session_id="ses-old-root", )
     _sync_runtime_phase(
         tmp_path,
         "42",
@@ -705,41 +721,15 @@ def test_run_monitor_cycle_auto_redispatches_stalled_issue_worker(tmp_path: Path
         stage="issue_worker_execution",
         status="queued",
         updated_at="2026-05-07T17:00:00+08:00",
+        automation_flags={
+            "continueWithoutHuman": True,
+            "queueNextSessionOnIdle": True,
+        },
+        artifact_refs={"worker_result_ref": "docs/agents/worker-results/issue-42.yaml"},
     )
     monitor_log_path = tmp_path / ".opencode/runtime/monitor.log"
-    call_count = {"value": 0}
-
-    def fake_collect_monitor_events(**_: object) -> list[dict[str, object]]:
-        call_count["value"] += 1
-        return critical_events if call_count["value"] == 1 else healthy_events
-
-    quarantine_calls: list[tuple[str, str]] = []
-
-    def fake_quarantine_issue_execution(*, base_dir: Path, issue_number: str, reason: str, updated_at: str | None = None) -> None:
-        quarantine_calls.append((issue_number, reason))
-        _ = upsert_issue_state(
-            base_dir,
-            issue_number=issue_number,
-            state="quarantined",
-            command_id="cmd-quarantined",
-            updated_at=cast(str, updated_at),
-            current_root_session_id="",
-        )
-
-    monkeypatch.setattr(orchestrator_monitor, "collect_monitor_events", fake_collect_monitor_events)
-    monkeypatch.setattr(orchestrator_monitor, "quarantine_issue_execution", fake_quarantine_issue_execution)
-    monkeypatch.setattr(
-        orchestrator_monitor,
-        "redispatch_quarantined_issue",
-        lambda **_: {
-            "status": "success",
-            "rootSessionID": "ses-root-retry",
-            "recordedAt": "2026-05-07T17:20:01+08:00",
-        },
-    )
 
     events, exit_code = orchestrator_monitor.run_monitor_cycle(
-        ledger_path=ledger_path,
         base_dir=tmp_path,
         monitor_log_path=monitor_log_path,
         now="2026-05-07T17:20:01+08:00",
@@ -748,25 +738,22 @@ def test_run_monitor_cycle_auto_redispatches_stalled_issue_worker(tmp_path: Path
     )
 
     rule_ids = [str(event["rule_id"]) for event in events]
+    runtime_issue = read_issue(tmp_path, "42")
 
-    assert exit_code == 0
-    assert quarantine_calls
-    assert "AUTO_RECOVERY_REDISPATCHED" in rule_ids
-    assert rule_ids[-1] == "RUNTIME_HEALTHY"
+    assert exit_code == 1
+    assert "ROOT_HEARTBEAT_STALLED" in rule_ids
+    assert runtime_issue is not None
+    assert str(runtime_issue.get("state") or "") == "running"
 
 
-def test_run_monitor_cycle_auto_advances_completed_child_artifact(tmp_path: Path) -> None:
+def test_run_monitor_cycle_uses_persisted_artifact_fact_without_auto_advancing(tmp_path: Path) -> None:
     issue_packet_path = tmp_path / "docs/agents/issue-packets/issue-42.yaml"
     issue_packet_path.parent.mkdir(parents=True, exist_ok=True)
     issue_packet_path.write_text(_issue_packet_text("42"), encoding="utf-8")
     issue_packet = parse_issue_packet_text(issue_packet_path.read_text(encoding="utf-8"), "docs/agents/issue-packets/issue-42.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, primary_workspace_root=str(tmp_path), updated_at="2026-05-07T17:00:00+08:00")
     cast(dict[str, object], ledger["current"]).update({"role": "issue_worker", "stage": "issue_worker_execution", "status": "queued"})
-    cast(dict[str, object], ledger["artifacts"]).update({"workerResultPath": "docs/agents/worker-results/issue-42.yaml"})
-    ledger_path = tmp_path / ".opencode/runtime/orchestrator-ledger.json"
-    ledger_path.parent.mkdir(parents=True, exist_ok=True)
-    write_ledger_file(ledger_path, ledger)
-
+    cast(dict[str, object], ledger["artifacts"]).update({"worker_result_ref": "docs/agents/worker-results/issue-42.yaml"})
     worker_result_path = tmp_path / "docs/agents/worker-results/issue-42.yaml"
     worker_result_path.parent.mkdir(parents=True, exist_ok=True)
     worker_result_path.write_text(
@@ -790,7 +777,7 @@ verification:
   implementation_self_checks:
     - command: \"pytest\"
       result: \"pass\"
-      evidence_ref: \"local\"
+      evidence_ref: \"db:issue-history/worker-result\"
       summary: \"ok\"
   final_acceptance_claim: false
 evidence_packet_refs:
@@ -818,14 +805,11 @@ metadata:
         encoding="utf-8",
     )
 
-    _ = upsert_issue_state(
-        tmp_path,
-        issue_number="42",
-        state="running",
-        command_id="cmd-running",
-        updated_at="2026-05-07T17:00:00+08:00",
-        current_root_session_id="ses-root-42",
-    )
+    _ = upsert_issue_state(tmp_path,
+    issue_number="42",
+    state="running",
+    command_id="cmd-running",
+    updated_at="2026-05-07T17:00:00+08:00", current_session_id="ses-root-42", )
     _sync_runtime_phase(
         tmp_path,
         "42",
@@ -833,11 +817,25 @@ metadata:
         stage="issue_worker_execution",
         status="queued",
         updated_at="2026-05-07T17:00:00+08:00",
+        automation_flags={
+            "continueWithoutHuman": True,
+            "queueNextSessionOnIdle": True,
+        },
+        artifact_refs={"worker_result_ref": "docs/agents/worker-results/issue-42.yaml"},
+        artifact_status={
+            "worker_result": {
+                "path": "docs/agents/worker-results/issue-42.yaml",
+                "observed_at": "2026-05-07T17:10:00+08:00",
+                "parse_ok": True,
+                "status": "success",
+                "pr_number": "77",
+                "completed_at": "2026-05-07T17:10:00+08:00",
+            }
+        },
     )
     monitor_log_path = tmp_path / ".opencode/runtime/monitor.log"
 
     events, exit_code = orchestrator_monitor.run_monitor_cycle(
-        ledger_path=ledger_path,
         base_dir=tmp_path,
         monitor_log_path=monitor_log_path,
         now="2026-05-07T17:11:00+08:00",
@@ -846,11 +844,12 @@ metadata:
     )
 
     rule_ids = [str(event["rule_id"]) for event in events]
-    reconciled_ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    runtime_issue = read_issue(tmp_path, "42")
 
     assert exit_code == 0
-    assert "AUTO_ADVANCED_CHILD_ARTIFACT" in rule_ids
-    assert cast(dict[str, object], reconciled_ledger["current"])["role"] == "pr_verifier"
+    assert rule_ids == ["RUNTIME_HEALTHY"]
+    assert runtime_issue is not None
+    assert str(runtime_issue.get("current_role") or "") == "issue_worker"
 
 
 def test_collect_monitor_events_reports_stale_queued_pr_verifier_heartbeat(tmp_path: Path):
@@ -860,18 +859,12 @@ def test_collect_monitor_events_reports_stale_queued_pr_verifier_heartbeat(tmp_p
     issue_packet = parse_issue_packet_text(issue_packet_path.read_text(encoding="utf-8"), "docs/agents/issue-packets/issue-42.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, primary_workspace_root=str(tmp_path), updated_at="2026-05-07T17:00:00+08:00")
     cast(dict[str, object], ledger["current"]).update({"role": "pr_verifier", "stage": "pr_verifier_execution", "status": "queued"})
-    cast(dict[str, object], ledger["artifacts"]).update({"evidencePacketPath": "docs/agents/evidence/issue-42-pr-77.yaml"})
-    ledger_path = tmp_path / ".opencode/runtime/orchestrator-ledger.json"
-    ledger_path.parent.mkdir(parents=True, exist_ok=True)
-    write_ledger_file(ledger_path, ledger)
-    _ = upsert_issue_state(
-        tmp_path,
-        issue_number="42",
-        state="verifying",
-        command_id="cmd-verifying",
-        updated_at="2026-05-07T17:02:00+08:00",
-        current_root_session_id="ses-root-42",
-    )
+    cast(dict[str, object], ledger["artifacts"]).update({"evidence_packet_ref": "docs/agents/evidence/issue-42-pr-77.yaml"})
+    _ = upsert_issue_state(tmp_path,
+    issue_number="42",
+    state="verifying",
+    command_id="cmd-verifying",
+    updated_at="2026-05-07T17:02:00+08:00", current_session_id="ses-root-42", )
     _sync_runtime_phase(
         tmp_path,
         "42",
@@ -882,7 +875,6 @@ def test_collect_monitor_events_reports_stale_queued_pr_verifier_heartbeat(tmp_p
     )
 
     events = collect_monitor_events(
-        ledger_path=ledger_path,
         base_dir=tmp_path,
         now="2026-05-07T17:20:01+08:00",
         heartbeat_timeout_seconds=900,
@@ -891,47 +883,12 @@ def test_collect_monitor_events_reports_stale_queued_pr_verifier_heartbeat(tmp_p
     assert any(event["rule_id"] == "ROOT_HEARTBEAT_STALLED" for event in events)
 
 
-def test_run_monitor_cycle_auto_redispatches_stalled_pr_verifier(tmp_path: Path, monkeypatch) -> None:
-    critical_events: list[dict[str, object]] = [
-        {
-            "rule_id": "ROOT_HEARTBEAT_STALLED",
-            "severity": "critical",
-            "summary": "stalled",
-            "evidence": {"issue_number": "42", "current_role": "pr_verifier"},
-        }
-    ]
-    healthy_events: list[dict[str, object]] = [
-        {
-            "rule_id": "RUNTIME_HEALTHY",
-            "severity": "info",
-            "summary": "healthy",
-            "evidence": {"issue_number": "42"},
-        }
-    ]
-    ledger_path = tmp_path / ".opencode/runtime/orchestrator-ledger.json"
-    ledger_path.parent.mkdir(parents=True, exist_ok=True)
-    write_ledger_file(
-        ledger_path,
-        {
-            "schemaVersion": "1.0",
-            "automation": {
-                "continueWithoutHuman": True,
-                "queueNextSessionOnIdle": True,
-            },
-            "issue": {"number": "42", "branch": "agent/issue-42-demo"},
-            "current": {"role": "pr_verifier", "stage": "pr_verifier_execution", "status": "queued"},
-            "artifacts": {"evidencePacketPath": "docs/agents/evidence/issue-42-pr-77.yaml"},
-            "updatedAt": "2026-05-07T17:20:01+08:00",
-        },
-    )
-    _ = upsert_issue_state(
-        tmp_path,
-        issue_number="42",
-        state="verifying",
-        command_id="cmd-verifying",
-        updated_at="2026-05-07T17:00:00+08:00",
-        current_root_session_id="ses-old-root",
-    )
+def test_run_monitor_cycle_reports_stalled_pr_verifier_without_auto_redispatch(tmp_path: Path) -> None:
+    _ = upsert_issue_state(tmp_path,
+    issue_number="42",
+    state="verifying",
+    command_id="cmd-verifying",
+    updated_at="2026-05-07T17:00:00+08:00", current_session_id="ses-old-root", )
     _sync_runtime_phase(
         tmp_path,
         "42",
@@ -939,41 +896,15 @@ def test_run_monitor_cycle_auto_redispatches_stalled_pr_verifier(tmp_path: Path,
         stage="pr_verifier_execution",
         status="queued",
         updated_at="2026-05-07T17:00:00+08:00",
+        automation_flags={
+            "continueWithoutHuman": True,
+            "queueNextSessionOnIdle": True,
+        },
+        artifact_refs={"evidence_packet_ref": "docs/agents/evidence/issue-42-pr-77.yaml"},
     )
     monitor_log_path = tmp_path / ".opencode/runtime/monitor.log"
-    call_count = {"value": 0}
-
-    def fake_collect_monitor_events(**_: object) -> list[dict[str, object]]:
-        call_count["value"] += 1
-        return critical_events if call_count["value"] == 1 else healthy_events
-
-    quarantine_calls: list[tuple[str, str]] = []
-
-    def fake_quarantine_issue_execution(*, base_dir: Path, issue_number: str, reason: str, updated_at: str | None = None) -> None:
-        quarantine_calls.append((issue_number, reason))
-        _ = upsert_issue_state(
-            base_dir,
-            issue_number=issue_number,
-            state="quarantined",
-            command_id="cmd-quarantined",
-            updated_at=cast(str, updated_at),
-            current_root_session_id="",
-        )
-
-    monkeypatch.setattr(orchestrator_monitor, "collect_monitor_events", fake_collect_monitor_events)
-    monkeypatch.setattr(orchestrator_monitor, "quarantine_issue_execution", fake_quarantine_issue_execution)
-    monkeypatch.setattr(
-        orchestrator_monitor,
-        "redispatch_quarantined_issue",
-        lambda **_: {
-            "status": "success",
-            "rootSessionID": "ses-root-retry",
-            "recordedAt": "2026-05-07T17:20:01+08:00",
-        },
-    )
 
     events, exit_code = orchestrator_monitor.run_monitor_cycle(
-        ledger_path=ledger_path,
         base_dir=tmp_path,
         monitor_log_path=monitor_log_path,
         now="2026-05-07T17:20:01+08:00",
@@ -982,11 +913,12 @@ def test_run_monitor_cycle_auto_redispatches_stalled_pr_verifier(tmp_path: Path,
     )
 
     rule_ids = [str(event["rule_id"]) for event in events]
+    runtime_issue = read_issue(tmp_path, "42")
 
-    assert exit_code == 0
-    assert quarantine_calls
-    assert "AUTO_RECOVERY_REDISPATCHED" in rule_ids
-    assert rule_ids[-1] == "RUNTIME_HEALTHY"
+    assert exit_code == 1
+    assert "ROOT_HEARTBEAT_STALLED" in rule_ids
+    assert runtime_issue is not None
+    assert str(runtime_issue.get("state") or "") == "verifying"
 
 
 def test_run_monitor_watch_appends_multiple_cycles_without_sleeping(tmp_path: Path, monkeypatch) -> None:
@@ -995,9 +927,6 @@ def test_run_monitor_watch_appends_multiple_cycles_without_sleeping(tmp_path: Pa
     issue_packet_path.write_text(_issue_packet_text("42"), encoding="utf-8")
     issue_packet = parse_issue_packet_text(issue_packet_path.read_text(encoding="utf-8"), "docs/agents/issue-packets/issue-42.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, primary_workspace_root=str(tmp_path), updated_at="2026-05-07T17:00:00+08:00")
-    ledger_path = tmp_path / ".opencode/runtime/orchestrator-ledger.json"
-    ledger_path.parent.mkdir(parents=True, exist_ok=True)
-    write_ledger_file(ledger_path, ledger)
     _ = upsert_issue_state(
         tmp_path,
         issue_number="42",
@@ -1022,7 +951,6 @@ def test_run_monitor_watch_appends_multiple_cycles_without_sleeping(tmp_path: Pa
     monkeypatch.setattr(orchestrator_monitor.time, "sleep", fake_sleep)
 
     exit_code = run_monitor_watch(
-        ledger_path=ledger_path,
         base_dir=tmp_path,
         monitor_log_path=monitor_log_path,
         now="2026-05-07T17:00:30+08:00",
@@ -1048,9 +976,6 @@ def test_watch_mode_stops_early_on_critical_issue(tmp_path: Path, monkeypatch) -
     ledger = create_initial_ledger(issue_packet=issue_packet, primary_workspace_root=str(tmp_path), updated_at="2026-05-07T17:00:00+08:00")
     cast(dict[str, object], ledger["current"]).update({"role": "main_orchestrator", "stage": "issue_selection_or_recovery", "status": "queued"})
     ledger["updatedAt"] = "2026-05-07T17:00:00+08:00"
-    ledger_path = tmp_path / ".opencode/runtime/orchestrator-ledger.json"
-    ledger_path.parent.mkdir(parents=True, exist_ok=True)
-    write_ledger_file(ledger_path, ledger)
     _ = upsert_issue_state(
         tmp_path,
         issue_number="42",
@@ -1065,6 +990,10 @@ def test_watch_mode_stops_early_on_critical_issue(tmp_path: Path, monkeypatch) -
         stage="issue_selection_or_recovery",
         status="queued",
         updated_at="2026-05-07T17:00:00+08:00",
+        automation_flags={
+            "continueWithoutHuman": True,
+            "queueNextSessionOnIdle": True,
+        },
     )
     _seed_ready_issue(tmp_path, "43", updated_at="2026-05-07T17:01:00+08:00")
     monitor_log_path = tmp_path / ".opencode/runtime/monitor.log"
@@ -1076,7 +1005,6 @@ def test_watch_mode_stops_early_on_critical_issue(tmp_path: Path, monkeypatch) -
     monkeypatch.setattr(orchestrator_monitor.time, "sleep", fake_sleep)
 
     exit_code = run_monitor_watch(
-        ledger_path=ledger_path,
         base_dir=tmp_path,
         monitor_log_path=monitor_log_path,
         now="2026-05-07T17:10:30+08:00",

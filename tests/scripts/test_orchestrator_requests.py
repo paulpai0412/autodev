@@ -5,16 +5,14 @@ from typing import cast
 from scripts import orchestrator_requests
 
 
-def test_build_prompt_for_main_orchestrator_requires_foreground_child_subagents() -> None:
+def test_build_prompt_for_main_orchestrator_excludes_release_worker_child_subagent() -> None:
     ledger = cast(dict[str, object], {
         "automation": {"primaryWorkspaceRoot": "/tmp/project"},
         "issue": {
             "number": "6",
             "branch": "agent/issue-6-demo",
-            "issuePacketPath": "docs/agents/issue-packets/issue-6.yaml",
         },
         "workflow": {
-            "checkpointPath": "docs/agents/runtime/context-checkpoint.yaml",
             "workflowPolicyPath": "docs/agents/autonomous-development-workflow.yaml",
         },
         "artifacts": {},
@@ -30,9 +28,11 @@ def test_build_prompt_for_main_orchestrator_requires_foreground_child_subagents(
     )
 
     assert 'task(subagent_type="general", ..., run_in_background=false)' in prompt
-    assert "Before launching the first child subagent, run the supervisor reconcile command once" in prompt
-    assert "After each child artifact is written, advance the queued child role with:" in prompt
-    assert "advance-child --ledger .opencode/runtime/orchestrator-ledger.json" in prompt
+    assert "Run issue_worker and pr_verifier as subagents" in prompt
+    assert "Do not launch release_worker from this root session" in prompt
+    assert "Run issue_worker, pr_verifier, and release_worker" not in prompt
+    assert "DB-backed control plane" in prompt
+    assert "Use the DB-backed supervisor reconcile flow before the first issue_worker launch" in prompt
     assert "Use the first supervisor decision to confirm the issue_worker dispatch" in prompt
     assert "Wait for each child task call to finish in the foreground before continuing." in prompt
     assert "Do not include karpathy-guidelines in load_skills for child subagents" not in prompt
@@ -44,10 +44,8 @@ def test_build_prompt_for_main_orchestrator_uses_authoritative_shared_runtime_pa
         "issue": {
             "number": "6",
             "branch": "agent/issue-6-demo",
-            "issuePacketPath": "docs/agents/issue-packets/issue-6.yaml",
         },
         "workflow": {
-            "checkpointPath": "docs/agents/runtime/context-checkpoint.yaml",
             "workflowPolicyPath": "/shared/autodev/docs/agents/autonomous-development-workflow.yaml",
         },
         "artifacts": {},
@@ -64,8 +62,10 @@ def test_build_prompt_for_main_orchestrator_uses_authoritative_shared_runtime_pa
 
     assert "The authoritative shared workflow policy is /shared/autodev/docs/agents/autonomous-development-workflow.yaml." in prompt
     assert "The authoritative nonstop supervisor doc is /shared/autodev/docs/agents/runtime/nonstop-supervisor-loop.md." in prompt
-    assert 'PYTHONPATH="/shared/autodev" python3 "/shared/autodev/scripts/orchestrator_supervisor.py" reconcile --ledger .opencode/runtime/orchestrator-ledger.json' in prompt
-    assert 'PYTHONPATH="/shared/autodev" python3 "/shared/autodev/scripts/orchestrator_supervisor.py" advance-child --ledger .opencode/runtime/orchestrator-ledger.json' in prompt
+    assert "Bootstrap from the SQLite-backed control plane" in prompt
+    assert "Use the DB-backed supervisor reconcile flow before the first issue_worker launch" in prompt
+    assert 'PYTHONPATH="/shared/autodev" python3 "/shared/autodev/scripts/orchestrator_supervisor.py" submit-artifact' in prompt
+    assert 'python3 "/tmp/project/scripts/orchestrator_supervisor.py"' not in prompt
 
 
 def test_build_prompt_uses_primary_workspace_absolute_artifact_paths() -> None:
@@ -74,16 +74,14 @@ def test_build_prompt_uses_primary_workspace_absolute_artifact_paths() -> None:
         "issue": {
             "number": "8",
             "branch": "agent/issue-8-demo",
-            "issuePacketPath": "docs/agents/issue-packets/issue-8.yaml",
         },
         "workflow": {
-            "checkpointPath": "docs/agents/runtime/context-checkpoint.yaml",
             "workflowPolicyPath": "docs/agents/autonomous-development-workflow.yaml",
         },
         "artifacts": {
-            "workerResultPath": "docs/agents/worker-results/issue-8.yaml",
-            "evidencePacketPath": "docs/agents/evidence/issue-8-pr-12.yaml",
-            "releaseResultPath": "docs/agents/release-results/issue-8-pr-12.yaml",
+            "worker_result_ref": "docs/agents/worker-results/issue-8.yaml",
+            "evidence_packet_ref": "docs/agents/evidence/issue-8-pr-12.yaml",
+            "release_result_ref": "docs/agents/release-results/issue-8-pr-12.yaml",
         },
     })
 
@@ -104,25 +102,30 @@ def test_build_prompt_uses_primary_workspace_absolute_artifact_paths() -> None:
         default_release_result_template_path="docs/agents/release-result-template.yaml",
     )
 
-    assert "/tmp/project/docs/agents/worker-results/issue-8.yaml" in verifier_prompt
-    assert "/tmp/project/docs/agents/evidence/issue-8-pr-12.yaml" in verifier_prompt
-    assert "/tmp/project/docs/agents/evidence/issue-8-pr-12.yaml" in release_prompt
-    assert "/tmp/project/docs/agents/release-results/issue-8-pr-12.yaml" in release_prompt
+    assert "submit-artifact" in verifier_prompt
+    assert "submit-artifact" in release_prompt
+    assert "python3 scripts/orchestrator_supervisor.py" in verifier_prompt
+    assert "must not be required for progress" not in verifier_prompt
+    assert "must not be required for progress" not in release_prompt
 
 
-def test_build_prompt_for_release_worker_mentions_workflow_start_approval_override() -> None:
+def test_build_prompt_for_release_worker_mentions_release_approval_override() -> None:
     ledger = cast(dict[str, object], {
         "issue": {
             "number": "7",
             "branch": "agent/issue-7-demo",
         },
         "workflow": {
-            "checkpointPath": "docs/agents/runtime/context-checkpoint.yaml",
             "workflowPolicyPath": "docs/agents/autonomous-development-workflow.yaml",
+            "runtimeControls": {
+                "approval_override_mode": "bypass_approval",
+                "override_source": "user_requested_autodev_release",
+                "human_approval_skipped": True,
+            },
         },
         "artifacts": {
-            "evidencePacketPath": "docs/agents/evidence/issue-7-pr-11.yaml",
-            "releaseResultPath": "docs/agents/release-results/issue-7-pr-11.yaml",
+            "evidence_packet_ref": "docs/agents/evidence/issue-7-pr-11.yaml",
+            "release_result_ref": "docs/agents/release-results/issue-7-pr-11.yaml",
         },
     })
 
@@ -135,12 +138,14 @@ def test_build_prompt_for_release_worker_mentions_workflow_start_approval_overri
         default_release_result_template_path="docs/agents/release-result-template.yaml",
     )
 
-    assert "Read the runtime_controls block in the checkpoint" in prompt
+    assert "Read the release runtime controls from the DB-backed control-plane context" in prompt
     assert "approval_override_mode" in prompt
     assert "bypass_approval" in prompt
     assert "human approval requirement" in prompt
     assert "merge_approval_mode" in prompt
     assert "override_scope" in prompt
+    assert "return control to the supervisor/release command result" in prompt
+    assert "return control to the main_orchestrator root session" not in prompt
 
 
 def test_build_prompt_for_pr_verifier_requires_evidence_packet_before_completion() -> None:
@@ -148,15 +153,13 @@ def test_build_prompt_for_pr_verifier_requires_evidence_packet_before_completion
         "issue": {
             "number": "8",
             "branch": "agent/issue-8-demo",
-            "issuePacketPath": "docs/agents/issue-packets/issue-8.yaml",
         },
         "workflow": {
-            "checkpointPath": "docs/agents/runtime/context-checkpoint.yaml",
             "workflowPolicyPath": "docs/agents/autonomous-development-workflow.yaml",
         },
         "artifacts": {
-            "workerResultPath": "docs/agents/worker-results/issue-8.yaml",
-            "evidencePacketPath": "docs/agents/evidence/issue-8-pr-12.yaml",
+            "worker_result_ref": "docs/agents/worker-results/issue-8.yaml",
+            "evidence_packet_ref": "docs/agents/evidence/issue-8-pr-12.yaml",
         },
     })
 
@@ -169,8 +172,8 @@ def test_build_prompt_for_pr_verifier_requires_evidence_packet_before_completion
         default_release_result_template_path="docs/agents/release-result-template.yaml",
     )
 
-    assert "Write docs/agents/evidence/issue-8-pr-12.yaml using docs/agents/evidence-packet-template.yaml." in prompt
-    assert "Do not stop, summarize, or report verification progress until that evidence packet exists" in prompt
+    assert "Persist verifier acceptance or failure as an evidence_packet via submit-artifact" in prompt
+    assert "Do not stop, summarize, or report verification progress until the evidence_packet payload is stored in SQLite" in prompt
 
 
 def test_build_prompt_for_issue_worker_requires_pr_metadata_before_success() -> None:
@@ -179,14 +182,12 @@ def test_build_prompt_for_issue_worker_requires_pr_metadata_before_success() -> 
         "issue": {
             "number": "18",
             "branch": "agent/issue-18-demo",
-            "issuePacketPath": "docs/agents/issue-packets/issue-18.yaml",
         },
         "workflow": {
-            "checkpointPath": "docs/agents/runtime/context-checkpoint.yaml",
             "workflowPolicyPath": "docs/agents/autonomous-development-workflow.yaml",
         },
         "artifacts": {
-            "workerResultPath": "docs/agents/worker-results/issue-18.yaml",
+            "worker_result_ref": "docs/agents/worker-results/issue-18.yaml",
         },
     })
 
@@ -199,9 +200,35 @@ def test_build_prompt_for_issue_worker_requires_pr_metadata_before_success() -> 
         default_release_result_template_path="docs/agents/release-result-template.yaml",
     )
 
-    assert "Do not write status: success until the branch is pushed, the PR exists" in prompt
-    assert "pr.number plus pr.url are populated in the worker_result" in prompt
-    assert "write blocked or failed instead of success" in prompt
+    assert "Persist the normalized worker_result into SQLite with submit-artifact" in prompt
+    assert "Do not report status=success until the implementation branch is pushed" in prompt
+    assert "Do not create the formal PR" in prompt
+    assert "submit blocked or failed instead of success" in prompt
+
+
+def test_build_prompt_for_pr_verifier_owns_formal_pr_creation() -> None:
+    ledger = cast(dict[str, object], {
+        "issue": {
+            "number": "18",
+            "branch": "agent/issue-18-demo",
+        },
+        "workflow": {
+            "workflowPolicyPath": "docs/agents/autonomous-development-workflow.yaml",
+        },
+        "artifacts": {},
+    })
+
+    prompt = orchestrator_requests.build_prompt(
+        ledger,
+        role="pr_verifier",
+        stage="pr_verifier_execution",
+        decision_summary="verify now",
+        default_supervisor_doc_path="docs/agents/runtime/nonstop-supervisor-loop.md",
+        default_release_result_template_path="docs/agents/release-result-template.yaml",
+    )
+
+    assert "create or record the formal PR" in prompt
+    assert "include pr_number in the evidence_packet payload" in prompt
 
 
 def test_build_prompt_for_local_seeded_issue_avoids_github_issue_assumptions() -> None:
@@ -210,17 +237,15 @@ def test_build_prompt_for_local_seeded_issue_avoids_github_issue_assumptions() -
         "issue": {
             "number": "31",
             "branch": "agent/issue-31-demo",
-            "issuePacketPath": "docs/agents/issue-packets/issue-31.yaml",
             "backingType": "local_seeded",
         },
         "workflow": {
-            "checkpointPath": "docs/agents/runtime/context-checkpoint.yaml",
             "workflowPolicyPath": "docs/agents/autonomous-development-workflow.yaml",
         },
         "artifacts": {
-            "workerResultPath": "docs/agents/worker-results/issue-31.yaml",
-            "evidencePacketPath": "docs/agents/evidence/issue-31-pr-28.yaml",
-            "releaseResultPath": "docs/agents/release-results/issue-31-pr-28.yaml",
+            "worker_result_ref": "docs/agents/worker-results/issue-31.yaml",
+            "evidence_packet_ref": "docs/agents/evidence/issue-31-pr-28.yaml",
+            "release_result_ref": "docs/agents/release-results/issue-31-pr-28.yaml",
         },
     })
 
@@ -252,16 +277,14 @@ def test_build_prompt_for_github_backed_issue_keeps_github_issue_language() -> N
         "issue": {
             "number": "42",
             "branch": "agent/issue-42-demo",
-            "issuePacketPath": "docs/agents/issue-packets/issue-42.yaml",
             "backingType": "github",
         },
         "workflow": {
-            "checkpointPath": "docs/agents/runtime/context-checkpoint.yaml",
             "workflowPolicyPath": "docs/agents/autonomous-development-workflow.yaml",
         },
         "artifacts": {
-            "evidencePacketPath": "docs/agents/evidence/issue-42-pr-77.yaml",
-            "releaseResultPath": "docs/agents/release-results/issue-42-pr-77.yaml",
+            "evidence_packet_ref": "docs/agents/evidence/issue-42-pr-77.yaml",
+            "release_result_ref": "docs/agents/release-results/issue-42-pr-77.yaml",
         },
     })
 

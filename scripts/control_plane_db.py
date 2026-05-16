@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -15,14 +18,15 @@ CONTROL_PLANE_DB_PATH = Path(".opencode/runtime/control-plane.sqlite3")
 
 ISSUE_COLUMNS: dict[str, str] = {
     "issue_number": "TEXT PRIMARY KEY",
+    "title": "TEXT NOT NULL DEFAULT ''",
+    "branch": "TEXT NOT NULL DEFAULT ''",
     "state": "TEXT NOT NULL DEFAULT 'ready'",
     "rank_score": "REAL NOT NULL DEFAULT 0",
     "lane": "TEXT NOT NULL DEFAULT 'default'",
     "current_role": "TEXT NOT NULL DEFAULT ''",
     "current_stage": "TEXT NOT NULL DEFAULT ''",
     "current_status": "TEXT NOT NULL DEFAULT ''",
-    "current_root_session_id": "TEXT NOT NULL DEFAULT ''",
-    "current_verifier_session_id": "TEXT NOT NULL DEFAULT ''",
+    "current_session_id": "TEXT NOT NULL DEFAULT ''",
     "last_history_id": "INTEGER NOT NULL DEFAULT 0",
     "last_command_id": "TEXT NOT NULL DEFAULT ''",
     "last_event_at": "TEXT NOT NULL DEFAULT ''",
@@ -31,18 +35,24 @@ ISSUE_COLUMNS: dict[str, str] = {
     "dispatching_at": "TEXT NOT NULL DEFAULT ''",
     "running_at": "TEXT NOT NULL DEFAULT ''",
     "verifying_at": "TEXT NOT NULL DEFAULT ''",
+    "verified_at": "TEXT NOT NULL DEFAULT ''",
+    "release_pending_at": "TEXT NOT NULL DEFAULT ''",
     "completed_at": "TEXT NOT NULL DEFAULT ''",
     "failed_at": "TEXT NOT NULL DEFAULT ''",
     "quarantined_at": "TEXT NOT NULL DEFAULT ''",
     "attempts_json": "TEXT NOT NULL DEFAULT '{}'",
     "limits_json": "TEXT NOT NULL DEFAULT '{}'",
     "last_failure_json": "TEXT NOT NULL DEFAULT '{}'",
+    "runtime_context_json": "TEXT NOT NULL DEFAULT '{}'",
+    "latest_refs_json": "TEXT NOT NULL DEFAULT '{}'",
     "resume_snapshot_json": "TEXT NOT NULL DEFAULT '{}'",
     "automation_flags_json": "TEXT NOT NULL DEFAULT '{}'",
     "artifact_refs_json": "TEXT NOT NULL DEFAULT '{}'",
     "artifact_status_json": "TEXT NOT NULL DEFAULT '{}'",
     "issue_packet_json": "TEXT NOT NULL DEFAULT '{}'",
 }
+
+DEVELOPMENT_SLOT_STATES = ("claimed", "dispatching", "running", "verifying")
 
 
 def control_plane_db_path(base_dir: Path) -> Path:
@@ -55,6 +65,19 @@ def _connect(base_dir: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(db_path)
     connection.row_factory = sqlite3.Row
     return connection
+
+
+@contextmanager
+def _connection(base_dir: Path) -> Iterator[sqlite3.Connection]:
+    connection = _connect(base_dir)
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def _json_dumps(payload: Any) -> str:
@@ -73,52 +96,95 @@ def _json_loads_dict(value: Any) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def _issue_packet_exists_locally(base_dir: Path, issue_packet: dict[str, Any]) -> bool:
-    issue_packet_path = str(issue_packet.get("issue_packet_path") or "")
-    if not issue_packet_path:
-        return False
-    path = Path(issue_packet_path)
-    if path.is_absolute():
-        if path.exists():
-            return True
-        raw_text = str(issue_packet.get("raw_text") or "")
-        if not raw_text:
-            return False
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _ = path.write_text(raw_text, encoding="utf-8")
-        return True
-    resolved_path = base_dir / path
-    if resolved_path.exists():
-        return True
-    raw_text = str(issue_packet.get("raw_text") or "")
-    if not raw_text:
-        return False
-    resolved_path.parent.mkdir(parents=True, exist_ok=True)
-    _ = resolved_path.write_text(raw_text, encoding="utf-8")
-    return True
+def _canonical_issue_packet_is_ready(issue_packet: dict[str, Any]) -> bool:
+    issue_number = str(issue_packet.get("issue_number") or "")
+    title = str(issue_packet.get("title") or "")
+    branch = str(issue_packet.get("branch") or "")
+    return bool(issue_number and title and branch)
 
 
-def _column_names(connection: sqlite3.Connection, table_name: str) -> set[str]:
-    rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
-    return {str(row[1]) for row in rows}
+def _content_hash(text: str) -> str:
+    if not text:
+        return ""
+    return f"sha256:{hashlib.sha256(text.encode('utf-8')).hexdigest()}"
 
 
-def _ensure_issue_columns(connection: sqlite3.Connection) -> None:
-    existing = _column_names(connection, "issues")
-    for column, definition in ISSUE_COLUMNS.items():
-        if column in existing:
-            continue
-        connection.execute(f"ALTER TABLE issues ADD COLUMN {column} {definition}")
+def _normalize_issue_row(row: sqlite3.Row | dict[str, Any] | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return dict(row)
+
+
+def _update_issue_snapshot(
+    connection: sqlite3.Connection,
+    *,
+    issue_number: str,
+    updates: dict[str, Any],
+) -> None:
+    if not updates:
+        return
+    assignments = ", ".join(f"{column} = ?" for column in updates)
+    connection.execute(
+        f"UPDATE issues SET {assignments} WHERE issue_number = ?",
+        list(updates.values()) + [issue_number],
+    )
+
+
+def _record_latest_ref(
+    connection: sqlite3.Connection,
+    *,
+    issue_number: str,
+    entry_type: str,
+    history_id: int,
+    created_at: str,
+    command_id: str = "",
+    session_id: str = "",
+    status: str = "",
+) -> None:
+    issue = _read_issue_row(connection, issue_number) or {}
+    latest_refs = _json_loads_dict(issue.get("latest_refs_json"))
+    latest_refs[entry_type] = {
+        "history_id": history_id,
+        "created_at": created_at,
+        "command_id": command_id,
+        "session_id": session_id,
+        "status": status,
+    }
+    _update_issue_snapshot(
+        connection,
+        issue_number=issue_number,
+        updates={"latest_refs_json": _json_dumps(latest_refs)},
+    )
+
+
+def _merge_runtime_context(
+    existing: dict[str, Any],
+    *,
+    resume_snapshot: dict[str, Any] | None,
+    automation_flags: dict[str, Any] | None,
+    artifact_refs: dict[str, Any] | None,
+    artifact_status: dict[str, Any] | None,
+    runtime_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    merged = dict(existing)
+    if resume_snapshot is not None:
+        merged["resume_snapshot"] = resume_snapshot
+    if automation_flags is not None:
+        merged["automation_flags"] = automation_flags
+    if artifact_refs is not None:
+        merged["artifact_refs"] = artifact_refs
+    if artifact_status is not None:
+        merged["artifact_status"] = artifact_status
+    if runtime_context is not None:
+        merged.update(runtime_context)
+    return merged
 
 
 def _ensure_base_schema(connection: sqlite3.Connection) -> None:
+    issue_columns_sql = ",\n            ".join(f"{column} {definition}" for column, definition in ISSUE_COLUMNS.items())
+    connection.execute(f"CREATE TABLE IF NOT EXISTS issues (\n            {issue_columns_sql}\n        )")
     connection.executescript(
         """
-        CREATE TABLE IF NOT EXISTS issues (
-            issue_number TEXT PRIMARY KEY,
-            state TEXT NOT NULL DEFAULT 'ready'
-        );
-
         CREATE TABLE IF NOT EXISTS issue_history (
             history_id INTEGER PRIMARY KEY AUTOINCREMENT,
             issue_number TEXT NOT NULL,
@@ -133,6 +199,8 @@ def _ensure_base_schema(connection: sqlite3.Connection) -> None:
             to_state TEXT NOT NULL DEFAULT '',
             summary TEXT NOT NULL DEFAULT '',
             payload_json TEXT NOT NULL DEFAULT '{}',
+            body_text TEXT NOT NULL DEFAULT '',
+            content_hash TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
             unique_key TEXT NOT NULL DEFAULT '',
             session_seq INTEGER NOT NULL DEFAULT 0
@@ -156,7 +224,6 @@ def _ensure_base_schema(connection: sqlite3.Connection) -> None:
         WHERE session_id != '' AND session_seq > 0;
         """
     )
-    _ensure_issue_columns(connection)
 
 
 def _update_issue_last_history_ref(
@@ -217,8 +284,11 @@ def _append_history_entry(
     to_state: str = "",
     summary: str = "",
     payload: dict[str, Any] | None = None,
+    body_text: str = "",
+    content_hash: str = "",
     unique_key: str = "",
     session_seq: int = 0,
+    update_issue_last_history: bool = True,
 ) -> int:
     _ensure_issue_exists(connection, issue_number=issue_number, updated_at=created_at)
     existing_history_id: int | None = None
@@ -255,10 +325,12 @@ def _append_history_entry(
             to_state,
             summary,
             payload_json,
+            body_text,
+            content_hash,
             created_at,
             unique_key,
             session_seq
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             issue_number,
@@ -273,6 +345,8 @@ def _append_history_entry(
             to_state,
             summary,
             _json_dumps(payload or {}),
+            body_text,
+            content_hash,
             created_at,
             unique_key,
             session_seq,
@@ -282,25 +356,26 @@ def _append_history_entry(
     if history_id_raw is None:
         raise RuntimeError("failed to insert issue_history row")
     history_id = int(history_id_raw)
-    _update_issue_last_history_ref(
-        connection,
-        issue_number=issue_number,
-        history_id=history_id,
-        created_at=created_at,
-    )
+    if update_issue_last_history:
+        _update_issue_last_history_ref(
+            connection,
+            issue_number=issue_number,
+            history_id=history_id,
+            created_at=created_at,
+        )
     return history_id
 
 
 def ensure_control_plane_db(base_dir: Path) -> Path:
     db_path = control_plane_db_path(base_dir)
-    with _connect(base_dir) as connection:
+    with _connection(base_dir) as connection:
         _ensure_base_schema(connection)
     return db_path
 
 
 def describe_control_plane_schema(base_dir: Path) -> dict[str, Any]:
     db_path = ensure_control_plane_db(base_dir)
-    with _connect(base_dir) as connection:
+    with _connection(base_dir) as connection:
         table_rows = connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name ASC"
         ).fetchall()
@@ -332,12 +407,12 @@ def _read_issue_row(connection: sqlite3.Connection, issue_number: str) -> dict[s
         "SELECT * FROM issues WHERE issue_number = ?",
         (issue_number,),
     ).fetchone()
-    return dict(row) if row else None
+    return _normalize_issue_row(row)
 
 
 def read_issue(base_dir: Path, issue_number: str) -> dict[str, Any] | None:
     ensure_control_plane_db(base_dir)
-    with _connect(base_dir) as connection:
+    with _connection(base_dir) as connection:
         return _read_issue_row(connection, issue_number)
 
 
@@ -346,21 +421,49 @@ def issues_in_states(base_dir: Path, states: list[str]) -> list[dict[str, Any]]:
     if not states:
         return []
     placeholders = ", ".join("?" for _ in states)
-    with _connect(base_dir) as connection:
+    with _connection(base_dir) as connection:
         rows = connection.execute(
             f"SELECT * FROM issues WHERE state IN ({placeholders}) ORDER BY issue_number ASC",
             states,
         ).fetchall()
-    return [dict(row) for row in rows]
+    return [normalized for row in rows if (normalized := _normalize_issue_row(row)) is not None]
+
+
+def list_issues(
+    base_dir: Path,
+    *,
+    states: list[str] | None = None,
+    require_current_session: bool = False,
+) -> list[dict[str, Any]]:
+    ensure_control_plane_db(base_dir)
+    clauses: list[str] = []
+    params: list[str] = []
+    if states:
+        placeholders = ", ".join("?" for _ in states)
+        clauses.append(f"state IN ({placeholders})")
+        params.extend(states)
+    if require_current_session:
+        clauses.append("current_session_id != ''")
+    where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    query = (
+        "SELECT * FROM issues "
+        f"{where_clause} "
+        "ORDER BY "
+        "CASE WHEN last_event_at != '' THEN last_event_at ELSE updated_at END DESC, "
+        "issue_number ASC"
+    )
+    with _connection(base_dir) as connection:
+        rows = connection.execute(query, params).fetchall()
+    return [normalized for row in rows if (normalized := _normalize_issue_row(row)) is not None]
 
 
 def issue_rows_with_packets(base_dir: Path) -> list[dict[str, Any]]:
     ensure_control_plane_db(base_dir)
-    with _connect(base_dir) as connection:
+    with _connection(base_dir) as connection:
         rows = connection.execute(
             "SELECT * FROM issues WHERE issue_packet_json != '{}' ORDER BY issue_number ASC"
         ).fetchall()
-    return [dict(row) for row in rows]
+    return [normalized for row in rows if (normalized := _normalize_issue_row(row)) is not None]
 
 
 def completed_issue_numbers(base_dir: Path) -> set[str]:
@@ -379,7 +482,7 @@ def ensure_issue_row(
     if not is_known_issue_state(state):
         raise ValueError(f"unknown issue state {state!r}")
     ensure_control_plane_db(base_dir)
-    with _connect(base_dir) as connection:
+    with _connection(base_dir) as connection:
         connection.execute(
             """
             INSERT INTO issues (issue_number, state, rank_score, lane, last_event_at, updated_at)
@@ -401,7 +504,7 @@ def upsert_issue_ranking(
     updated_at: str,
 ) -> dict[str, Any]:
     ensure_control_plane_db(base_dir)
-    with _connect(base_dir) as connection:
+    with _connection(base_dir) as connection:
         _ensure_issue_exists(connection, issue_number=issue_number, updated_at=updated_at)
         connection.execute(
             "UPDATE issues SET rank_score = ?, lane = ?, updated_at = ? WHERE issue_number = ?",
@@ -411,19 +514,56 @@ def upsert_issue_ranking(
     return row or {}
 
 
-def ready_issues_for_selection(base_dir: Path) -> list[dict[str, Any]]:
+def development_issues(base_dir: Path) -> list[dict[str, Any]]:
+    return issues_in_states(base_dir, list(DEVELOPMENT_SLOT_STATES))
+
+
+def development_slot_occupancy(base_dir: Path) -> int:
+    return len(development_issues(base_dir))
+
+
+def available_development_slots(base_dir: Path, capacity: int) -> int:
+    return max(0, capacity - development_slot_occupancy(base_dir))
+
+
+def release_slot_occupancy(base_dir: Path) -> int:
     ensure_control_plane_db(base_dir)
-    with _connect(base_dir) as connection:
+    with _connection(base_dir) as connection:
         rows = connection.execute(
-            "SELECT * FROM issues WHERE state = 'ready' AND rank_score >= 0 ORDER BY rank_score DESC, issue_number ASC"
+            """
+            SELECT * FROM issues
+            WHERE state = 'release_pending'
+              AND current_role = 'release_worker'
+              AND (current_status != '' OR current_session_id != '')
+            ORDER BY issue_number ASC
+            """
+        ).fetchall()
+    return len(rows)
+
+
+def available_release_slots(base_dir: Path, capacity: int) -> int:
+    return max(0, capacity - release_slot_occupancy(base_dir))
+
+
+def ready_issues_for_selection(base_dir: Path, *, limit: int | None = None) -> list[dict[str, Any]]:
+    ensure_control_plane_db(base_dir)
+    if limit is not None and limit <= 0:
+        return []
+    with _connection(base_dir) as connection:
+        rows = connection.execute(
+            "SELECT * FROM issues WHERE state = 'ready' AND rank_score >= 0 AND current_session_id = '' ORDER BY rank_score DESC, issue_number ASC"
         ).fetchall()
     ready_rows: list[dict[str, Any]] = []
     for row in rows:
-        payload = dict(row)
+        payload = _normalize_issue_row(row)
+        if payload is None:
+            continue
         issue_packet = _json_loads_dict(payload.get("issue_packet_json"))
-        if not _issue_packet_exists_locally(base_dir, issue_packet):
+        if not _canonical_issue_packet_is_ready(issue_packet):
             continue
         ready_rows.append(payload)
+        if limit is not None and len(ready_rows) >= limit:
+            break
     return ready_rows
 
 
@@ -438,6 +578,7 @@ def sync_issue_runtime_context(
     attempts: dict[str, Any] | None = None,
     limits: dict[str, Any] | None = None,
     last_failure: dict[str, Any] | None = None,
+    runtime_context: dict[str, Any] | None = None,
     resume_snapshot: dict[str, Any] | None = None,
     automation_flags: dict[str, Any] | None = None,
     artifact_refs: dict[str, Any] | None = None,
@@ -445,8 +586,9 @@ def sync_issue_runtime_context(
     issue_packet: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     ensure_control_plane_db(base_dir)
-    with _connect(base_dir) as connection:
+    with _connection(base_dir) as connection:
         _ensure_issue_exists(connection, issue_number=issue_number, updated_at=updated_at)
+        existing = _read_issue_row(connection, issue_number) or {}
         updates: dict[str, Any] = {"updated_at": updated_at}
         if current_role is not None:
             updates["current_role"] = current_role
@@ -460,6 +602,22 @@ def sync_issue_runtime_context(
             updates["limits_json"] = _json_dumps(limits)
         if last_failure is not None:
             updates["last_failure_json"] = _json_dumps(last_failure)
+        merged_runtime_context = _merge_runtime_context(
+            _json_loads_dict(existing.get("runtime_context_json")),
+            resume_snapshot=resume_snapshot,
+            automation_flags=automation_flags,
+            artifact_refs=artifact_refs,
+            artifact_status=artifact_status,
+            runtime_context=runtime_context,
+        )
+        if (
+            runtime_context is not None
+            or resume_snapshot is not None
+            or automation_flags is not None
+            or artifact_refs is not None
+            or artifact_status is not None
+        ):
+            updates["runtime_context_json"] = _json_dumps(merged_runtime_context)
         if resume_snapshot is not None:
             updates["resume_snapshot_json"] = _json_dumps(resume_snapshot)
         if automation_flags is not None:
@@ -470,11 +628,9 @@ def sync_issue_runtime_context(
             updates["artifact_status_json"] = _json_dumps(artifact_status)
         if issue_packet is not None:
             updates["issue_packet_json"] = _json_dumps(issue_packet)
-        assignments = ", ".join(f"{column} = ?" for column in updates)
-        connection.execute(
-            f"UPDATE issues SET {assignments} WHERE issue_number = ?",
-            list(updates.values()) + [issue_number],
-        )
+            updates["title"] = str(issue_packet.get("title") or existing.get("title") or "")
+            updates["branch"] = str(issue_packet.get("branch") or existing.get("branch") or "")
+        _update_issue_snapshot(connection, issue_number=issue_number, updates=updates)
         row = _read_issue_row(connection, issue_number)
     return row or {}
 
@@ -495,11 +651,14 @@ def append_issue_history(
     to_state: str = "",
     summary: str = "",
     payload: dict[str, Any] | None = None,
+    body_text: str = "",
+    content_hash: str = "",
     unique_key: str = "",
     session_seq: int = 0,
+    update_issue_last_history: bool = True,
 ) -> int:
     ensure_control_plane_db(base_dir)
-    with _connect(base_dir) as connection:
+    with _connection(base_dir) as connection:
         return _append_history_entry(
             connection,
             issue_number=issue_number,
@@ -515,8 +674,11 @@ def append_issue_history(
             to_state=to_state,
             summary=summary,
             payload=payload,
+            body_text=body_text,
+            content_hash=content_hash,
             unique_key=unique_key,
             session_seq=session_seq,
+            update_issue_last_history=update_issue_last_history,
         )
 
 
@@ -541,7 +703,37 @@ def read_latest_issue_history(
         f"SELECT * FROM issue_history WHERE {' AND '.join(clauses)} "
         "ORDER BY created_at DESC, history_id DESC LIMIT 1"
     )
-    with _connect(base_dir) as connection:
+    with _connection(base_dir) as connection:
+        row = connection.execute(query, params).fetchone()
+    return dict(row) if row else None
+
+
+def read_latest_history_entry(
+    base_dir: Path,
+    *,
+    issue_number: str | None = None,
+    entry_type: str | None = None,
+    entry_types: list[str] | None = None,
+) -> dict[str, Any] | None:
+    ensure_control_plane_db(base_dir)
+    clauses: list[str] = []
+    params: list[str] = []
+    if issue_number is not None:
+        clauses.append("issue_number = ?")
+        params.append(issue_number)
+    if entry_type is not None:
+        clauses.append("entry_type = ?")
+        params.append(entry_type)
+    elif entry_types:
+        placeholders = ", ".join("?" for _ in entry_types)
+        clauses.append(f"entry_type IN ({placeholders})")
+        params.extend(entry_types)
+    where_clause = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    query = (
+        f"SELECT * FROM issue_history {where_clause} "
+        "ORDER BY created_at DESC, history_id DESC LIMIT 1"
+    )
+    with _connection(base_dir) as connection:
         row = connection.execute(query, params).fetchone()
     return dict(row) if row else None
 
@@ -554,21 +746,39 @@ def ingest_issue_packet(
     updated_at: str,
 ) -> dict[str, Any]:
     ensure_control_plane_db(base_dir)
-    with _connect(base_dir) as connection:
+    with _connection(base_dir) as connection:
         _ensure_issue_exists(connection, issue_number=issue_number, updated_at=updated_at)
-        connection.execute(
-            "UPDATE issues SET issue_packet_json = ?, updated_at = ? WHERE issue_number = ?",
-            (_json_dumps(issue_packet), updated_at, issue_number),
-        )
-        _append_history_entry(
+        body_text = str(issue_packet.get("raw_text") or "")
+        history_id = _append_history_entry(
             connection,
             issue_number=issue_number,
-            entry_type="issue_packet_ingested",
+            entry_type="issue_packet",
             created_at=updated_at,
             status="ingested",
             summary=f"Ingest issue packet for issue #{issue_number} into SQLite control plane.",
             payload=issue_packet,
+            body_text=body_text,
+            content_hash=_content_hash(body_text),
             unique_key=f"issue-packet:{issue_number}:{updated_at}",
+        )
+        _record_latest_ref(
+            connection,
+            issue_number=issue_number,
+            entry_type="issue_packet",
+            history_id=history_id,
+            created_at=updated_at,
+            status="ingested",
+        )
+        _update_issue_snapshot(
+            connection,
+            issue_number=issue_number,
+            updates={
+                "issue_packet_json": _json_dumps(issue_packet),
+                "title": str(issue_packet.get("title") or ""),
+                "branch": str(issue_packet.get("branch") or ""),
+                "updated_at": updated_at,
+                "last_event_at": updated_at,
+            },
         )
         row = _read_issue_row(connection, issue_number)
     return row or {}
@@ -577,6 +787,154 @@ def ingest_issue_packet(
 def read_issue_packet(base_dir: Path, issue_number: str) -> dict[str, Any]:
     issue = read_issue(base_dir, issue_number) or {}
     return _json_loads_dict(issue.get("issue_packet_json"))
+
+
+def read_latest_ref(base_dir: Path, issue_number: str, entry_type: str) -> dict[str, Any]:
+    issue = read_issue(base_dir, issue_number) or {}
+    latest_refs = _json_loads_dict(issue.get("latest_refs_json"))
+    ref = latest_refs.get(entry_type)
+    return dict(ref) if isinstance(ref, dict) else {}
+
+
+def read_artifact_fact(base_dir: Path, issue_number: str, entry_type: str) -> dict[str, Any]:
+    issue = read_issue(base_dir, issue_number) or {}
+    artifact_status = _json_loads_dict(issue.get("artifact_status_json"))
+    fact = artifact_status.get(entry_type)
+    return dict(fact) if isinstance(fact, dict) else {}
+
+
+def read_runtime_context(base_dir: Path, issue_number: str) -> dict[str, Any]:
+    issue = read_issue(base_dir, issue_number) or {}
+    return _json_loads_dict(issue.get("runtime_context_json"))
+
+
+def record_artifact_fact(
+    base_dir: Path,
+    *,
+    issue_number: str,
+    entry_type: str,
+    created_at: str,
+    payload: dict[str, Any],
+    summary: str = "",
+    session_id: str = "",
+    command_id: str = "",
+    body_text: str = "",
+    source: str = "db",
+    artifact_path: str = "",
+    unique_key: str = "",
+) -> dict[str, Any]:
+    ensure_control_plane_db(base_dir)
+    artifact_body = body_text or _json_dumps(payload)
+    artifact_content_hash = _content_hash(artifact_body)
+    dedupe_key = unique_key or f"{entry_type}:{issue_number}:{artifact_content_hash}"
+    status = str(payload.get("status") or "")
+    with _connection(base_dir) as connection:
+        history_id = _append_history_entry(
+            connection,
+            issue_number=issue_number,
+            entry_type=entry_type,
+            created_at=created_at,
+            session_id=session_id,
+            command_id=command_id,
+            status=status,
+            summary=summary or status or f"Record {entry_type} for issue #{issue_number}.",
+            payload=payload,
+            body_text=artifact_body,
+            content_hash=artifact_content_hash,
+            unique_key=dedupe_key,
+        )
+        _record_latest_ref(
+            connection,
+            issue_number=issue_number,
+            entry_type=entry_type,
+            history_id=history_id,
+            created_at=created_at,
+            command_id=command_id,
+            session_id=session_id,
+            status=status,
+        )
+        issue = _read_issue_row(connection, issue_number) or {}
+        artifact_status = _json_loads_dict(issue.get("artifact_status_json"))
+        snapshot: dict[str, Any] = {
+            "observed_at": created_at,
+            "parse_ok": True,
+            "source": source,
+            "history_id": history_id,
+            "content_hash": artifact_content_hash,
+        }
+        if artifact_path:
+            snapshot["path"] = artifact_path
+        snapshot.update(payload)
+        _update_issue_snapshot(
+            connection,
+            issue_number=issue_number,
+            updates={
+                "artifact_status_json": _json_dumps({**artifact_status, entry_type: snapshot}),
+                "updated_at": created_at,
+                "last_event_at": created_at,
+            },
+        )
+    return snapshot
+
+
+def record_pr_opened(
+    base_dir: Path,
+    *,
+    issue_number: str,
+    pr_number: str,
+    created_at: str,
+    verifier_session_id: str = "",
+    command_id: str = "",
+    summary: str = "",
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    ensure_control_plane_db(base_dir)
+    pr_payload: dict[str, Any] = {"pr_number": pr_number}
+    if payload:
+        pr_payload.update(payload)
+    body_text = _json_dumps(pr_payload)
+    content_hash = _content_hash(body_text)
+    dedupe_key = f"pr-opened:{issue_number}:{pr_number}"
+    with _connection(base_dir) as connection:
+        history_id = _append_history_entry(
+            connection,
+            issue_number=issue_number,
+            entry_type="pr_opened",
+            created_at=created_at,
+            session_id=verifier_session_id,
+            command_id=command_id,
+            status="opened",
+            summary=summary or f"Record PR #{pr_number} opened for issue #{issue_number}.",
+            payload=pr_payload,
+            body_text=body_text,
+            content_hash=content_hash,
+            unique_key=dedupe_key,
+        )
+        _record_latest_ref(
+            connection,
+            issue_number=issue_number,
+            entry_type="pr_opened",
+            history_id=history_id,
+            created_at=created_at,
+            command_id=command_id,
+            session_id=verifier_session_id,
+            status="opened",
+        )
+        _update_issue_snapshot(
+            connection,
+            issue_number=issue_number,
+            updates={
+                "updated_at": created_at,
+                "last_event_at": created_at,
+            },
+        )
+    return {
+        "history_id": history_id,
+        "pr_number": pr_number,
+        "session_id": verifier_session_id,
+        "status": "opened",
+        "created_at": created_at,
+    }
 
 
 def transition_issue_state(
@@ -589,11 +947,10 @@ def transition_issue_state(
     reason: str,
     updated_at: str,
     from_state: str | None = None,
-    current_root_session_id: str | None = None,
-    current_verifier_session_id: str | None = None,
+    current_session_id: str | None = None,
 ) -> dict[str, Any]:
     ensure_control_plane_db(base_dir)
-    with _connect(base_dir) as connection:
+    with _connection(base_dir) as connection:
         _ensure_issue_exists(connection, issue_number=issue_number, state=from_state or "ready", updated_at=updated_at)
         current = _read_issue_row(connection, issue_number) or {}
         actual_from_state = str(current.get("state") or "ready")
@@ -620,23 +977,20 @@ def transition_issue_state(
             updates["running_at"] = updated_at
         if to_state == "verifying":
             updates["verifying_at"] = updated_at
+        if to_state == "verified":
+            updates["verified_at"] = updated_at
+        if to_state == "release_pending":
+            updates["release_pending_at"] = updated_at
         if to_state == "completed":
             updates["completed_at"] = updated_at
         if to_state == "failed":
             updates["failed_at"] = updated_at
         if to_state == "quarantined":
             updates["quarantined_at"] = updated_at
-        if current_root_session_id is not None:
-            updates["current_root_session_id"] = current_root_session_id
-        if current_verifier_session_id is not None:
-            updates["current_verifier_session_id"] = current_verifier_session_id
+        if current_session_id is not None:
+            updates["current_session_id"] = current_session_id
 
-        assignments = ", ".join(f"{column} = ?" for column in updates)
-        connection.execute(
-            f"UPDATE issues SET {assignments} WHERE issue_number = ?",
-            list(updates.values()) + [issue_number],
-        )
-        _append_history_entry(
+        history_id = _append_history_entry(
             connection,
             issue_number=issue_number,
             entry_type="state_transition",
@@ -649,6 +1003,16 @@ def transition_issue_state(
             payload={"decision_type": "state_transition", "scheduler_id": scheduler_id},
             unique_key=f"state-transition:{command_id}",
         )
+        _record_latest_ref(
+            connection,
+            issue_number=issue_number,
+            entry_type="state_transition",
+            history_id=history_id,
+            created_at=updated_at,
+            command_id=command_id,
+            status=to_state,
+        )
+        _update_issue_snapshot(connection, issue_number=issue_number, updates=updates)
         updated = _read_issue_row(connection, issue_number)
     return updated or {}
 
@@ -660,13 +1024,12 @@ def upsert_issue_state(
     state: str,
     command_id: str,
     updated_at: str,
-    current_root_session_id: str | None = None,
-    current_verifier_session_id: str | None = None,
+    current_session_id: str | None = None,
 ) -> dict[str, Any]:
     if not is_known_issue_state(state):
         raise ValueError(f"unknown issue state {state!r}")
     ensure_control_plane_db(base_dir)
-    with _connect(base_dir) as connection:
+    with _connection(base_dir) as connection:
         _ensure_issue_exists(connection, issue_number=issue_number, state=state, updated_at=updated_at)
         existing = _read_issue_row(connection, issue_number) or {}
         previous_state = str(existing.get("state") or state)
@@ -676,10 +1039,8 @@ def upsert_issue_state(
             "last_event_at": updated_at,
             "updated_at": updated_at,
         }
-        if current_root_session_id is not None:
-            updates["current_root_session_id"] = current_root_session_id
-        if current_verifier_session_id is not None:
-            updates["current_verifier_session_id"] = current_verifier_session_id
+        if current_session_id is not None:
+            updates["current_session_id"] = current_session_id
         if state == "claimed":
             updates["claimed_at"] = updated_at
         if state == "dispatching":
@@ -688,19 +1049,18 @@ def upsert_issue_state(
             updates["running_at"] = updated_at
         if state == "verifying":
             updates["verifying_at"] = updated_at
+        if state == "verified":
+            updates["verified_at"] = updated_at
+        if state == "release_pending":
+            updates["release_pending_at"] = updated_at
         if state == "completed":
             updates["completed_at"] = updated_at
         if state == "failed":
             updates["failed_at"] = updated_at
         if state == "quarantined":
             updates["quarantined_at"] = updated_at
-        assignments = ", ".join(f"{column} = ?" for column in updates)
-        connection.execute(
-            f"UPDATE issues SET {assignments} WHERE issue_number = ?",
-            list(updates.values()) + [issue_number],
-        )
         if previous_state != state or str(existing.get("last_command_id") or "") != command_id:
-            _append_history_entry(
+            history_id = _append_history_entry(
                 connection,
                 issue_number=issue_number,
                 entry_type="state_transition",
@@ -713,6 +1073,16 @@ def upsert_issue_state(
                 payload={"decision_type": "state_transition", "scheduler_id": "upsert"},
                 unique_key=f"state-upsert:{command_id}:{issue_number}",
             )
+            _record_latest_ref(
+                connection,
+                issue_number=issue_number,
+                entry_type="state_transition",
+                history_id=history_id,
+                created_at=updated_at,
+                command_id=command_id,
+                status=state,
+            )
+        _update_issue_snapshot(connection, issue_number=issue_number, updates=updates)
         row = _read_issue_row(connection, issue_number)
     return row or {}
 
@@ -729,7 +1099,7 @@ def record_github_sync_attempt(
     last_error: str = "",
 ) -> None:
     ensure_control_plane_db(base_dir)
-    with _connect(base_dir) as connection:
+    with _connection(base_dir) as connection:
         previous = connection.execute(
             """
             SELECT payload_json FROM issue_history
@@ -742,7 +1112,7 @@ def record_github_sync_attempt(
         previous_payload = _json_loads_dict(previous["payload_json"]) if previous else {}
         attempt_count = int(previous_payload.get("attempt_count") or 0) + 1
         delta = {"add": add_labels, "remove": remove_labels}
-        _append_history_entry(
+        history_id = _append_history_entry(
             connection,
             issue_number=issue_number,
             entry_type="github_sync",
@@ -756,6 +1126,15 @@ def record_github_sync_attempt(
                 "last_error": last_error,
             },
             unique_key=f"github-sync:{command_id}:{attempt_count}",
+        )
+        _record_latest_ref(
+            connection,
+            issue_number=issue_number,
+            entry_type="github_sync",
+            history_id=history_id,
+            created_at=updated_at,
+            command_id=command_id,
+            status=status,
         )
 
 
@@ -771,7 +1150,7 @@ def append_issue_event(
     created_at: str,
 ) -> None:
     ensure_control_plane_db(base_dir)
-    with _connect(base_dir) as connection:
+    with _connection(base_dir) as connection:
         existing = connection.execute(
             "SELECT history_id FROM issue_history WHERE unique_key = ?",
             (event_id,),
@@ -780,7 +1159,7 @@ def append_issue_event(
             return
         event_payload = dict(payload)
         event_payload.setdefault("event_type", event_type)
-        _append_history_entry(
+        history_id = _append_history_entry(
             connection,
             issue_number=issue_number,
             entry_type="root_event",
@@ -793,9 +1172,19 @@ def append_issue_event(
             unique_key=event_id,
             session_seq=session_seq,
         )
-        connection.execute(
-            "UPDATE issues SET last_event_at = ?, updated_at = ? WHERE issue_number = ?",
-            (created_at, created_at, issue_number),
+        _record_latest_ref(
+            connection,
+            issue_number=issue_number,
+            entry_type="root_event",
+            history_id=history_id,
+            created_at=created_at,
+            session_id=root_session_id,
+            status=event_type,
+        )
+        _update_issue_snapshot(
+            connection,
+            issue_number=issue_number,
+            updates={"last_event_at": created_at, "updated_at": created_at},
         )
 
 
@@ -834,7 +1223,7 @@ def _history_row_to_github_sync(row: sqlite3.Row | dict[str, Any] | None) -> dic
 
 def read_latest_decision(base_dir: Path, issue_number: str) -> dict[str, Any] | None:
     ensure_control_plane_db(base_dir)
-    with _connect(base_dir) as connection:
+    with _connection(base_dir) as connection:
         row = connection.execute(
             """
             SELECT * FROM issue_history
@@ -849,7 +1238,7 @@ def read_latest_decision(base_dir: Path, issue_number: str) -> dict[str, Any] | 
 
 def read_latest_github_sync_attempt(base_dir: Path, issue_number: str) -> dict[str, Any] | None:
     ensure_control_plane_db(base_dir)
-    with _connect(base_dir) as connection:
+    with _connection(base_dir) as connection:
         row = connection.execute(
             """
             SELECT * FROM issue_history
@@ -864,7 +1253,7 @@ def read_latest_github_sync_attempt(base_dir: Path, issue_number: str) -> dict[s
 
 def read_github_sync_attempt(base_dir: Path, command_id: str) -> dict[str, Any] | None:
     ensure_control_plane_db(base_dir)
-    with _connect(base_dir) as connection:
+    with _connection(base_dir) as connection:
         row = connection.execute(
             """
             SELECT * FROM issue_history
@@ -879,7 +1268,7 @@ def read_github_sync_attempt(base_dir: Path, command_id: str) -> dict[str, Any] 
 
 def read_decision(base_dir: Path, command_id: str) -> dict[str, Any] | None:
     ensure_control_plane_db(base_dir)
-    with _connect(base_dir) as connection:
+    with _connection(base_dir) as connection:
         row = connection.execute(
             """
             SELECT * FROM issue_history
@@ -908,8 +1297,8 @@ def record_admin_decision(
     to_state: str = "",
 ) -> None:
     ensure_control_plane_db(base_dir)
-    with _connect(base_dir) as connection:
-        _append_history_entry(
+    with _connection(base_dir) as connection:
+        history_id = _append_history_entry(
             connection,
             issue_number=issue_number,
             entry_type="admin_action",
@@ -920,4 +1309,13 @@ def record_admin_decision(
             summary=reason,
             payload={"decision_type": decision_type, "scheduler_id": "admin"},
             unique_key=f"admin-action:{command_id}",
+        )
+        _record_latest_ref(
+            connection,
+            issue_number=issue_number,
+            entry_type="admin_action",
+            history_id=history_id,
+            created_at=updated_at,
+            command_id=command_id,
+            status=decision_type,
         )

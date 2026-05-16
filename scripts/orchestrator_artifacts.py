@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from pathlib import Path
 from typing import cast
 
 
@@ -14,7 +13,6 @@ class IssuePacketRecord:
     issue_number: str
     title: str
     branch: str
-    issue_packet_path: str
     backing_type: str
     prior_handoff: str
     labels: list[str]
@@ -290,7 +288,6 @@ def parse_issue_packet_text(text: str, issue_packet_path: str) -> IssuePacketRec
         issue_number=issue_number,
         title=title,
         branch=branch,
-        issue_packet_path=issue_packet_path,
         backing_type=backing_type,
         prior_handoff="" if prior_handoff == "none" else prior_handoff,
         labels=_extract_issue_labels(text),
@@ -305,7 +302,6 @@ def issue_packet_record_to_json(record: IssuePacketRecord) -> JsonObject:
         "issue_number": record.issue_number,
         "title": record.title,
         "branch": record.branch,
-        "issue_packet_path": record.issue_packet_path,
         "backing_type": record.backing_type,
         "prior_handoff": record.prior_handoff,
         "labels": list(record.labels),
@@ -318,8 +314,7 @@ def issue_packet_record_to_json(record: IssuePacketRecord) -> JsonObject:
 def issue_packet_record_from_json(payload: dict[str, object]) -> IssuePacketRecord | None:
     issue_number = str(payload.get("issue_number") or "")
     branch = str(payload.get("branch") or "")
-    issue_packet_path = str(payload.get("issue_packet_path") or "")
-    if not issue_number or not branch or not issue_packet_path:
+    if not issue_number or not branch:
         return None
     labels_raw = payload.get("labels", [])
     dependencies_raw = payload.get("dependencies", [])
@@ -329,7 +324,6 @@ def issue_packet_record_from_json(payload: dict[str, object]) -> IssuePacketReco
         issue_number=issue_number,
         title=str(payload.get("title") or ""),
         branch=branch,
-        issue_packet_path=issue_packet_path,
         backing_type=str(payload.get("backing_type") or "github"),
         prior_handoff=str(payload.get("prior_handoff") or ""),
         labels=labels,
@@ -337,55 +331,6 @@ def issue_packet_record_from_json(payload: dict[str, object]) -> IssuePacketReco
         dependencies=dependencies,
         raw_text=str(payload.get("raw_text") or ""),
     )
-
-
-
-def default_worker_result_path(issue_number: str) -> str:
-    return f"docs/agents/worker-results/issue-{issue_number}.yaml"
-
-
-def default_evidence_packet_path(issue_number: str, pr_number: str) -> str:
-    return f"docs/agents/evidence/issue-{issue_number}-pr-{pr_number}.yaml"
-
-
-def default_release_result_path(issue_number: str, pr_number: str) -> str:
-    return f"docs/agents/release-results/issue-{issue_number}-pr-{pr_number}.yaml"
-
-
-def parse_worker_result_file(path: Path) -> JsonObject:
-    text = path.read_text(encoding="utf-8")
-    return {
-        "status": _extract_top_level_scalar(text, "status"),
-        "pr_number": _extract_mapping_value_optional(text, "pr:", "number"),
-        "next_recommended_step": _extract_scalar_from_any_block(text, "next_recommended_step", "summary", "compact_summary"),
-        "failure_kind": _extract_inline_mapping_value_optional(text, "failure_classification:", "kind"),
-        "retryable": _extract_inline_bool_optional(text, "failure_classification:", "retryable"),
-        "completed_at": _extract_mapping_value_optional(text, "metadata:", "completed_at") or _extract_nested_scalar_optional(text, "metadata", "completed_at"),
-    }
-
-
-def parse_evidence_packet_file(path: Path) -> JsonObject:
-    text = path.read_text(encoding="utf-8")
-    return {
-        "status": _extract_top_level_scalar(text, "status"),
-        "pr_number": _extract_mapping_value_optional(text, "subject:", "pr_number") or _extract_nested_scalar_optional(text, "subject", "pr_number"),
-        "verifier_session_id": _extract_mapping_value_optional(text, "verifier:", "verifier_session_id") or _extract_nested_scalar_optional(text, "verifier", "verifier_session_id"),
-        "next_recommended_step": _extract_scalar_from_any_block(text, "next_recommended_step", "summary", "compact_summary"),
-        "failure_kind": _extract_inline_mapping_value_optional(text, "failure_classification:", "kind"),
-        "retryable": _extract_inline_bool_optional(text, "failure_classification:", "retryable"),
-    }
-
-
-def parse_release_result_file(path: Path) -> JsonObject:
-    text = path.read_text(encoding="utf-8")
-    return {
-        "status": _extract_top_level_scalar(text, "status"),
-        "blocked_reason": _extract_top_level_scalar_optional(text, "blocked_reason") or "none",
-        "next_recommended_step": _extract_scalar_from_any_block(text, "next_recommended_step", "summary", "compact_summary"),
-        "failure_kind": _extract_inline_mapping_value_optional(text, "failure_classification:", "kind"),
-        "retryable": _extract_inline_bool_optional(text, "failure_classification:", "retryable"),
-    }
-
 
 def _is_successful_release_status(status: str) -> bool:
     return status in {"success", "completed"}

@@ -18,26 +18,8 @@ When a skill mentions a role, use the corresponding label string from this table
 
 | Supplemental label  | Meaning |
 | ------------------- | ------- |
+| `agent-dispatching` | Claimed by the scheduler and currently in DB-backed dispatch/bootstrap flow. |
 | `agent-in-progress` | Claimed by an active autodev run; blocks duplicate starts for the same issue across sessions. |
+| `quarantined`       | Issue is fenced for controlled recovery and must not be auto-started. |
 
-## E2E test case labels
-
-E2E-specific labels may add workflow detail, but they must not replace the
-canonical triage labels above.
-
-| Supplemental label | Meaning |
-| ------------------ | ------- |
-| `e2e-test-case`    | One executable E2E test case issue. |
-| `blocked-by-spec`  | Expected behavior or acceptance criteria need PRD/spec repair. |
-| `blocked-by-infra` | Shared harness, fixture, environment, or infrastructure failure blocks verification. |
-
-## Refactor labels
-
-Refactor-specific labels may add workflow detail, but they must not replace the
-canonical triage labels above. `blocked-by-spec` is shared with E2E issues when
-the blocker is a product or PRD/spec decision.
-
-| Supplemental label   | Meaning |
-| -------------------- | ------- |
-| `refactor-candidate` | One behavior-preserving refactor candidate issue from the phase refactor audit. |
-| `blocked-by-risk`    | Refactor candidate failed the risk gate; split smaller or route to human. |
+These runtime coordination labels are additive. They help GitHub stay aligned with the SQLite control plane, but they do not replace the canonical DB state in `issues` and `issue_history`.

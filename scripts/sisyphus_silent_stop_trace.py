@@ -62,6 +62,8 @@ def diagnose_trace(result: dict[str, object]) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workdir", default=".", help="Directory for the root OpenCode run")
+    parser.add_argument("--root-agent", default="build", help="Root agent used to launch the repro")
+    parser.add_argument("--child-subagent-type", default="", help="Direct child subagent type; empty uses category routing")
     parser.add_argument("--category", default="deep", help="task() category used to spawn Sisyphus-Junior")
     parser.add_argument("--skill", action="append", default=[], help="Child load_skills entry (repeatable)")
     parser.add_argument(
@@ -73,6 +75,8 @@ def main() -> int:
     parser.add_argument("--root-timeout", type=float, default=15.0)
     parser.add_argument("--db-timeout", type=float, default=5.0)
     parser.add_argument("--child-timeout", type=float, default=30.0)
+    parser.add_argument("--run-in-background", choices=["true", "false"], default="true")
+    parser.add_argument("--parent-keepalive-seconds", type=float, default=8.0)
     parser.add_argument("--poll-interval", type=float, default=0.5)
     parser.add_argument("--settle-timeout", type=float, default=5.0)
     args = parser.parse_args()
@@ -82,12 +86,16 @@ def main() -> int:
     result = run_once(
         workdir=workdir,
         title=title,
+        root_agent=str(args.root_agent),
+        child_subagent_type=str(args.child_subagent_type),
         category=args.category,
         skills=list(args.skill),
         child_description="Trace Sisyphus-Junior silent stop",
         child_title_contains="Trace Sisyphus-Junior silent stop",
         child_prompt=str(args.child_prompt),
         child_prompt_file=str(args.child_prompt_file),
+        run_in_background=cast(str, args.run_in_background) == "true",
+        parent_keepalive_seconds=float(args.parent_keepalive_seconds),
         root_timeout=float(args.root_timeout),
         db_timeout=float(args.db_timeout),
         child_timeout=float(args.child_timeout),

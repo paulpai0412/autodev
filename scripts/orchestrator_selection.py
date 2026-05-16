@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
-from typing import Callable, Protocol, cast
+from typing import Callable, Protocol
 
-from scripts.control_plane_db import completed_issue_numbers, ingest_issue_packet, issue_rows_with_packets, issues_in_states, read_issue_packet, ready_issues_for_selection, upsert_issue_ranking
+from scripts.control_plane_db import available_development_slots, completed_issue_numbers, ingest_issue_packet, issue_rows_with_packets, issues_in_states, read_issue_packet, ready_issues_for_selection, upsert_issue_ranking
 
 
 JsonObject = dict[str, object]
@@ -17,7 +17,6 @@ class IssuePacketRecord(Protocol):
     issue_number: str
     title: str
     branch: str
-    issue_packet_path: str
     backing_type: str
     prior_handoff: str
     labels: list[str]
@@ -41,7 +40,7 @@ def sync_issue_packet_to_db(
     now: NowFunc,
     updated_at: str | None = None,
 ) -> None:
-    ingest_issue_packet(
+    _ = ingest_issue_packet(
         base_dir,
         issue_number=packet.issue_number,
         issue_packet=issue_packet_record_to_json(packet),
@@ -59,58 +58,8 @@ def load_issue_packet_from_db(
     return issue_packet_record_from_json(payload)
 
 
-def resolve_artifact_path(path_text: str, *, base_dir: Path, root: Path) -> Path:
-    path = Path(path_text)
-    if path.is_absolute():
-        return path
-    candidate = base_dir / path
-    if candidate.exists():
-        return candidate
-    return root / path
-
-
-def infer_artifact_base_dir(ledger_path: Path, *, root: Path) -> Path:
-    resolved = ledger_path.resolve()
-    if resolved.parent.name == "runtime" and resolved.parent.parent.name == ".opencode":
-        return resolved.parent.parent.parent
-    if resolved.parent != resolved:
-        return resolved.parent
-    return root
-
-
-def _packet_exists_locally(base_dir: Path, packet: IssuePacketRecord) -> bool:
-    path = Path(packet.issue_packet_path)
-    resolved_path = path if path.is_absolute() else base_dir / path
-    if resolved_path.exists():
-        return True
-    if not packet.raw_text:
-        return False
-    resolved_path.parent.mkdir(parents=True, exist_ok=True)
-    _ = resolved_path.write_text(packet.raw_text, encoding="utf-8")
-    return True
-
-
-def completed_issue_numbers_from_control_plane(base_dir: Path, checkpoint_path: str) -> set[str]:
-    del checkpoint_path
+def completed_issue_numbers_from_control_plane(base_dir: Path) -> set[str]:
     return completed_issue_numbers(base_dir)
-
-
-def checkpoint_completed_issue_numbers(text: str, *, parse_issue_numbers: Callable[[str], list[str]]) -> set[str]:
-    completed: set[str] = set()
-    in_completed = False
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        indent = len(line) - len(line.lstrip(" "))
-        if indent == 2 and stripped == "completed:":
-            in_completed = True
-            continue
-        if in_completed and indent <= 2 and not stripped.startswith("- "):
-            break
-        if in_completed and stripped.startswith("- "):
-            completed.update(parse_issue_numbers(stripped))
-    return completed
 
 
 def select_next_issue_packet(
@@ -118,14 +67,46 @@ def select_next_issue_packet(
     *,
     workflow: dict[str, str],
     current_issue: dict[str, str],
-    completed_issue_numbers_func: Callable[[Path, str], set[str]],
+    completed_issue_numbers_func: Callable[[Path], set[str]],
     parse_issue_packet_text: Callable[[str, str], IssuePacketRecord],
     sync_issue_packet_to_db_func: Callable[..., None],
     issue_packet_record_from_json: Callable[[dict[str, object]], IssuePacketRecord | None],
     dependency_issue_numbers: Callable[[str, list[str]], list[str]],
     now: NowFunc,
+    development_capacity: int | None = None,
 ) -> IssuePacketRecord | None:
-    completed = completed_issue_numbers_func(base_dir, workflow["checkpointPath"])
+    selected_packets = select_issue_packets_for_capacity(
+        base_dir,
+        workflow=workflow,
+        current_issue=current_issue,
+        completed_issue_numbers_func=completed_issue_numbers_func,
+        parse_issue_packet_text=parse_issue_packet_text,
+        sync_issue_packet_to_db_func=sync_issue_packet_to_db_func,
+        issue_packet_record_from_json=issue_packet_record_from_json,
+        dependency_issue_numbers=dependency_issue_numbers,
+        now=now,
+        development_capacity=development_capacity,
+    )
+    return selected_packets[0] if selected_packets else None
+
+
+def select_issue_packets_for_capacity(
+    base_dir: Path,
+    *,
+    workflow: dict[str, str],
+    current_issue: dict[str, str],
+    completed_issue_numbers_func: Callable[[Path], set[str]],
+    parse_issue_packet_text: Callable[[str, str], IssuePacketRecord],
+    sync_issue_packet_to_db_func: Callable[..., None],
+    issue_packet_record_from_json: Callable[[dict[str, object]], IssuePacketRecord | None],
+    dependency_issue_numbers: Callable[[str, list[str]], list[str]],
+    now: NowFunc,
+    development_capacity: int | None = None,
+) -> list[IssuePacketRecord]:
+    del parse_issue_packet_text
+    del sync_issue_packet_to_db_func
+    del workflow
+    completed = completed_issue_numbers_func(base_dir)
     runtime_states = {
         issue["issue_number"]: issue["state"]
         for issue in issues_in_states(base_dir, ["claimed", "dispatching", "running", "verifying", "quarantined"])
@@ -133,23 +114,10 @@ def select_next_issue_packet(
     current_number = current_issue.get("number", "")
     current_parent = current_issue.get("parentReference", "")
     packet_by_issue_number: dict[str, IssuePacketRecord] = {}
-    packets_dir = base_dir / "docs/agents/issue-packets"
-    if packets_dir.exists():
-        for path in sorted(packets_dir.glob("issue-*.yaml")):
-            packet = parse_issue_packet_text(path.read_text(encoding="utf-8"), str(path.relative_to(base_dir)))
-            sync_issue_packet_to_db_func(base_dir, packet)
+    selected_packets: list[IssuePacketRecord] = []
     for row in issue_rows_with_packets(base_dir):
         packet = issue_packet_record_from_json(read_issue_packet(base_dir, str(row.get("issue_number") or "")))
         if packet is None:
-            continue
-        if not _packet_exists_locally(base_dir, packet):
-            _ = upsert_issue_ranking(
-                base_dir,
-                issue_number=packet.issue_number,
-                rank_score=-1.0,
-                lane="default",
-                updated_at=now(None),
-            )
             continue
         packet_by_issue_number[packet.issue_number] = packet
         rank_score = -1.0
@@ -187,12 +155,13 @@ def select_next_issue_packet(
             updated_at=now(None),
         )
 
-    for row in ready_issues_for_selection(base_dir):
+    ready_limit = available_development_slots(base_dir, development_capacity) if development_capacity is not None else None
+    for row in ready_issues_for_selection(base_dir, limit=ready_limit):
         issue_number = str(row.get("issue_number") or "")
         packet = packet_by_issue_number.get(issue_number)
         if packet is not None:
-            return packet
-    return None
+            selected_packets.append(packet)
+    return selected_packets
 
 
 def run_issue_packet_intake(
@@ -205,35 +174,24 @@ def run_issue_packet_intake(
 ) -> bool:
     script_path = DEFAULT_ISSUE_INTAKE_SCRIPT_PATH
     repo = read_project_github_repo(base_dir)
+    del parse_issue_packet_text
+    del sync_issue_packet_to_db_func
     command = [
         "python3",
         str(script_path),
-        "--output-dir",
-        str(base_dir / "docs/agents/issue-packets"),
+        "--project-root",
+        str(base_dir),
     ]
     if repo:
         command.extend(["--repo", repo])
     try:
-        completed = run(
+        _ = run(
             command,
             cwd=base_dir,
             check=True,
             capture_output=True,
             text=True,
         )
-        for line in completed.stdout.splitlines():
-            packet_ref = line.strip()
-            if not packet_ref:
-                continue
-            packet_path = Path(packet_ref)
-            resolved_path = packet_path if packet_path.is_absolute() else base_dir / packet_path
-            if not resolved_path.exists():
-                continue
-            packet = parse_issue_packet_text(
-                resolved_path.read_text(encoding="utf-8"),
-                str(resolved_path.relative_to(base_dir)) if resolved_path.is_relative_to(base_dir) else str(resolved_path),
-            )
-            sync_issue_packet_to_db_func(base_dir, packet)
         return True
     except subprocess.CalledProcessError:
         return False

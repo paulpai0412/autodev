@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -16,13 +18,14 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.control_plane_db import ensure_control_plane_db
+from scripts.orchestrator_supervisor import show_latest_session
+from scripts.control_plane_db import list_issues
+from scripts.orchestrator_sessions import default_host_adapter
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_COMMANDS_DIR = Path.home() / ".config/opencode/commands"
 AGENTS_BEGIN = "<!-- AUTODEV:BEGIN -->"
 AGENTS_END = "<!-- AUTODEV:END -->"
-CHECKPOINT_TEMPLATE_PATH = ROOT / "docs/agents/runtime/context-checkpoint.yaml"
 DEFAULT_REPO_DESCRIPTION = "Autodev consumer project"
 
 BOOTSTRAP_LABELS = [
@@ -43,19 +46,45 @@ DOMAIN_DOCS = {
 }
 
 ARTIFACT_DIRS = [
-    "docs/agents/issue-packets",
-    "docs/agents/handoffs",
-    "docs/agents/worker-results",
-    "docs/agents/evidence",
-    "docs/agents/release-results",
     "docs/agents/runtime",
     ".opencode/runtime",
 ]
 
+RUNTIME_GITIGNORE_LINES = [
+    "# autodev runtime state",
+    ".opencode/runtime/*",
+    "!.opencode/runtime/.gitkeep",
+]
+
+TRACKED_RUNTIME_BLOCK_PREFIX = "tracked autodev runtime files must be removed from git index:"
+
+
+def _host_adapter():
+    return default_host_adapter()
+
+
+def _operator_entrypoints() -> dict[str, str]:
+    entrypoints = _host_adapter().operator_entrypoints()
+    return {str(key): str(value) for key, value in entrypoints.items()}
+
+
+def _default_commands_dir() -> Path:
+    commands_dir = _host_adapter().capabilities().get("commands_dir")
+    if isinstance(commands_dir, str) and commands_dir:
+        return Path(commands_dir).expanduser()
+    return Path.home() / ".config/opencode/commands"
+
+
 def _command_templates() -> dict[str, str]:
     autodev_home = '${AUTODEV_HOME:-$HOME/apps/autodev}'
+    entrypoints = _operator_entrypoints()
+    start_filename = entrypoints.get("start", "autodev-start.md")
+    reconcile_filename = entrypoints.get("reconcile", "autodev-reconcile.md")
+    release_filename = entrypoints.get("release", "autodev-release.md")
+    inspect_filename = entrypoints.get("inspect", "autodev-show-session.md")
+    doctor_filename = entrypoints.get("doctor", "autodev-doctor.md")
     return {
-        "autodev-start.md": f"""---
+        start_filename: f"""---
 description: Start autodev workflow for the current project and issue number
 agent: build
 subtask: false
@@ -65,14 +94,14 @@ Run autodev for issue number `$ARGUMENTS` in the current project.
 
 1. Execute:
 !`AUTODEV_HOME="{autodev_home}" PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" start --project-root "$PWD" --issue-number "$1"`
-2. Report the checkpoint, ledger, session result, and next action from the command output.
+2. Report the DB-backed dispatch result, current root session, and next recommended action from the command output.
 
 Notes:
 - This is an autodev-owned global command. It discovers the target project from the current directory.
 - Override `AUTODEV_HOME` first if the shared workflow repo is not installed at `~/apps/autodev`.
 - Entrypoint: `scripts/autodev_project.py start`.
 """,
-        "autodev-reconcile.md": f"""---
+        reconcile_filename: f"""---
 description: Reconcile autodev runtime state for the current project
 agent: build
 subtask: false
@@ -85,7 +114,24 @@ Report the supervisor decision and whether it requires a subagent or fresh main 
 
 Set `AUTODEV_HOME` first if the shared workflow repo is not installed at `~/apps/autodev`.
 """,
-        "autodev-show-session.md": f"""---
+        release_filename: f"""---
+description: Launch independent autodev release worker for PR merge
+agent: build
+subtask: false
+---
+
+Run the independent release path for issue number `$ARGUMENTS` in the current project. If no issue number is provided, autodev selects the first verified issue waiting for release.
+
+Run:
+!`AUTODEV_HOME="{autodev_home}" PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" release --project-root "$PWD" --issue-number "$1"`
+
+Report the DB-backed release dispatch result and the release_worker session to resume.
+
+Notes:
+- This is separate from `/autodev-reconcile` so human PR approval waits do not block development scheduling.
+- Entrypoint: `scripts/autodev_project.py release`.
+""",
+        inspect_filename: f"""---
 description: Show the latest autodev root session for the current project
 agent: build
 subtask: false
@@ -98,7 +144,7 @@ Report how to inspect or resume the latest root session.
 
 Set `AUTODEV_HOME` first if the shared workflow repo is not installed at `~/apps/autodev`.
 """,
-        "autodev-doctor.md": f"""---
+        doctor_filename: f"""---
 description: Check whether the current project is ready for autodev
 agent: build
 subtask: false
@@ -144,11 +190,61 @@ def _read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def _ensure_checkpoint_file(root: Path) -> None:
-    checkpoint_path = root / "docs/agents/runtime/context-checkpoint.yaml"
-    if checkpoint_path.exists():
+def _runtime_gitignore_is_configured(root: Path) -> bool:
+    gitignore = root / ".gitignore"
+    if not gitignore.exists():
+        return False
+    text = _read_text(gitignore)
+    return all(line in text.splitlines() for line in RUNTIME_GITIGNORE_LINES[1:])
+
+
+def _ensure_runtime_gitignore(root: Path, *, dry_run: bool, check: bool, report: ActionReport) -> None:
+    if _runtime_gitignore_is_configured(root):
         return
-    _write_text(checkpoint_path, _read_text(CHECKPOINT_TEMPLATE_PATH))
+    report.actions.append("update .gitignore for autodev runtime state")
+    if dry_run or check:
+        return
+    gitignore = root / ".gitignore"
+    original = _read_text(gitignore) if gitignore.exists() else ""
+    separator = "" if not original or original.endswith("\n") else "\n"
+    block = "\n".join(RUNTIME_GITIGNORE_LINES) + "\n"
+    _write_text(gitignore, f"{original}{separator}{block}")
+
+
+def _tracked_runtime_paths(root: Path) -> list[str]:
+    if not _is_git_repo(root):
+        return []
+    result = _run_command(["git", "ls-files", ".opencode/runtime"], cwd=root, check=False)
+    if result.returncode != 0:
+        return []
+    stdout = cast(str, result.stdout or "")
+    return [line.strip() for line in stdout.splitlines() if line.strip() and line.strip() != ".opencode/runtime/.gitkeep"]
+
+
+def _print_runtime_path_confirmation(*, project_root: Path, command: str) -> None:
+    runtime_db = project_root / ".opencode/runtime/control-plane.sqlite3"
+    print(f"[autodev:{command}] project-root={project_root}")
+    print(f"[autodev:{command}] runtime-db={runtime_db}")
+    print(f"[autodev:{command}] supervisor-base-dir={project_root}")
+
+
+def _enforce_runtime_db_untracked(*, project_root: Path, command: str) -> bool:
+    report = doctor_project(project_root)
+    tracked_findings = [
+        finding
+        for finding in report.findings
+        if finding.startswith(TRACKED_RUNTIME_BLOCK_PREFIX)
+    ]
+    if not tracked_findings:
+        print(f"[autodev:{command}] doctor tracked-runtime check: pass")
+        return True
+    for finding in tracked_findings:
+        print(f"[autodev:{command}] BLOCKED: {finding}", file=sys.stderr)
+    print(
+        f"[autodev:{command}] Run `PYTHONPATH=. python3 scripts/autodev_project.py doctor --project-root \"{project_root}\"` and untrack runtime DB before retrying.",
+        file=sys.stderr,
+    )
+    return False
 
 
 def _run_command(args: list[str], *, cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -159,9 +255,17 @@ def _repo_https_url(github_repo: str) -> str:
     return f"https://github.com/{github_repo}.git"
 
 
+def _validate_github_repo(github_repo: str) -> str:
+    normalized = github_repo.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", normalized):
+        raise ValueError(f"github_repo must be owner/repo, got {github_repo!r}")
+    return normalized
+
+
 def _is_git_repo(root: Path) -> bool:
     result = _run_command(["git", "rev-parse", "--is-inside-work-tree"], cwd=root, check=False)
-    return result.returncode == 0 and result.stdout.strip() == "true"
+    stdout = cast(str, result.stdout or "")
+    return result.returncode == 0 and stdout.strip() == "true"
 
 
 def _git_remote_url(root: Path, remote: str) -> str | None:
@@ -278,13 +382,8 @@ def _config_text(root: Path, github_repo: str) -> str:
             "    - docs/agents/issue-tracker.md",
             "    - docs/agents/triage-labels.md",
             "",
-            "artifacts:",
-            "  issue_packets: docs/agents/issue-packets",
-            "  handoffs: docs/agents/handoffs",
-            "  worker_results: docs/agents/worker-results",
-            "  evidence: docs/agents/evidence",
-            "  release_results: docs/agents/release-results",
-            "  runtime: .opencode/runtime",
+            "runtime:",
+            "  control_plane_db: .opencode/runtime/control-plane.sqlite3",
             "",
         ]
     )
@@ -301,8 +400,8 @@ def _managed_agents_block() -> str:
             "- Project config: `.autodev.yaml`",
             f"- Workflow source: `{ROOT}`",
             f"- Main workflow policy: `{ROOT / 'docs/agents/autonomous-development-workflow.yaml'}`",
-            "- Runtime artifacts: `.opencode/runtime/`",
-            "- Issue artifacts: `docs/agents/issue-packets/`, `handoffs/`, `worker-results/`, `evidence/`, `release-results/`",
+            "- Runtime state: `.opencode/runtime/control-plane.sqlite3`",
+            "- SQLite is the only runtime control-plane source of truth; local YAML/JSON artifacts are not required for progress.",
             "",
             "Do not copy workflow implementation, templates, commands, or runner scripts into this repo.",
             AGENTS_END,
@@ -325,6 +424,7 @@ def _replace_managed_block(original: str, block: str) -> str:
 
 
 def init_project(root: Path, *, github_repo: str, dry_run: bool, check: bool, force: bool) -> ActionReport:
+    github_repo = _validate_github_repo(github_repo)
     report = ActionReport(actions=[], findings=[])
     config_path = root / ".autodev.yaml"
     expected_config = _config_text(root, github_repo)
@@ -345,6 +445,8 @@ def init_project(root: Path, *, github_repo: str, dry_run: bool, check: bool, fo
             if not dry_run and not check:
                 path.mkdir(parents=True, exist_ok=True)
 
+    _ensure_runtime_gitignore(root, dry_run=dry_run, check=check, report=report)
+
     gitkeep = root / ".opencode/runtime/.gitkeep"
     if not gitkeep.exists():
         report.actions.append("create .opencode/runtime/.gitkeep")
@@ -356,12 +458,6 @@ def init_project(root: Path, *, github_repo: str, dry_run: bool, check: bool, fo
         report.actions.append("create .opencode/runtime/control-plane.sqlite3")
         if not dry_run and not check:
             _ = ensure_control_plane_db(root)
-
-    checkpoint_path = root / "docs/agents/runtime/context-checkpoint.yaml"
-    if not checkpoint_path.exists():
-        report.actions.append("create docs/agents/runtime/context-checkpoint.yaml")
-        if not dry_run and not check:
-            _ensure_checkpoint_file(root)
 
     for relative_path, starter in DOMAIN_DOCS.items():
         path = root / relative_path
@@ -412,6 +508,13 @@ def doctor_project(root: Path) -> ActionReport:
         report.findings.append("missing .autodev.yaml")
     if not (root / ".opencode/runtime/control-plane.sqlite3").exists():
         report.findings.append("missing .opencode/runtime/control-plane.sqlite3")
+    if _is_git_repo(root) and not _runtime_gitignore_is_configured(root):
+        report.findings.append("missing .gitignore entries for .opencode/runtime/*")
+    tracked_runtime = _tracked_runtime_paths(root)
+    if tracked_runtime:
+        report.findings.append(
+            "tracked autodev runtime files must be removed from git index: " + ", ".join(tracked_runtime)
+        )
     agents_path = root / "AGENTS.md"
     if agents_path.exists():
         text = _read_text(agents_path)
@@ -422,6 +525,31 @@ def doctor_project(root: Path) -> ActionReport:
     else:
         report.findings.append("missing AGENTS.md")
     return report
+
+
+def _show_session_result(project_root: Path) -> tuple[int, str]:
+    payload = show_latest_session(base_dir=project_root)
+    if payload is None:
+        return 1, "no DB-backed autodev session found\n"
+    return 0, f"{json.dumps(payload, ensure_ascii=False)}\n"
+
+
+def _reconcile_issue_number(project_root: Path) -> str:
+    active_states = ["claimed", "dispatching", "running", "verifying", "verified", "release_pending", "quarantined", "failed"]
+    active_with_session = list_issues(project_root, states=active_states, require_current_session=True)
+    if active_with_session:
+        return str(active_with_session[0].get("issue_number") or "")
+    active_issues = list_issues(project_root, states=active_states)
+    if active_issues:
+        return str(active_issues[0].get("issue_number") or "")
+    raise RuntimeError("no DB-backed autodev issue is currently active for reconcile")
+
+
+def _has_reconcileable_issue(project_root: Path) -> bool:
+    active_states = ["claimed", "dispatching", "running", "verifying", "verified", "release_pending", "quarantined", "failed"]
+    if list_issues(project_root, states=active_states):
+        return True
+    return bool(list_issues(project_root, states=["ready"]))
 
 
 def _print_report(report: ActionReport, *, json_output: bool) -> None:
@@ -439,24 +567,13 @@ def _print_report(report: ActionReport, *, json_output: bool) -> None:
 def _bootstrap_args(project_root: Path, issue_number: str) -> list[str]:
     normalized = issue_number.strip().removeprefix("#").removeprefix("issue-")
     return [
+        "start-issue",
+        "--base-dir",
+        str(project_root),
         "--issue-number",
         normalized,
-        "--checkpoint",
-        str(project_root / "docs/agents/runtime/context-checkpoint.yaml"),
-        "--ledger",
-        str(project_root / ".opencode/runtime/orchestrator-ledger.json"),
-        "--new-session-request",
-        str(project_root / ".opencode/runtime/new-session-request.json"),
-        "--workflow-policy-path",
-        str(ROOT / "docs/agents/autonomous-development-workflow.yaml"),
-        "--dispatch-now",
         "--source-session-id",
         "autodev-start",
-        "--approval-override-mode",
-        "bypass_approval",
-        "--override-source",
-        "user_requested_autodev_start",
-        "--human-approval-skipped",
     ]
 
 
@@ -466,6 +583,51 @@ def _shared_workflow_env() -> dict[str, str]:
     root_str = str(ROOT)
     env["PYTHONPATH"] = f"{root_str}{os.pathsep}{pythonpath}" if pythonpath else root_str
     return env
+
+
+def _reconcile_workspace_command(project_root: Path) -> list[str]:
+    return [
+        "python3",
+        "-m",
+        "scripts.orchestrator_supervisor",
+        "reconcile-workspace",
+        "--base-dir",
+        str(project_root),
+    ]
+
+
+def _run_reconcile_workspace(project_root: Path) -> int:
+    return subprocess.run(
+        _reconcile_workspace_command(project_root),
+        cwd=project_root,
+        env=_shared_workflow_env(),
+    ).returncode
+
+
+def reconcile_watch(
+    project_root: Path,
+    *,
+    interval_seconds: float,
+    iterations: int,
+    stop_on_error: bool,
+) -> int:
+    if interval_seconds < 0:
+        raise ValueError("--interval-seconds must be non-negative")
+    if iterations < 0:
+        raise ValueError("--iterations must be non-negative")
+
+    cycle = 0
+    final_exit_code = 0
+    while iterations == 0 or cycle < iterations:
+        exit_code = _run_reconcile_workspace(project_root)
+        final_exit_code = max(final_exit_code, exit_code)
+        cycle += 1
+        if stop_on_error and exit_code != 0:
+            return exit_code
+        if iterations > 0 and cycle >= iterations:
+            break
+        time.sleep(interval_seconds)
+    return final_exit_code
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -480,8 +642,8 @@ def build_parser() -> argparse.ArgumentParser:
     _ = init.add_argument("--force", action="store_true")
     _ = init.add_argument("--json", action="store_true")
 
-    install = subparsers.add_parser("install-commands", help="Install autodev-owned global OpenCode commands")
-    _ = install.add_argument("--commands-dir", default=str(DEFAULT_COMMANDS_DIR))
+    install = subparsers.add_parser("install-commands", help="Install autodev-owned global host commands")
+    _ = install.add_argument("--commands-dir", default=str(_default_commands_dir()))
     _ = install.add_argument("--dry-run", action="store_true")
     _ = install.add_argument("--force", action="store_true")
     _ = install.add_argument("--json", action="store_true")
@@ -496,6 +658,35 @@ def build_parser() -> argparse.ArgumentParser:
 
     reconcile = subparsers.add_parser("reconcile", help="Reconcile autodev runtime state")
     _ = reconcile.add_argument("--project-root", default=".")
+
+    reconcile_watch_parser = subparsers.add_parser("reconcile-watch", help="Continuously reconcile autodev runtime state")
+    _ = reconcile_watch_parser.add_argument("--project-root", default=".")
+    _ = reconcile_watch_parser.add_argument(
+        "--interval-seconds",
+        type=float,
+        default=30.0,
+        help="Seconds to wait between reconcile cycles",
+    )
+    _ = reconcile_watch_parser.add_argument(
+        "--iterations",
+        type=int,
+        default=0,
+        help="Number of reconcile cycles to run; 0 means run until interrupted",
+    )
+    _ = reconcile_watch_parser.add_argument(
+        "--stop-on-error",
+        action="store_true",
+        help="Exit immediately when a reconcile cycle returns a non-zero status",
+    )
+
+    release = subparsers.add_parser("release", help="Launch independent release worker for PR merge")
+    _ = release.add_argument("--project-root", default=".")
+    _ = release.add_argument("--issue-number", default="")
+    _ = release.add_argument(
+        "--auto-approve",
+        action="store_true",
+        help="Bypass only the human merge approval gate during release; all verifier/check/mergeability gates still apply",
+    )
 
     show = subparsers.add_parser("show-session", help="Show latest autodev root session")
     _ = show.add_argument("--project-root", default=".")
@@ -528,41 +719,70 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if report.has_findings() else 0
     if command == "start":
         project_root = _consumer_project_root(cast(str, args.project_root))
-        _ensure_checkpoint_file(project_root)
+        _print_runtime_path_confirmation(project_root=project_root, command=command)
+        if not _enforce_runtime_db_untracked(project_root=project_root, command=command):
+            return 1
         return subprocess.run(
-            ["python3", "-m", "scripts.orchestrator_bootstrap_runner", *_bootstrap_args(project_root, cast(str, args.issue_number))],
+            ["python3", "-m", "scripts.orchestrator_supervisor", *_bootstrap_args(project_root, cast(str, args.issue_number))],
             cwd=project_root,
             env=_shared_workflow_env(),
         ).returncode
     if command == "reconcile":
         project_root = _consumer_project_root(cast(str, args.project_root))
+        _print_runtime_path_confirmation(project_root=project_root, command=command)
+        if not _enforce_runtime_db_untracked(project_root=project_root, command=command):
+            return 1
+        if not _has_reconcileable_issue(project_root):
+            raise RuntimeError("no DB-backed autodev issue is currently active for reconcile")
+        return _run_reconcile_workspace(project_root)
+    if command == "reconcile-watch":
+        project_root = _consumer_project_root(cast(str, args.project_root))
+        _print_runtime_path_confirmation(project_root=project_root, command=command)
+        if not _enforce_runtime_db_untracked(project_root=project_root, command=command):
+            return 1
+        return reconcile_watch(
+            project_root,
+            interval_seconds=cast(float, args.interval_seconds),
+            iterations=cast(int, args.iterations),
+            stop_on_error=cast(bool, args.stop_on_error),
+        )
+    if command == "release":
+        project_root = _consumer_project_root(cast(str, args.project_root))
+        _print_runtime_path_confirmation(project_root=project_root, command=command)
+        if not _enforce_runtime_db_untracked(project_root=project_root, command=command):
+            return 1
+        release_args = [
+            "python3",
+            "-m",
+            "scripts.orchestrator_supervisor",
+            "release",
+            "--base-dir",
+            str(project_root),
+            "--source-session-id",
+            "autodev-release",
+        ]
+        issue_number = cast(str, args.issue_number).strip()
+        if issue_number:
+            release_args.extend(["--issue-number", issue_number])
+        if cast(bool, args.auto_approve):
+            release_args.extend(
+                [
+                    "--approval-override-mode",
+                    "bypass_approval",
+                    "--override-source",
+                    "user_requested_autodev_release",
+                    "--human-approval-skipped",
+                ]
+            )
         return subprocess.run(
-            [
-                "python3",
-                "-m",
-                "scripts.orchestrator_supervisor",
-                "reconcile",
-                "--ledger",
-                ".opencode/runtime/orchestrator-ledger.json",
-                "--request",
-                ".opencode/runtime/new-session-request.json",
-                "--session-result",
-                ".opencode/runtime/new-session-result.json",
-                "--write-request",
-                "--dispatch-now",
-                "--source-session-id",
-                "autodev-reconcile",
-            ],
+            release_args,
             cwd=project_root,
             env=_shared_workflow_env(),
         ).returncode
     if command == "show-session":
-        result_path = _consumer_project_root(cast(str, args.project_root)) / ".opencode/runtime/new-session-result.json"
-        if not result_path.exists():
-            print(f"no autodev session result found: {result_path}")
-            return 1
-        print(_read_text(result_path), end="")
-        return 0
+        exit_code, output = _show_session_result(_consumer_project_root(cast(str, args.project_root)))
+        print(output, end="")
+        return exit_code
     return 2
 
 

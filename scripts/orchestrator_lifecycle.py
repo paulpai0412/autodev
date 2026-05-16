@@ -11,6 +11,7 @@ from uuid import uuid4
 from scripts.control_plane_db import (
     ensure_control_plane_db,
     ensure_issue_row,
+    read_artifact_fact,
     read_issue,
     record_admin_decision,
     record_github_sync_attempt,
@@ -18,22 +19,17 @@ from scripts.control_plane_db import (
     transition_issue_state,
     upsert_issue_state,
 )
-
-
 JsonObject = dict[str, object]
 NowFunc = Callable[[str | None], str]
 SyncProgressLabel = Callable[..., str]
 TransitionIssueState = Callable[..., None]
 ReleaseIssueExecution = Callable[..., None]
+SyncLocalMainAfterReleaseMerge = Callable[..., str]
 
-DEFAULT_PROJECT_CONFIG_PATH = ".autodev.yaml"
-DEFAULT_ISSUE_LOCKS_DIR = ".opencode/runtime/issue-locks"
 READY_FOR_AGENT_LABEL = "ready-for-agent"
 AGENT_DISPATCHING_LABEL = "agent-dispatching"
 AGENT_IN_PROGRESS_LABEL = "agent-in-progress"
 QUARANTINED_LABEL = "quarantined"
-
-
 def _issue_backing_type(base_dir: Path, issue_number: str) -> str:
     issue = read_issue(base_dir, issue_number) or {}
     issue_packet = cast(dict[str, object], json.loads(str(issue.get("issue_packet_json") or "{}"))) if issue else {}
@@ -53,8 +49,7 @@ def transition_issue_state_if_possible(
     updated_at: str,
     reason: str,
     from_state: str | None = None,
-    current_root_session_id: str | None = None,
-    current_verifier_session_id: str | None = None,
+    current_session_id: str | None = None,
 ) -> None:
     transition_issue_state(
         base_dir,
@@ -65,33 +60,13 @@ def transition_issue_state_if_possible(
         reason=reason,
         updated_at=updated_at,
         from_state=from_state,
-        current_root_session_id=current_root_session_id,
-        current_verifier_session_id=current_verifier_session_id,
+        current_session_id=current_session_id,
     )
 
 
-def issue_lock_path(base_dir: Path, issue_number: str) -> Path:
-    return base_dir / DEFAULT_ISSUE_LOCKS_DIR / f"issue-{issue_number}.json"
-
-
 def has_issue_execution_lock(base_dir: Path, issue_number: str) -> bool:
-    return issue_lock_path(base_dir, issue_number).exists()
-
-
-def read_json(path: Path) -> JsonObject:
-    return cast(JsonObject, json.loads(path.read_text(encoding="utf-8")))
-
-
-def read_issue_lock(path: Path) -> JsonObject:
-    try:
-        return read_json(path)
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-def write_issue_lock(path: Path, payload: JsonObject) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _ = path.write_text(f"{json.dumps(payload, indent=2, ensure_ascii=False)}\n", encoding="utf-8")
+    issue = read_issue(base_dir, issue_number) or {}
+    return str(issue.get("state") or "") in {"claimed", "dispatching", "running", "verifying", "quarantined"}
 
 
 def update_issue_execution_claim(
@@ -101,24 +76,19 @@ def update_issue_execution_claim(
     updates: JsonObject,
     now: NowFunc,
 ) -> None:
-    lock_path = issue_lock_path(base_dir, issue_number)
-    payload: JsonObject = read_issue_lock(lock_path) if lock_path.exists() else {"issueNumber": issue_number}
+    issue = read_issue(base_dir, issue_number) or {}
+    payload: JsonObject = cast(dict[str, object], json.loads(str(issue.get("artifact_refs_json") or "{}"))) if issue else {"issueNumber": issue_number}
     for key, value in updates.items():
         payload[str(key)] = value
-    write_issue_lock(lock_path, payload)
-    issue = read_issue(base_dir, issue_number) or {}
-    existing_artifacts = cast(dict[str, object], json.loads(str(issue.get("artifact_refs_json") or "{}"))) if issue else {}
-    existing_artifacts.update(updates)
     _ = sync_issue_runtime_context(
         base_dir,
         issue_number=issue_number,
-        updated_at=str(existing_artifacts.get("recordedAt") or now(None)),
-        artifact_refs=existing_artifacts,
+        updated_at=str(payload.get("recordedAt") or now(None)),
+        artifact_refs=payload,
     )
 
 
 def clear_issue_execution_claim_projection(*, base_dir: Path, issue_number: str, updated_at: str) -> None:
-    issue_lock_path(base_dir, issue_number).unlink(missing_ok=True)
     issue = read_issue(base_dir, issue_number) or {}
     existing_artifacts = cast(dict[str, object], json.loads(str(issue.get("artifact_refs_json") or "{}"))) if issue else {}
     for key in ["issueNumber", "branch", "sourceSessionID", "createdAt", "status", "rootSessionID", "verifierSessionID", "recordedAt"]:
@@ -138,36 +108,15 @@ def clear_issue_session_ids(*, base_dir: Path, issue_number: str, updated_at: st
         state=str((read_issue(base_dir, issue_number) or {}).get("state") or "ready"),
         command_id=f"clear-session-ids:{issue_number}:{updated_at}",
         updated_at=updated_at,
-        current_root_session_id="",
-        current_verifier_session_id="",
+        current_session_id="",
     )
-
-
-def read_project_github_repo(base_dir: Path) -> str:
-    config_path = base_dir / DEFAULT_PROJECT_CONFIG_PATH
-    if not config_path.exists():
-        return ""
-    in_project = False
-    for line in config_path.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        indent = len(line) - len(line.lstrip(" "))
-        if indent == 0 and stripped == "project:":
-            in_project = True
-            continue
-        if in_project and indent == 0:
-            break
-        if in_project and indent == 2 and stripped.startswith("github_repo:"):
-            _, value = stripped.split(":", 1)
-            return value.strip().strip('"')
-    return ""
 
 
 def sync_issue_progress_label(
     *,
     base_dir: Path,
     issue_number: str,
+    repo: str,
     add_labels: list[str],
     remove_labels: list[str],
     now: NowFunc,
@@ -189,7 +138,6 @@ def sync_issue_progress_label(
                 last_error="skipped GitHub label sync for local-seeded issue",
             )
         return ""
-    repo = read_project_github_repo(base_dir)
     if not repo:
         if command_id:
             record_github_sync_attempt(
@@ -235,6 +183,66 @@ def sync_issue_progress_label(
     return error
 
 
+def sync_local_main_after_release_merge(
+    *,
+    base_dir: Path,
+    issue_number: str,
+    updated_at: str | None = None,
+) -> str:
+    del updated_at
+    issue = read_issue(base_dir, issue_number) or {}
+    release_result = read_artifact_fact(base_dir, issue_number, "release_result")
+    if not bool(release_result.get("parse_ok")):
+        return ""
+
+    status = str(release_result.get("status") or "").strip().lower()
+    if status not in {"success", "completed"}:
+        return ""
+
+    merge_payload_raw = release_result.get("merge")
+    merge_payload = cast(dict[str, object], merge_payload_raw) if isinstance(merge_payload_raw, dict) else {}
+    merged = bool(merge_payload.get("merged")) or bool(str(merge_payload.get("merged_sha") or ""))
+    if not merged:
+        return ""
+
+    branch = str(issue.get("branch") or "").strip()
+
+    def _run_git(command: list[str]) -> str:
+        completed = subprocess.run(command, cwd=base_dir, check=False, capture_output=True, text=True)
+        if completed.returncode == 0:
+            return ""
+        return (completed.stderr or completed.stdout).strip() or (
+            f"{' '.join(command)} failed with exit code {completed.returncode}"
+        )
+
+    repo_probe = _run_git(["git", "rev-parse", "--is-inside-work-tree"])
+    if repo_probe:
+        return ""
+
+    for command in (
+        ["git", "fetch", "origin", "main"],
+        ["git", "checkout", "main"],
+        ["git", "pull", "--ff-only", "origin", "main"],
+    ):
+        sync_error = _run_git(command)
+        if sync_error:
+            return f"failed local main sync after release merge for issue #{issue_number}: {sync_error}"
+
+    if branch and branch != "main":
+        branch_exists_error = _run_git(["git", "rev-parse", "--verify", branch])
+        if not branch_exists_error:
+            for command in (
+                ["git", "checkout", branch],
+                ["git", "merge", "--ff-only", "main"],
+                ["git", "checkout", "main"],
+            ):
+                sync_error = _run_git(command)
+                if sync_error:
+                    return f"failed local branch/main sync after release merge for issue #{issue_number}: {sync_error}"
+
+    return ""
+
+
 def claim_issue_execution(
     *,
     base_dir: Path,
@@ -248,18 +256,6 @@ def claim_issue_execution(
 ) -> None:
     timestamp = now(updated_at)
     ensure_control_plane_db(base_dir)
-    lock_path = issue_lock_path(base_dir, issue_number)
-    if lock_path.exists():
-        existing = read_issue_lock(lock_path)
-        holder = str(existing.get("rootSessionID") or existing.get("sourceSessionID") or "unknown-session")
-        created_at = str(existing.get("createdAt") or existing.get("recordedAt") or "unknown-time")
-        resume_hint = ""
-        root_session_id = str(existing.get("rootSessionID") or "")
-        if root_session_id:
-            resume_hint = f" Resume with: opencode --session {root_session_id}."
-        raise RuntimeError(
-            f"issue #{issue_number} is already in progress via {holder} since {created_at}; refusing duplicate start.{resume_hint}"
-        )
     existing_issue = read_issue(base_dir, issue_number)
     if existing_issue is not None and str(existing_issue.get("state") or "") in {
         "claimed",
@@ -268,7 +264,7 @@ def claim_issue_execution(
         "verifying",
         "quarantined",
     }:
-        holder = str(existing_issue.get("current_root_session_id") or source_session_id or "unknown-session")
+        holder = str(existing_issue.get("current_session_id") or source_session_id or "unknown-session")
         created_at = str(
             existing_issue.get("claimed_at")
             or existing_issue.get("dispatching_at")
@@ -276,23 +272,12 @@ def claim_issue_execution(
             or existing_issue.get("updated_at")
             or "unknown-time"
         )
-        resume_hint = f" Resume with: opencode --session {holder}." if holder else ""
         raise RuntimeError(
-            f"issue #{issue_number} is already in progress via {holder} since {created_at}; refusing duplicate start.{resume_hint}"
+            f"issue #{issue_number} is already in progress via {holder} since {created_at}; refusing duplicate start."
         )
 
     command_id = uuid4().hex
     ensure_issue_row(base_dir, issue_number=issue_number, updated_at=timestamp)
-    write_issue_lock(
-        lock_path,
-        {
-            "issueNumber": issue_number,
-            "branch": branch,
-            "sourceSessionID": source_session_id,
-            "createdAt": timestamp,
-            "status": "claimed",
-        },
-    )
     _ = sync_issue_runtime_context(
         base_dir,
         issue_number=issue_number,
@@ -341,6 +326,7 @@ def release_issue_execution(
     restore_ready_for_agent: bool,
     now: NowFunc,
     sync_progress_label: SyncProgressLabel,
+    sync_local_main_after_release_merge: SyncLocalMainAfterReleaseMerge,
     transition_state: TransitionIssueState,
     final_state: str | None = None,
     updated_at: str | None = None,
@@ -368,10 +354,29 @@ def release_issue_execution(
         raise ValueError(f"issue #{issue_number} is missing from control-plane state")
 
     current_state = str(issue_state.get("state") or "")
+
+    if target_state == "completed":
+        sync_error = sync_local_main_after_release_merge(
+            base_dir=base_dir,
+            issue_number=issue_number,
+            updated_at=timestamp,
+        )
+        if sync_error:
+            record_admin_decision(
+                base_dir,
+                command_id=f"{command_id}:admin-local-main-sync-failed",
+                issue_number=issue_number,
+                decision_type="admin_local_main_sync_failure",
+                from_state=current_state,
+                to_state=current_state,
+                reason=sync_error,
+                updated_at=timestamp,
+            )
+            raise RuntimeError(sync_error)
+
     if target_state == "ready" and current_state in {"ready", "claimed", "dispatching"}:
         clear_issue_execution_claim_projection(base_dir=base_dir, issue_number=issue_number, updated_at=timestamp)
-    elif target_state in {"failed", "completed"}:
-        issue_lock_path(base_dir, issue_number).unlink(missing_ok=True)
+    elif target_state in {"verified", "failed", "completed"}:
         clear_issue_execution_claim_projection(base_dir=base_dir, issue_number=issue_number, updated_at=timestamp)
 
     if current_state == target_state:
@@ -391,7 +396,20 @@ def release_issue_execution(
         )
         return
 
-    if target_state == "failed" and current_state in {"running", "verifying", "quarantined"}:
+    if target_state == "verified" and current_state == "release_pending":
+        transition_state(
+            base_dir=base_dir,
+            issue_number=issue_number,
+            to_state="verified",
+            command_id=command_id,
+            updated_at=timestamp,
+            reason=f"Return issue #{issue_number} to verified after non-terminal release block.",
+            from_state="release_pending",
+            current_session_id="",
+        )
+        return
+
+    if target_state == "failed" and current_state in {"running", "verifying", "release_pending", "quarantined"}:
         transition_state(
             base_dir=base_dir,
             issue_number=issue_number,
@@ -410,13 +428,12 @@ def release_issue_execution(
                 base_dir=base_dir,
                 issue_number=issue_number,
                 to_state="failed",
-                command_id=f"{command_id}:failed",
-                updated_at=timestamp,
-                reason=f"Release issue #{issue_number} into failed terminal state.",
-                from_state="quarantined",
-                current_root_session_id="",
-                current_verifier_session_id="",
-            )
+            command_id=f"{command_id}:failed",
+            updated_at=timestamp,
+            reason=f"Release issue #{issue_number} into failed terminal state.",
+            from_state="quarantined",
+            current_session_id="",
+        )
         else:
             clear_issue_session_ids(base_dir=base_dir, issue_number=issue_number, updated_at=timestamp)
         return
@@ -428,8 +445,7 @@ def release_issue_execution(
             state="failed",
             command_id=command_id,
             updated_at=timestamp,
-            current_root_session_id="",
-            current_verifier_session_id="",
+            current_session_id="",
         )
         record_admin_decision(
             base_dir,
@@ -443,7 +459,7 @@ def release_issue_execution(
         )
         return
 
-    if target_state == "completed" and current_state == "verifying":
+    if target_state == "completed" and current_state in {"verifying", "release_pending"}:
         transition_state(
             base_dir=base_dir,
             issue_number=issue_number,
@@ -451,9 +467,8 @@ def release_issue_execution(
             command_id=command_id,
             updated_at=timestamp,
             reason=f"Release issue #{issue_number} into completed terminal state.",
-            from_state="verifying",
-            current_root_session_id="",
-            current_verifier_session_id="",
+            from_state=current_state,
+            current_session_id="",
         )
         return
 
@@ -464,8 +479,7 @@ def release_issue_execution(
             state="completed",
             command_id=command_id,
             updated_at=timestamp,
-            current_root_session_id="",
-            current_verifier_session_id="",
+            current_session_id="",
         )
         record_admin_decision(
             base_dir,
@@ -496,7 +510,7 @@ def quarantine_issue_execution(
     ensure_control_plane_db(base_dir)
     issue = read_issue(base_dir, issue_number) or {}
     from_state = str(issue.get("state") or "running")
-    if from_state not in {"running", "dispatching", "verifying"}:
+    if from_state not in {"running", "dispatching", "verifying", "release_pending"}:
         raise ValueError(f"cannot quarantine issue #{issue_number} from {from_state!r}")
     transition_state(
         base_dir=base_dir,
@@ -571,23 +585,21 @@ def redispatch_quarantined_issue_execution(
         updated_at=timestamp,
         reason=reason,
         from_state="quarantined",
-        current_root_session_id="",
-        current_verifier_session_id="",
+        current_session_id="",
     )
-    lock_payload: JsonObject = {
+    claim_payload: JsonObject = {
         "issueNumber": issue_number,
         "branch": branch,
         "sourceSessionID": source_session_id,
         "createdAt": timestamp,
         "status": "claimed",
     }
-    write_issue_lock(issue_lock_path(base_dir, issue_number), lock_payload)
 
     issue = read_issue(base_dir, issue_number) or {}
     existing_artifacts = cast(dict[str, object], json.loads(str(issue.get("artifact_refs_json") or "{}"))) if issue else {}
     for key in ["issueNumber", "branch", "sourceSessionID", "createdAt", "status", "rootSessionID", "recordedAt"]:
         existing_artifacts.pop(key, None)
-    existing_artifacts.update(lock_payload)
+    existing_artifacts.update(claim_payload)
     _ = sync_issue_runtime_context(
         base_dir,
         issue_number=issue_number,
@@ -611,8 +623,7 @@ def redispatch_quarantined_issue_execution(
             state="quarantined",
             command_id=f"{command_id}:rollback",
             updated_at=timestamp,
-            current_root_session_id="",
-            current_verifier_session_id="",
+            current_session_id="",
         )
         raise RuntimeError(f"failed to sync GitHub redispatch labels for issue #{issue_number}: {sync_error}")
 

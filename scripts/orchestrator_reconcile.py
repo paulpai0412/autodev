@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Callable, Protocol, cast
 from uuid import uuid4
@@ -11,16 +12,75 @@ JsonObject = dict[str, object]
 ReconcileResult = tuple[JsonObject, JsonObject, JsonObject | None]
 
 
-def _canonical_artifact_path(path_text: str, *, base_dir: Path) -> Path:
-    path = Path(path_text)
-    return path if path.is_absolute() else base_dir / path
+def _set_artifact_ref(artifacts: dict[str, str], semantic_key: str, value: str) -> None:
+    artifacts[semantic_key] = value
+
+
+def _stored_fact(artifacts: dict[str, str], entry_type: str, read_artifact_fact: Callable[[str], dict[str, object]]) -> dict[str, object]:
+    _ = artifacts
+    return read_artifact_fact(entry_type)
+
+
+def _fact_from_latest_history_entry(row: dict[str, object] | None) -> dict[str, object]:
+    if not isinstance(row, dict):
+        return {}
+    payload_raw = row.get("payload_json")
+    payload: dict[str, object] = {}
+    if isinstance(payload_raw, str) and payload_raw.strip():
+        try:
+            decoded = json.loads(payload_raw)
+        except json.JSONDecodeError:
+            decoded = None
+        if isinstance(decoded, dict):
+            payload = cast(dict[str, object], decoded)
+    status = str(payload.get("status") or row.get("status") or "")
+    if not status:
+        return {}
+    snapshot: dict[str, object] = {
+        "parse_ok": True,
+        "source": "history_fallback",
+        "status": status,
+        "observed_at": str(row.get("created_at") or ""),
+        "history_id": row.get("history_id"),
+        "command_id": str(row.get("command_id") or ""),
+    }
+    session_id = str(row.get("session_id") or "")
+    if session_id:
+        snapshot["verifier_session_id"] = session_id
+    snapshot.update(payload)
+    return snapshot
+
+
+def _extract_pr_number_from_fact(fact: dict[str, object]) -> str:
+    pr_number = str(fact.get("pr_number") or "").strip()
+    if pr_number and pr_number != "none":
+        return pr_number
+
+    pr_url = str(fact.get("pr_url") or "").strip()
+    if pr_url:
+        for segment in reversed(pr_url.rstrip("/").split("/")):
+            if segment.isdigit():
+                return segment
+
+    pr_payload_raw = fact.get("pr")
+    if isinstance(pr_payload_raw, dict):
+        pr_payload = cast(dict[str, object], pr_payload_raw)
+        nested_number = str(pr_payload.get("number") or "").strip()
+        if nested_number and nested_number != "none":
+            return nested_number
+        nested_url = str(pr_payload.get("url") or "").strip()
+        if nested_url:
+            for segment in reversed(nested_url.rstrip("/").split("/")):
+                if segment.isdigit():
+                    return segment
+
+    return ""
 
 
 class IssuePacketRecord(Protocol):
     issue_number: str
     title: str
     branch: str
-    issue_packet_path: str
     backing_type: str
     prior_handoff: str
     labels: list[str]
@@ -37,25 +97,12 @@ def queue_transition(
     updated_at: str,
     bump_ledger_revision: Callable[[JsonObject, str], None],
 ) -> None:
-    current = cast(JsonObject, ledger["current"])
-    history = cast(list[JsonObject], ledger["history"])
-    history.append(
-        {
-            "recordedAt": updated_at,
-            "fromRole": current.get("role", "unknown"),
-            "fromStage": current.get("stage", "unknown"),
-            "toRole": next_role,
-            "toStage": next_stage,
-            "reason": summary,
-        }
-    )
+    del summary, updated_at, bump_ledger_revision
     ledger["current"] = {
         "role": next_role,
         "stage": next_stage,
         "status": "queued",
     }
-    bump_ledger_revision(ledger, updated_at)
-    ledger["updatedAt"] = updated_at
 
 
 def set_failure(ledger: JsonObject, *, kind: str, summary: str, retryable: bool) -> None:
@@ -85,14 +132,12 @@ def request_for_transition(
             decision_summary=summary,
         )
     if next_role == "pr_verifier":
-        artifacts = cast(dict[str, str], ledger["artifacts"])
-        evidence_path = artifacts["evidencePacketPath"] or f"issue #{issue['number']} verifier evidence"
         return build_session_request(
             ledger,
             role="pr_verifier",
             stage=next_stage,
             reason=f"pr_verifier dispatch for issue #{issue['number']}",
-            title=f"Verify issue #{issue['number']} using {evidence_path}",
+            title=f"Verify issue #{issue['number']} from DB-backed evidence",
             decision_summary=summary,
         )
     if next_role == "release_worker":
@@ -184,7 +229,6 @@ def queue_orchestrator_recovery(
     summary: str,
     release_issue_execution: Callable[..., None],
     select_next_issue_packet: Callable[..., IssuePacketRecord | None],
-    run_issue_packet_intake: Callable[[Path], bool],
     handoff_to_selected_issue: Callable[..., tuple[JsonObject, JsonObject, JsonObject]],
     request_for_transition_func: Callable[..., JsonObject],
     queue_transition_func: Callable[..., None],
@@ -204,12 +248,6 @@ def queue_orchestrator_recovery(
         workflow=cast(dict[str, str], ledger["workflow"]),
         current_issue=current_issue,
     )
-    if selected_issue is None and run_issue_packet_intake(base_dir):
-        selected_issue = select_next_issue_packet(
-            base_dir,
-            workflow=cast(dict[str, str], ledger["workflow"]),
-            current_issue=cast(dict[str, str], ledger["issue"]),
-        )
     if selected_issue is not None:
         ledger["queuedNextIssue"] = {
             "selectedAt": updated_at,
@@ -218,7 +256,6 @@ def queue_orchestrator_recovery(
                 "issue_number": selected_issue.issue_number,
                 "title": selected_issue.title,
                 "branch": selected_issue.branch,
-                "issue_packet_path": selected_issue.issue_packet_path,
                 "backing_type": selected_issue.backing_type,
                 "prior_handoff": selected_issue.prior_handoff,
                 "labels": list(selected_issue.labels),
@@ -226,7 +263,7 @@ def queue_orchestrator_recovery(
                 "dependencies": list(selected_issue.dependencies),
             },
         }
-        next_summary = f"{summary} Continue automatically with issue #{selected_issue.issue_number} via {selected_issue.issue_packet_path}."
+        next_summary = f"{summary} Continue automatically with issue #{selected_issue.issue_number}."
         return handoff_to_selected_issue(
             ledger,
             selected_issue=selected_issue,
@@ -288,31 +325,19 @@ def reconcile_issue_worker(
     limits: dict[str, int],
     artifacts: dict[str, str],
     updated_at: str,
-    resolve_artifact_path: Callable[..., Path],
-    parse_worker_result_file: Callable[[Path], JsonObject],
     is_successful_release_status: Callable[[str], bool],
-    default_evidence_packet_path: Callable[[str, str], str],
-    read_issue: Callable[[Path, str], JsonObject | None],
-    read_artifact_fact: Callable[[dict[str, object] | None, str], dict[str, object]],
-    record_artifact_status: Callable[..., None],
+    read_artifact_fact: Callable[[str], dict[str, object]],
     set_failure_func: Callable[..., None],
     requeue_issue_worker_func: Callable[..., tuple[JsonObject, None]],
     queue_orchestrator_recovery_func: Callable[..., tuple[JsonObject, JsonObject, JsonObject]],
     queue_transition_func: Callable[..., None],
     subagent_decision_func: Callable[..., JsonObject],
 ) -> ReconcileResult:
-    automation = cast(dict[str, object], ledger.get("automation", {}))
-    primary_workspace_root = str(automation.get("primaryWorkspaceRoot") or "")
-    worker_artifact_base_dir = Path(primary_workspace_root) if primary_workspace_root else base_dir
-    worker_result_path = (
-        _canonical_artifact_path(artifacts["workerResultPath"], base_dir=worker_artifact_base_dir)
-        if primary_workspace_root
-        else resolve_artifact_path(artifacts["workerResultPath"], base_dir=worker_artifact_base_dir)
-    )
-    if not worker_result_path.exists():
+    persisted_worker = _stored_fact(artifacts, "worker_result", read_artifact_fact)
+    if not bool(persisted_worker.get("parse_ok")):
         if current.get("status") == "queued":
             summary = (
-                f"Issue worker for issue #{issue['number']} is queued and has not produced {artifacts['workerResultPath']} yet. "
+                f"Issue worker for issue #{issue['number']} is queued and SQLite has not recorded a worker_result yet. "
                 "Keep the queued dispatch state unchanged."
             )
             return (
@@ -327,7 +352,7 @@ def reconcile_issue_worker(
                 None,
             )
         summary = (
-            f"Issue worker for issue #{issue['number']} ended without writing {artifacts['workerResultPath']}. "
+            f"Issue worker for issue #{issue['number']} ended without recording a worker_result in SQLite. "
             "Retry the worker session as a contract repair."
         )
         set_failure_func(ledger, kind="contract_invalid", summary=summary, retryable=True)
@@ -348,40 +373,20 @@ def reconcile_issue_worker(
             summary=summary,
             final_state="failed",
         )
-
-    worker = parse_worker_result_file(worker_result_path)
-    record_artifact_status(
-        base_dir=base_dir,
-        issue_number=issue["number"],
-        artifact_kind="worker_result",
-        artifact_path=worker_result_path,
-        observed_at=updated_at,
-        parsed=worker,
-    )
-    persisted_worker = read_artifact_fact(read_issue(base_dir, issue["number"]), "worker_result")
-    if not bool(persisted_worker.get("parse_ok")):
-        summary = (
-            f"Issue worker for issue #{issue['number']} wrote {artifacts['workerResultPath']}, but the persisted worker_result fact is missing. "
-            "Treat this as a contract-invalid worker result and retry or recover instead of advancing."
-        )
-        set_failure_func(ledger, kind="contract_invalid", summary=summary, retryable=True)
-        return queue_orchestrator_recovery_func(ledger, base_dir=base_dir, updated_at=updated_at, summary=summary)
-    status = cast(str, persisted_worker.get("status") or worker["status"])
+    status = cast(str, persisted_worker.get("status") or "")
     if is_successful_release_status(status):
-        pr_number = cast(str, persisted_worker.get("pr_number") or worker["pr_number"])
-        if not pr_number or pr_number == "none":
-            summary = (
-                f"Issue worker for issue #{issue['number']} reported success without a PR number. "
-                "Route to main_orchestrator recovery instead of stalling."
-            )
-            set_failure_func(ledger, kind="contract_invalid", summary=summary, retryable=True)
-            return queue_orchestrator_recovery_func(ledger, base_dir=base_dir, updated_at=updated_at, summary=summary)
-        artifacts["evidencePacketPath"] = default_evidence_packet_path(issue["number"], pr_number)
+        pr_number = cast(str, persisted_worker.get("pr_number") or "")
         attempts["pr_verifier"] += 1
-        summary = (
-            f"Issue worker for issue #{issue['number']} succeeded. The main_orchestrator should delegate a "
-            f"pr_verifier subagent for PR #{pr_number}."
-        )
+        if pr_number and pr_number != "none":
+            summary = (
+                f"Issue worker for issue #{issue['number']} succeeded. The main_orchestrator should delegate a "
+                f"pr_verifier subagent for PR #{pr_number}."
+            )
+        else:
+            summary = (
+                f"Issue worker for issue #{issue['number']} succeeded. The main_orchestrator should delegate a "
+                "pr_verifier subagent to verify the pushed branch and create or record the formal PR."
+            )
         set_failure_func(ledger, kind="none", summary="", retryable=True)
         queue_transition_func(
             ledger,
@@ -397,9 +402,9 @@ def reconcile_issue_worker(
             summary=summary,
         ), None
 
-    summary = cast(str, worker["next_recommended_step"])
-    failure_kind = cast(str, worker["failure_kind"] or "issue_worker_retry")
-    retryable = cast(bool | None, worker["retryable"])
+    summary = cast(str, persisted_worker.get("next_recommended_step") or "")
+    failure_kind = cast(str, persisted_worker.get("failure_kind") or "issue_worker_retry")
+    retryable = cast(bool | None, persisted_worker.get("retryable"))
     set_failure_func(
         ledger,
         kind=failure_kind,
@@ -442,12 +447,10 @@ def reconcile_pr_verifier(
     limits: dict[str, int],
     artifacts: dict[str, str],
     updated_at: str,
-    resolve_artifact_path: Callable[..., Path],
-    parse_evidence_packet_file: Callable[[Path], JsonObject],
-    default_release_result_path: Callable[[str, str], str],
     read_issue: Callable[[Path, str], JsonObject | None],
-    read_artifact_fact: Callable[[dict[str, object] | None, str], dict[str, object]],
-    record_artifact_status: Callable[..., None],
+    read_artifact_fact: Callable[[str], dict[str, object]],
+    read_latest_history_entry: Callable[[str], dict[str, object] | None],
+    record_pr_opened: Callable[..., dict[str, object]],
     record_current_verifier_session: Callable[..., None],
     transition_issue_state_if_possible: Callable[..., None],
     set_failure_func: Callable[..., None],
@@ -456,10 +459,14 @@ def reconcile_pr_verifier(
     queue_transition_func: Callable[..., None],
     subagent_decision_func: Callable[..., JsonObject],
 ) -> ReconcileResult:
-    evidence_packet_path = resolve_artifact_path(artifacts["evidencePacketPath"], base_dir=base_dir)
-    if not artifacts["evidencePacketPath"] or not evidence_packet_path.exists():
+    issue_state = read_issue(base_dir, issue["number"])
+    current_issue_state = str(issue_state.get("state") or "") if issue_state else ""
+    persisted_evidence = _stored_fact(artifacts, "evidence_packet", read_artifact_fact)
+    if not bool(persisted_evidence.get("parse_ok")):
+        persisted_evidence = _fact_from_latest_history_entry(read_latest_history_entry("evidence_packet"))
+    if not bool(persisted_evidence.get("parse_ok")):
         summary = (
-            f"pr_verifier for issue #{issue['number']} ended without writing {artifacts['evidencePacketPath'] or 'an evidence packet'}. "
+            f"pr_verifier for issue #{issue['number']} ended without recording evidence_packet in SQLite. "
             "Retry the verifier once before recovery."
         )
         set_failure_func(ledger, kind="contract_invalid", summary=summary, retryable=True)
@@ -493,34 +500,42 @@ def reconcile_pr_verifier(
             summary=summary,
             final_state="failed",
         )
-
-    evidence = parse_evidence_packet_file(evidence_packet_path)
-    record_artifact_status(
-        base_dir=base_dir,
-        issue_number=issue["number"],
-        artifact_kind="evidence_packet",
-        artifact_path=evidence_packet_path,
-        observed_at=updated_at,
-        parsed=evidence,
-    )
-    persisted_evidence = read_artifact_fact(read_issue(base_dir, issue["number"]), "evidence_packet")
-    if not bool(persisted_evidence.get("parse_ok")):
-        summary = (
-            f"pr_verifier for issue #{issue['number']} wrote {artifacts['evidencePacketPath'] or 'an evidence packet'}, but the persisted evidence_packet fact is missing. "
-            "Do not advance to release_worker until SQLite has acknowledged the verifier artifact."
-        )
-        set_failure_func(ledger, kind="contract_invalid", summary=summary, retryable=True)
-        return queue_orchestrator_recovery_func(ledger, base_dir=base_dir, updated_at=updated_at, summary=summary)
-    verifier_session_id = cast(str, persisted_evidence.get("verifier_session_id") or evidence.get("verifier_session_id") or "")
+    verifier_session_id = cast(str, persisted_evidence.get("verifier_session_id") or "")
     record_current_verifier_session(
         base_dir=base_dir,
         issue_number=issue["number"],
         verifier_session_id=verifier_session_id,
         updated_at=updated_at,
     )
-    status = cast(str, persisted_evidence.get("status") or evidence["status"])
+    status = cast(str, persisted_evidence.get("status") or "")
     if status == "pass":
-        pr_number = cast(str, persisted_evidence.get("pr_number") or evidence["pr_number"])
+        if current_issue_state in {"completed", "failed", "quarantined"}:
+            summary = (
+                f"Verifier for issue #{issue['number']} passed, but the issue is already {current_issue_state}. "
+                "Preserve the terminal DB state and leave release handling to the independent release command."
+            )
+            set_failure_func(ledger, kind="none", summary="", retryable=True)
+            queue_transition_func(
+                ledger,
+                next_role="main_orchestrator",
+                next_stage="issue_selection_or_recovery",
+                summary=summary,
+                updated_at=updated_at,
+            )
+            return ledger, {
+                "action": "release_waiting",
+                "next_role": "operator",
+                "next_stage": "release_command",
+                "summary": summary,
+                "request_title": "/autodev-release",
+            }, None
+        pr_number = _extract_pr_number_from_fact(persisted_evidence)
+        pr_source_artifact = "evidence_packet"
+        if not pr_number:
+            persisted_worker = _stored_fact(artifacts, "worker_result", read_artifact_fact)
+            pr_number = _extract_pr_number_from_fact(persisted_worker)
+            if pr_number:
+                pr_source_artifact = "worker_result_fallback"
         if not pr_number or pr_number == "none":
             summary = (
                 f"Verifier for issue #{issue['number']} passed without a PR number. Route to main_orchestrator recovery instead of waiting."
@@ -533,9 +548,34 @@ def reconcile_pr_verifier(
                 summary=summary,
                 final_state="failed",
             )
-        artifacts["releaseResultPath"] = default_release_result_path(issue["number"], pr_number)
-        attempts["release_worker"] += 1
-        summary = f"Verifier for issue #{issue['number']} passed. The main_orchestrator should delegate release_worker for PR #{pr_number}."
+        record_pr_opened(
+            base_dir=base_dir,
+            issue_number=issue["number"],
+            pr_number=pr_number,
+            created_at=updated_at,
+            verifier_session_id=verifier_session_id,
+            command_id=str(persisted_evidence.get("command_id") or ""),
+            payload={
+                "issue_number": issue["number"],
+                "pr_number": pr_number,
+                "verifier_session_id": verifier_session_id,
+                "source_artifact": pr_source_artifact,
+            },
+        )
+        transition_issue_state_if_possible(
+            base_dir=base_dir,
+            issue_number=issue["number"],
+            to_state="verified",
+            command_id=uuid4().hex,
+            updated_at=updated_at,
+            reason=f"Verifier accepted issue #{issue['number']} and recorded PR #{pr_number}.",
+            from_state="verifying",
+            current_session_id=verifier_session_id or None,
+        )
+        summary = (
+            f"Verifier for issue #{issue['number']} passed and recorded PR #{pr_number}. "
+            "The development loop is complete; run the independent release command to claim PR merge/release work."
+        )
         set_failure_func(ledger, kind="none", summary="", retryable=True)
         record_current_verifier_session(
             base_dir=base_dir,
@@ -545,21 +585,22 @@ def reconcile_pr_verifier(
         )
         queue_transition_func(
             ledger,
-            next_role="release_worker",
-            next_stage="release_worker_execution",
+            next_role="main_orchestrator",
+            next_stage="issue_selection_or_recovery",
             summary=summary,
             updated_at=updated_at,
         )
-        return ledger, subagent_decision_func(
-            ledger,
-            next_role="release_worker",
-            next_stage="release_worker_execution",
-            summary=summary,
-        ), None
+        return ledger, {
+            "action": "release_waiting",
+            "next_role": "operator",
+            "next_stage": "release_command",
+            "summary": summary,
+            "request_title": "/autodev-release",
+        }, None
 
-    failure_kind = cast(str, evidence["failure_kind"] or "verifier_retry")
-    retryable = cast(bool | None, evidence["retryable"])
-    summary = cast(str, evidence["next_recommended_step"])
+    failure_kind = cast(str, persisted_evidence.get("failure_kind") or "verifier_retry")
+    retryable = cast(bool | None, persisted_evidence.get("retryable"))
+    summary = cast(str, persisted_evidence.get("next_recommended_step") or "")
     set_failure_func(
         ledger,
         kind=failure_kind,
@@ -622,26 +663,45 @@ def reconcile_release_worker(
     *,
     base_dir: Path,
     issue: dict[str, str],
+    current: dict[str, str],
     attempts: dict[str, int],
     limits: dict[str, int],
     artifacts: dict[str, str],
     updated_at: str,
     transient_release_blockers: set[str],
-    resolve_artifact_path: Callable[..., Path],
-    parse_release_result_file: Callable[[Path], JsonObject],
-    read_artifact_fact: Callable[[dict[str, object] | None, str], dict[str, object]],
-    record_artifact_status: Callable[..., None],
+    non_terminal_release_failure_kinds: set[str],
     read_issue: Callable[[Path, str], JsonObject | None],
+    read_artifact_fact: Callable[[str], dict[str, object]],
     transition_issue_state_if_possible: Callable[..., None],
     set_failure_func: Callable[..., None],
     queue_orchestrator_recovery_func: Callable[..., tuple[JsonObject, JsonObject, JsonObject]],
     queue_transition_func: Callable[..., None],
     subagent_decision_func: Callable[..., JsonObject],
 ) -> ReconcileResult:
-    release_result_path = resolve_artifact_path(artifacts["releaseResultPath"], base_dir=base_dir)
-    if not artifacts["releaseResultPath"] or not release_result_path.exists():
+    issue_state = read_issue(base_dir, issue["number"])
+    verifier_session_id = str(issue_state.get("current_session_id") or "") if issue_state else ""
+    persisted_release = _stored_fact(artifacts, "release_result", read_artifact_fact)
+    if not bool(persisted_release.get("parse_ok")):
+        if current.get("status") == "running" or (
+            current.get("status") == "queued" and attempts["release_worker"] < limits["release_worker"]
+        ):
+            summary = (
+                f"release_worker for issue #{issue['number']} is {current.get('status') or 'queued'} and SQLite has not recorded "
+                "release_result yet. Keep the queued/running dispatch state unchanged."
+            )
+            return (
+                ledger,
+                {
+                    "action": "no_change",
+                    "next_role": current.get("role") or "release_worker",
+                    "next_stage": current.get("stage") or "release_worker_execution",
+                    "summary": summary,
+                    "request_title": "",
+                },
+                None,
+            )
         summary = (
-            f"release_worker for issue #{issue['number']} ended without writing {artifacts['releaseResultPath'] or 'a release result'}. "
+            f"release_worker for issue #{issue['number']} ended without recording release_result in SQLite. "
             "Retry release once before recovery."
         )
         set_failure_func(ledger, kind="contract_invalid", summary=summary, retryable=True)
@@ -650,10 +710,11 @@ def reconcile_release_worker(
             transition_issue_state_if_possible(
                 base_dir=base_dir,
                 issue_number=issue["number"],
-                to_state="verifying",
+                to_state="release_pending",
                 command_id=uuid4().hex,
                 updated_at=updated_at,
                 reason=f"Retry release_worker for issue #{issue['number']} after missing release result.",
+                current_session_id=verifier_session_id or None,
             )
             queue_transition_func(
                 ledger,
@@ -675,39 +736,8 @@ def reconcile_release_worker(
             summary=summary,
             final_state="failed",
         )
-
-    release = parse_release_result_file(release_result_path)
-    record_artifact_status(
-        base_dir=base_dir,
-        issue_number=issue["number"],
-        artifact_kind="release_result",
-        artifact_path=release_result_path,
-        observed_at=updated_at,
-        parsed=release,
-    )
-    issue_state = read_issue(base_dir, issue["number"])
-    persisted_release = read_artifact_fact(issue_state, "release_result")
-    if not bool(persisted_release.get("parse_ok")):
-        summary = (
-            f"release_worker for issue #{issue['number']} wrote {artifacts['releaseResultPath'] or 'a release result'}, but the persisted release_result fact is missing. "
-            "Do not complete the issue until SQLite has acknowledged the release artifact."
-        )
-        set_failure_func(ledger, kind="contract_invalid", summary=summary, retryable=True)
-        return queue_orchestrator_recovery_func(ledger, base_dir=base_dir, updated_at=updated_at, summary=summary)
-    verifier_session_id = str(issue_state.get("current_verifier_session_id") or "") if issue_state else ""
-    status = cast(str, persisted_release.get("status") or release["status"])
+    status = cast(str, persisted_release.get("status") or "")
     if status == "success":
-        if issue_state and issue_state.get("state") == "running":
-            transition_issue_state_if_possible(
-                base_dir=base_dir,
-                issue_number=issue["number"],
-                to_state="verifying",
-                command_id=uuid4().hex,
-                updated_at=updated_at,
-                reason=f"Issue #{issue['number']} still occupies capacity until verifier-backed completion is recorded.",
-                from_state="running",
-                current_verifier_session_id=verifier_session_id or None,
-            )
         if read_issue(base_dir, issue["number"]):
             transition_issue_state_if_possible(
                 base_dir=base_dir,
@@ -716,8 +746,8 @@ def reconcile_release_worker(
                 command_id=uuid4().hex,
                 updated_at=updated_at,
                 reason=f"Release worker completed issue #{issue['number']} after verifier-owned evidence passed.",
-                from_state="verifying",
-                current_verifier_session_id=verifier_session_id or None,
+                from_state="release_pending",
+                current_session_id=verifier_session_id or None,
             )
         summary = (
             f"Release worker completed issue #{issue['number']}. Hand off to main_orchestrator to select the next ready issue and keep the workflow moving."
@@ -731,10 +761,10 @@ def reconcile_release_worker(
             final_state="completed",
         )
 
-    blocked_reason = cast(str, persisted_release.get("blocked_reason") or release["blocked_reason"])
-    retryable = cast(bool | None, release["retryable"])
-    failure_kind = cast(str, release["failure_kind"] or blocked_reason or "release_blocked")
-    summary = cast(str, release["next_recommended_step"])
+    blocked_reason = cast(str, persisted_release.get("blocked_reason") or "none")
+    retryable = cast(bool | None, persisted_release.get("retryable"))
+    failure_kind = cast(str, persisted_release.get("failure_kind") or blocked_reason or "release_blocked")
+    summary = cast(str, persisted_release.get("next_recommended_step") or "")
     set_failure_func(
         ledger,
         kind=failure_kind,
@@ -749,11 +779,11 @@ def reconcile_release_worker(
         transition_issue_state_if_possible(
             base_dir=base_dir,
             issue_number=issue["number"],
-            to_state="verifying",
+            to_state="release_pending",
             command_id=uuid4().hex,
             updated_at=updated_at,
             reason=f"Retry release_worker for issue #{issue['number']} after transient release blocker {blocked_reason}.",
-            current_verifier_session_id=verifier_session_id or None,
+            current_session_id=verifier_session_id or None,
         )
         queue_transition_func(
             ledger,
@@ -768,6 +798,18 @@ def reconcile_release_worker(
             next_stage="release_worker_execution",
             summary=retry_summary,
         ), None
+    if failure_kind in non_terminal_release_failure_kinds:
+        recovery_summary = (
+            f"Release worker for issue #{issue['number']} is blocked by {blocked_reason or failure_kind}. "
+            "Keep the issue re-releasable in verified so independent release can be retried after approval/policy changes."
+        )
+        return queue_orchestrator_recovery_func(
+            ledger,
+            base_dir=base_dir,
+            updated_at=updated_at,
+            summary=recovery_summary,
+            final_state="verified",
+        )
     recovery_summary = (
         f"Release worker for issue #{issue['number']} is blocked by {blocked_reason or status}. Route to main_orchestrator recovery so the broader workflow can continue without waiting for a human reply."
     )
@@ -822,42 +864,28 @@ def reconcile_issue_selection_or_recovery(
     issue: dict[str, str],
     artifacts: dict[str, str],
     updated_at: str,
-    resolve_artifact_path: Callable[..., Path],
-    parse_release_result_file: Callable[[Path], JsonObject],
-    read_artifact_fact: Callable[[dict[str, object] | None, str], dict[str, object]],
-    record_artifact_status: Callable[..., None],
     read_issue: Callable[[Path, str], JsonObject | None],
+    read_artifact_fact: Callable[[str], dict[str, object]],
     is_successful_release_status: Callable[[str], bool],
     set_failure_func: Callable[..., None],
     queue_orchestrator_recovery_func: Callable[..., tuple[JsonObject, JsonObject, JsonObject]],
 ) -> ReconcileResult | None:
-    release_result_path = resolve_artifact_path(artifacts["releaseResultPath"], base_dir=base_dir)
     issue_state = read_issue(base_dir, issue["number"])
-    if artifacts["releaseResultPath"] and release_result_path.exists():
-        release = parse_release_result_file(release_result_path)
-        record_artifact_status(
-            base_dir=base_dir,
-            issue_number=issue["number"],
-            artifact_kind="release_result",
-            artifact_path=release_result_path,
-            observed_at=updated_at,
-            parsed=release,
+    persisted_release = _stored_fact(artifacts, "release_result", read_artifact_fact)
+    issue_runtime_state = str(issue_state.get("state") or "") if issue_state else ""
+    if issue_runtime_state in {"failed", "ready"} and bool(persisted_release.get("parse_ok")) and is_successful_release_status(cast(str, persisted_release.get("status") or "")):
+        summary = (
+            f"Late successful release result for issue #{issue['number']} arrived after failure recovery. "
+            "Reconcile the control plane into completed and continue issue selection."
         )
-        persisted_release = read_artifact_fact(read_issue(base_dir, issue["number"]), "release_result")
-        issue_runtime_state = str(issue_state.get("state") or "") if issue_state else ""
-        if issue_runtime_state in {"failed", "ready"} and bool(persisted_release.get("parse_ok")) and is_successful_release_status(cast(str, persisted_release.get("status") or release["status"])):
-            summary = (
-                f"Late successful release result for issue #{issue['number']} arrived after failure recovery. "
-                "Reconcile the control plane into completed and continue issue selection."
-            )
-            set_failure_func(ledger, kind="none", summary="", retryable=True)
-            return queue_orchestrator_recovery_func(
-                ledger,
-                base_dir=base_dir,
-                updated_at=updated_at,
-                summary=summary,
-                final_state="completed",
-            )
+        set_failure_func(ledger, kind="none", summary="", retryable=True)
+        return queue_orchestrator_recovery_func(
+            ledger,
+            base_dir=base_dir,
+            updated_at=updated_at,
+            summary=summary,
+            final_state="completed",
+        )
     last_failure = cast(dict[str, object], ledger.get("lastFailure", {}))
     if issue_state and str(issue_state.get("state") or "") == "failed" and bool(last_failure.get("retryable")):
         summary = cast(str, last_failure.get("summary") or "") or (
@@ -875,8 +903,7 @@ def reconcile_issue_selection_or_recovery(
 
 def no_change_decision(ledger: JsonObject, *, current: dict[str, str], updated_at: str, bump_ledger_revision: Callable[[JsonObject, str], None]) -> ReconcileResult:
     summary = f"Supervisor found role={current['role']} stage={current['stage']} with no automatic transition. Keep the current state unchanged."
-    ledger["updatedAt"] = updated_at
-    bump_ledger_revision(ledger, updated_at)
+    del updated_at, bump_ledger_revision
     return (
         ledger,
         {

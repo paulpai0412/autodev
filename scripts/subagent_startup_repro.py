@@ -11,6 +11,7 @@ import shutil
 import sqlite3
 import sys
 import time
+from contextlib import closing
 from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
@@ -23,7 +24,7 @@ from scripts.opencode_session_trace import (
     read_session_summary,
     session_summary_abort_reason,
 )
-from scripts.orchestrator_sessions import (
+from scripts.opencode_host_adapter import (
     extract_session_id_from_run_output,
     find_session_id_in_db,
     opencode_db_path,
@@ -130,7 +131,7 @@ def _load_session_parts(session_id: str, *, db_path: Path | None = None) -> list
     database_path = db_path or opencode_db_path()
     if not database_path.exists():
         return []
-    with sqlite3.connect(database_path) as connection:
+    with closing(sqlite3.connect(database_path)) as connection:
         rows = connection.execute(
             "SELECT data FROM part WHERE session_id = ? ORDER BY time_created",
             (session_id,),
