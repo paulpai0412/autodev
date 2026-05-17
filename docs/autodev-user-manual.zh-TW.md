@@ -168,7 +168,10 @@
     - 以上子任務應以 `task(..., run_in_background=false)` 前景執行，讓同一個 root orchestrator session 逐一等待完成後再繼續
     - child role 的 outcome 必須用 `scripts/orchestrator_supervisor.py submit-artifact` 之類的 DB-backed submission 寫回 SQLite；repo-local artifact file 不是必要 runtime gate
     - `issue_worker` 成功只代表 implementation-ready；formal PR creation 與 acceptance gate 由 verifier path 擁有
-6. `pr_verifier` 通過後 issue 停在 `verified`；PR merge / release 由獨立 `/autodev-release [issue-number]` 命令 claim 成 `release_pending` 後啟動 `release_worker`
+6. `pr_verifier` 通過後 issue 停在 `verified`；workspace `reconcile` 會依 release capacity 自動補位啟動 `release_worker`（可用 `AUTODEV_RELEASE_BACKFILL_MODE=manual` 改為僅手動 `/autodev-release [issue-number]`）
+   - `AUTODEV_AUTO_RELEASE_APPROVAL_MODE=human_required|bypass_approval` 控制 auto backfill 啟動的 `release_worker` 是否可略過人工 PR approval
+   - 預設為 `human_required`：auto release 仍會在缺少人工 approval 時提交 blocked `release_result`
+   - 設為 `bypass_approval`：auto release 可在 verifier pass、mergeability、required checks、workspace hygiene 全部通過時直接合併 PR
 7. 每次有新的 DB-backed fact / artifact submission 後，supervisor 執行 `reconcile`
 8. `reconcile` 會同步 SQLite control plane，判斷下一步是：
    - 繼續派工
@@ -375,6 +378,30 @@ PYTHONPATH=. python3 scripts/autodev_project.py start --project-root <project> -
 - 同步 DB-backed dispatch context
 - 直接 dispatch root session
 
+> `.autodev.yaml` 由 `autodev_project.py init` 產生；目前 schema 由程式碼 (`scripts/autodev_project.py::_config_text`) 定義。若文件敘述與實際檔案內容有差異，請以 repo 中實際 `.autodev.yaml` 為準。
+
+典型 `.autodev.yaml` 內容如下（以實際專案路徑/名稱為準）：
+
+```yaml
+schema_version: "1.0"
+
+project:
+  name: <project-folder-name>
+  root: <absolute-project-root>
+  github_repo: <owner/repo>
+
+context:
+  required_reads:
+    - AGENTS.md
+    - CONTEXT.md
+    - docs/agents/domain.md
+    - docs/agents/issue-tracker.md
+    - docs/agents/triage-labels.md
+
+runtime:
+  control_plane_db: .opencode/runtime/control-plane.sqlite3
+```
+
 如果你已安裝全域命令，也可直接在 consumer project 內使用：
 
 ```text
@@ -407,7 +434,7 @@ PYTHONPATH=. python3 scripts/orchestrator_supervisor.py reconcile-workspace --ba
 PYTHONPATH=. python3 scripts/autodev_project.py reconcile-watch --project-root <project> --interval-seconds 30
 ```
 
-`reconcile-watch` 不改變 supervisor 的核心排程邏輯；它只是定期重跑 DB-backed `reconcile-workspace`。測試或短期執行時可加上 `--iterations <n>` 限制輪數，若希望任何一輪失敗就停止，可加上 `--stop-on-error`。
+`reconcile-watch` 不改變 supervisor 的核心排程邏輯；它只是定期重跑 DB-backed `reconcile-workspace`，讓 development 與 release 兩條 lane 一起補位。測試或短期執行時可加上 `--iterations <n>` 限制輪數，若希望任何一輪失敗就停止，可加上 `--stop-on-error`。
 
 ### 5.4 查看目前 root session
 
@@ -430,6 +457,8 @@ opencode --session <rootSessionID>
 ```
 
 來進入對應 session。
+
+> 補充：`rootSessionID` 是 OpenCode adapter payload 的 resume 提示；control-plane 層的 canonical current session pointer 仍是 SQLite `issues.current_session_id`。實務上建議先用 `/autodev-show-session` 或 `autodev_project.py show-session` 取得最新可恢復 session，再進行 host adapter resume。
 
 ### 5.5 專案 readiness 檢查
 
@@ -483,6 +512,7 @@ PYTHONPATH=. python3 scripts/orchestrator_supervisor.py inspect --base-dir <proj
 - `issue`
 - `latestDecision`
 - `latestGitHubSyncAttempt`
+- `releaseBackfill`（`mode`、`releaseCapacity`、`availableReleaseSlots`、`verifiedWaitingCount`）
 
 ### 6.4 quarantine：人工隔離 issue
 

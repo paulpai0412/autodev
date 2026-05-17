@@ -51,10 +51,12 @@ PYTHONPATH=. python3 scripts/autodev_project.py reconcile-watch --project-root /
 PYTHONPATH=. python3 scripts/orchestrator_bootstrap_runner.py --base-dir /path/to/project --issue-number 32 --source-session-id auto-dev
 ```
 
+`--source-session-id` is an explicit caller tag (the bootstrap runner default is `orchestrator-bootstrap`).
+
 The runtime source of truth is `.opencode/runtime/control-plane.sqlite3`.
 Supervisor decisions, dispatch results, resumable session state, verifier-owned PR facts, and issue packet context are persisted in SQLite rows. Local JSON/YAML artifacts are outside the active runtime contract.
 
-Release/merge is intentionally separate from the per-issue development loop: verifier acceptance leaves an issue in `verified`, and `/autodev-release [issue-number]` claims it into `release_pending` before launching an independent `release_worker` session for PR merge/release work.
+Release/merge is intentionally separate from the per-issue development loop: verifier acceptance leaves an issue in `verified`, and `/autodev-release [issue-number]` claims it into `release_pending` before launching an independent `release_worker` session for PR merge/release work. Workspace reconcile can also auto-backfill verified issues into release when `AUTODEV_RELEASE_BACKFILL_MODE=auto`; pair that with `AUTODEV_AUTO_RELEASE_APPROVAL_MODE=bypass_approval` only if you want auto-started release workers to skip the human PR approval requirement while still enforcing all other release gates. After a successful merged release on GitHub-backed issues, autodev now closes the linked GitHub issue through the release completion path instead of relying only on PR closing keywords.
 
 The active branch contract is:
 

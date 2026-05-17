@@ -13,6 +13,7 @@ Use the `gh` CLI for issue operations when a skill says to publish to or fetch f
 - `gh auth status --repo paulpai0412/wferp` should succeed on any machine expected to materialize issue packets from GitHub.
 - Network access to GitHub is required for live issue intake.
 - When GitHub is temporarily unavailable, the autonomous loop can keep working only from issue data already ingested into SQLite.
+- Intake default repo is `paulpai0412/wferp`; override it per consumer project with `AUTODEV_GITHUB_REPO=<owner/repo>`.
 
 ## Conventions
 

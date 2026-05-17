@@ -54,6 +54,6 @@
 - `docs/agents/runtime/host-adapter-strategy.md` for the host-agnostic adapter boundary and OpenCode/Claude Code/Codex portability plan.
 - `docs/agents/runtime/product-positioning.md` for harness-product positioning and value relative to coding-agent runtimes.
 - `docs/agents/runtime/multi-issue-concurrency.md` for the bounded multi-issue scheduler model on branch `db-only-control-plane`.
-- `docs/agents/autonomous-development-workflow.yaml` for role boundaries, gates, and serial execution policy.
+- `docs/agents/autonomous-development-workflow.yaml` for role boundaries, gates, and bounded issue-scoped concurrency policy.
 - `docs/agents/issue-tracker.md` for GitHub tracker commands and verifier/release evidence rules.
 - `scripts/autodev_project.py` for consumer project init, global command install, and doctor checks.
