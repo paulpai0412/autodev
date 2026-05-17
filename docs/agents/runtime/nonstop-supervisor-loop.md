@@ -1,59 +1,84 @@
-# Nonstop supervisor loop
+# Nonstop Supervisor Loop Contract (DB-backed)
 
-This repo now has a runtime supervisor layer for the autonomous development workflow.
+## Purpose
 
-## Runtime artifacts
+Define the runtime contract for a **nonstop** main orchestrator session that advances AFK issues using the SQLite control plane (`issues`, `issue_history`) as the single source of truth.
 
-- `.opencode/runtime/orchestrator-ledger.json` is the machine-readable handoff artifact for the current issue, role, attempts, latest failure, and next dispatch target.
-- `.opencode/runtime/control-plane.sqlite3` is the canonical control-plane store for current issue state plus append-only issue history.
-- `.opencode/runtime/new-session-request.json` is the queue file consumed by the explicit `dispatch` fallback when a fresh `main_orchestrator` root session must be created.
-- The configured root-session agent must survive checkpoint compaction, runtime-ledger handoff, and fresh-session dispatch; restore must not silently switch agents.
-- `.opencode/runtime/new-session-result.json` records the created root session plus source-session stop status.
-- `docs/agents/issue-packets/issue-<n>.yaml` remains the local execution source for selected issues, even when the issue first came from GitHub.
-- `scripts/issue_packet_intake.py` is the GitHub-to-local materialization step for `ready-for-agent` issues.
-- `.opencode/runtime/issue-locks/issue-<n>.json` is a duplicate-start safety projection, not canonical truth.
+This document is authoritative for orchestrator behavior when prompts reference:
 
-## Session chain contract
+- `docs/agents/autonomous-development-workflow.yaml`
+- `docs/agents/runtime/nonstop-supervisor-loop.md`
 
-1. Orchestrator bootstrap writes the checkpoint, initializes the supervisor ledger, writes the first `new-session-request.json`, and immediately dispatches a fresh `main_orchestrator` root session.
-2. The `main_orchestrator` root session owns the selected issue end-to-end. It delegates `issue_worker`, `pr_verifier`, and `release_worker` work to subagents rather than creating root sessions for those roles.
-3. Before launching the first `issue_worker`, the fresh root orchestrator must run `reconcile --ledger ...` once so the bootstrap -> `issue_worker_execution` transition is persisted to the on-disk ledger.
-4. The root orchestrator launches each worker/verifier/release subagent with `task(..., run_in_background=false)` so the same root session waits for the child reply before moving on.
-5. Each worker/verifier/release subagent may execute issue scope inside an issue worktree, but it must write compact artifacts back to the primary workspace's canonical repo paths recorded in the ledger so the supervisor can reconcile them deterministically.
-6. `issue_worker` must not write `status: success` until its branch is pushed and the worker result contains finalized PR metadata (`pr.number` and `pr.url`). If PR creation or push is still incomplete, the worker must emit a blocked/failed artifact instead of an optimistic success result.
-7. After each subagent writes its compact artifact, the orchestrator runs `PYTHONPATH=. python3 scripts/orchestrator_supervisor.py advance-child --ledger .opencode/runtime/orchestrator-ledger.json` and uses the returned decision to choose the next subagent or recovery action.
-8. `advance-child` is valid only when the on-disk ledger is already queued on `issue_worker`, `pr_verifier`, or `release_worker`; bootstrap must continue using `reconcile --ledger ...` for the initial `main_orchestrator` -> `issue_worker` transition.
-9. `reconcile --write-request --dispatch-now` is reserved for creating a new `main_orchestrator` root session during orchestrator bootstrap, recovery, or next-issue handoff; it must not be used to launch worker/verifier/release roles as root sessions.
-10. `.opencode/runtime/new-session-result.json` records created root orchestrator sessions so operators can inspect or resume them if needed.
-11. If recovery needs another `ready-for-agent` issue and no suitable local packet exists yet, the supervisor runs `python3 scripts/issue_packet_intake.py --output-dir docs/agents/issue-packets` and retries selection once.
+## Core rules
 
-## GitHub intake prerequisites
+1. Bootstrap and reconcile from SQLite facts only.
+2. Do not block on human replies when a deterministic next step exists.
+3. Transition ordering is enforced by reconcile decisions, not ad-hoc agent memory.
+4. Persist child-role outcomes via `submit-artifact` before advancing.
+5. Main orchestrator owns dispatch sequencing; child roles own implementation/verification outputs.
 
-- `gh` must be installed and authenticated for the target repository.
-- The runtime host must have network access to GitHub when intake fallback is expected.
-- If GitHub is unavailable, the loop can continue only with already-materialized local issue packets.
+## Required reconcile checkpoints
 
-## Default automatic routing
+The main orchestrator must run supervisor reconcile at these checkpoints:
 
-- `main_orchestrator` orchestrator bootstrap -> `issue_worker`
-- `issue_worker success` -> `pr_verifier`
-- `issue_worker blocked|failed` -> retry `issue_worker` up to 3 times, then queue `main_orchestrator` recovery
-- `pr_verifier pass` -> `release_worker`
-- `pr_verifier fail` -> `issue_worker` repair up to 3 worker cycles, then `main_orchestrator` recovery
-- `pr_verifier blocked` -> retry `pr_verifier` only when marked retryable; otherwise `main_orchestrator` recovery
-- `release_worker success` -> `main_orchestrator` selects the next ready issue and reruns orchestrator bootstrap
-- `release_worker blocked` -> retry `release_worker` for transient blockers; otherwise `main_orchestrator` recovery
+1. **Before first issue_worker launch**
+   - Goal: persist bootstrap -> `issue_worker_execution` transition.
+2. **After worker_result is written**
+   - Goal: choose next role (normally `pr_verifier`).
+3. **After evidence_packet is written**
+   - Goal: move to `verified` and emit release wait decision.
 
-## Recovery principle
+If a child artifact is missing at a checkpoint, reconcile decides retry/recovery/quarantine according to DB attempts/limits.
 
-The supervisor prefers retry or reroute over `stop_for_human_decision`. Human intervention becomes the last resort when the orchestrator cannot select a next issue or cannot classify a terminal blocker honestly.
+## Role boundaries
 
-When `select_next_issue_packet(...)` finds no next local candidate, recovery tries one intake pass from GitHub before giving up. If intake also fails or still produces no eligible packet, the supervisor keeps control with `main_orchestrator` recovery and records the blocked state in the ledger instead of silently stalling.
+### main_orchestrator
 
-## Control-plane operator commands
+- May: validate contracts, run reconcile, dispatch next child role.
+- Must not: implement issue scope directly, run final acceptance QA directly.
 
-- `inspect` shows canonical issue state, latest decision, and latest GitHub sync attempt.
-- `quarantine` moves a running issue into the explicit quarantined state.
-- `resume-quarantined` performs fenced resume from `quarantined` back to `running`.
-- `fail-quarantined` marks a quarantined issue as terminally failed.
-- `retry-github-sync` replays only the latest failed GitHub label sync attempt for an issue and records an admin audit decision.
+### issue_worker
+
+- Owns: implementation, self-check, commit/push/PR prep.
+- Must submit: `worker_result` via `submit-artifact`.
+
+### pr_verifier
+
+- Owns: independent acceptance verification and final evidence packet.
+- Must submit: `evidence_packet` via `submit-artifact`.
+
+### release_worker
+
+- Launched independently via release command (not from the main issue root loop).
+- Must submit: `release_result` via `submit-artifact`.
+
+## Artifact submission contract
+
+All child outcomes are written with:
+
+```bash
+AUTODEV_HOME="${AUTODEV_HOME:-~/apps/autodev}" PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/orchestrator_supervisor.py" submit-artifact \
+  --base-dir "<consumer-project-root>" \
+  --issue-number <issue-number> \
+  --artifact-kind <worker_result|evidence_packet|release_result> \
+  --payload-json '<json>' \
+  [--body-text '<text>']
+```
+
+Reconcile must treat SQLite artifact facts as authoritative and avoid runtime YAML/JSON artifact gates.
+
+## Dispatch policy
+
+- Child subagents run from the same root orchestrator session in foreground (`run_in_background=false`) when executing issue_worker/pr_verifier steps.
+- The main orchestrator waits for each child call to finish before deciding next stage.
+- Only next-issue handoff or explicit recovery may create a new root session.
+
+## Stop conditions for this loop
+
+For one selected issue, the nonstop loop is complete when:
+
+1. `worker_result` stored,
+2. `evidence_packet` stored with verifier result,
+3. reconcile returns release wait / release command handoff.
+
+At that point, merge/release proceeds through independent release flow.

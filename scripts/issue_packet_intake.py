@@ -13,10 +13,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import cast
 
+from scripts.control_plane_db import ingest_issue_packet
+from scripts.autodev_project import doctor_project
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REPO = os.environ.get("AUTODEV_GITHUB_REPO", "paulpai0412/wferp")
 AUTODEV_CONFIG_NAME = ".autodev.yaml"
+TRACKED_RUNTIME_BLOCK_PREFIX = "tracked autodev runtime files must be removed from git index:"
 
 
 @dataclass
@@ -181,8 +185,8 @@ def render_issue_packet(issue: GitHubIssue, *, actor: str = "Hephaestus", prepar
             "    automated_checks:",
             '      - {command: "<verifier fills this from issue scope>", success_criteria: "Verifier confirms acceptance criteria through observable behavior."}',
             '  verifier_manual_qa: {owner: "pr_verifier", surface: "cli|api|browser|library|sql|static-html", happy_path: "Exercise the issue\'s primary user path.", refusal_or_error_path: "Confirm one refusal, edge, or blocked path when applicable."}',
-            f'handoff_contract: {{repo_path: "docs/agents/handoffs/issue-{issue.number}.yaml", github_summary_required: true}}',
-            'result_contract: {template_path: "docs/agents/worker-result-template.yaml", verifier_template_path: "docs/agents/evidence-packet-template.yaml", allowed_statuses: [success, blocked, failed]}',
+            'handoff_contract: {storage: "issue_history", github_summary_required: true}',
+            'result_contract: {submission: "scripts/orchestrator_supervisor.py submit-artifact", allowed_statuses: [success, blocked, failed]}',
             'role_boundary: {orchestrator_may_validate_contract_only: true, worker_may_emit_final_acceptance: false, verifier_packet_required_for_completion: true}',
             f'prepared_by: {{actor: "{actor}", prepared_at: "{timestamp}"}}',
         ]
@@ -190,14 +194,33 @@ def render_issue_packet(issue: GitHubIssue, *, actor: str = "Hephaestus", prepar
     return "\n".join(lines) + "\n"
 
 
-def sync_issue_packets(issues: list[GitHubIssue], *, output_dir: Path) -> list[Path]:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    written: list[Path] = []
+def issue_packet_payload(issue: GitHubIssue, *, actor: str = "Hephaestus", prepared_at: str | None = None) -> dict[str, object]:
+    timestamp = prepared_at or datetime.now().astimezone().isoformat(timespec="seconds")
+    return {
+        "issue_number": issue.number,
+        "title": issue.title,
+        "branch": build_branch_name(issue),
+        "backing_type": "github",
+        "prior_handoff": "",
+        "labels": list(issue.labels),
+        "parent_reference": infer_parent_reference(issue),
+        "dependencies": infer_dependencies(issue),
+        "raw_text": render_issue_packet(issue, actor=actor, prepared_at=timestamp),
+    }
+
+
+def sync_issue_packets_to_db(issues: list[GitHubIssue], *, project_root: Path, actor: str = "Hephaestus", prepared_at: str | None = None) -> list[str]:
+    ingested: list[str] = []
     for issue in issues:
-        packet_path = output_dir / f"issue-{issue.number}.yaml"
-        _ = packet_path.write_text(render_issue_packet(issue), encoding="utf-8")
-        written.append(packet_path)
-    return written
+        payload = issue_packet_payload(issue, actor=actor, prepared_at=prepared_at)
+        _ = ingest_issue_packet(
+            project_root,
+            issue_number=issue.number,
+            issue_packet=payload,
+            updated_at=prepared_at or datetime.now().astimezone().isoformat(timespec="seconds"),
+        )
+        ingested.append(issue.number)
+    return ingested
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -205,25 +228,37 @@ def build_parser() -> argparse.ArgumentParser:
     _ = parser.add_argument("--repo", default=DEFAULT_REPO, help="GitHub repo name for gh issue list")
     _ = parser.add_argument("--issues-json", help="Path to a JSON fixture with gh issue list output")
     _ = parser.add_argument("--project-root", default=".", help="Consumer project root or a nested path inside it")
-    _ = parser.add_argument("--output-dir", help="Directory for issue packets; overrides consumer project discovery")
+    _ = parser.add_argument("--output-dir", help="Deprecated compatibility flag; DB-backed intake ignores packet file output")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    output_dir_arg = cast(str | None, args.output_dir)
-    if output_dir_arg:
-        output_dir = Path(output_dir_arg)
-    else:
-        consumer_root = _consumer_project_root(cast(str, args.project_root))
-        if consumer_root is None:
-            message = (
-                "ERROR: could not find .autodev.yaml from --project-root. "
-                "Run intake from a consumer project, pass --project-root <project>, or set --output-dir explicitly."
-            )
-            print(message)
-            return 1
-        output_dir = consumer_root / "docs/agents/issue-packets"
+    consumer_root = _consumer_project_root(cast(str, args.project_root))
+    if consumer_root is None:
+        message = (
+            "ERROR: could not find .autodev.yaml from --project-root. "
+            "Run intake from a consumer project or pass --project-root <project>."
+        )
+        print(message)
+        return 1
+    runtime_db = consumer_root / ".opencode/runtime/control-plane.sqlite3"
+    print(f"[issue-packet-intake] project-root={consumer_root}")
+    print(f"[issue-packet-intake] runtime-db={runtime_db}")
+    report = doctor_project(consumer_root)
+    tracked_findings = [
+        finding
+        for finding in report.findings
+        if finding.startswith(TRACKED_RUNTIME_BLOCK_PREFIX)
+    ]
+    if tracked_findings:
+        for finding in tracked_findings:
+            print(f"[issue-packet-intake] BLOCKED: {finding}")
+        print(
+            f"[issue-packet-intake] Run `PYTHONPATH=. python3 scripts/autodev_project.py doctor --project-root \"{consumer_root}\"` and untrack runtime DB before retrying."
+        )
+        return 1
+    print("[issue-packet-intake] doctor tracked-runtime check: pass")
     if cast(str | None, args.issues_json):
         payload = cast(list[dict[str, object]], json.loads(Path(cast(str, args.issues_json)).read_text(encoding="utf-8")))
         issues = [
@@ -238,9 +273,9 @@ def main(argv: list[str] | None = None) -> int:
         ]
     else:
         issues = fetch_ready_issues(cast(str, args.repo))
-    written = sync_issue_packets(issues, output_dir=output_dir)
-    for path in written:
-        print(path)
+    ingested = sync_issue_packets_to_db(issues, project_root=consumer_root)
+    for issue_number in ingested:
+        print(f"issue-{issue_number}")
     return 0
 
 

@@ -8,10 +8,11 @@ import json
 import shutil
 import sqlite3
 import time
+from contextlib import closing
 from pathlib import Path
 from uuid import uuid4
 
-from scripts.orchestrator_sessions import (
+from scripts.opencode_host_adapter import (
     extract_session_id_from_run_output,
     find_session_id_in_db,
     opencode_db_path,
@@ -54,7 +55,7 @@ def poll_session_tables(session_id: str, *, timeout_seconds: float, interval_sec
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         now_ms = int(time.time() * 1000)
-        with sqlite3.connect(db_path) as conn:
+        with closing(sqlite3.connect(db_path)) as conn:
             session_count = conn.execute("SELECT COUNT(*) FROM session WHERE id = ?", (session_id,)).fetchone()[0]
             message_count = conn.execute("SELECT COUNT(*) FROM message WHERE session_id = ?", (session_id,)).fetchone()[0]
             part_count = conn.execute("SELECT COUNT(*) FROM part WHERE session_id = ?", (session_id,)).fetchone()[0]

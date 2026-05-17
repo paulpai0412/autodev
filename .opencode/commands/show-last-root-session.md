@@ -7,7 +7,7 @@ subtask: false
 Run:
 !`AUTODEV_HOME="${AUTODEV_HOME:-$HOME/apps/autodev}" PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" show-session --project-root "$PWD"`
 
-This wrapper resolves the actual consumer project root from the current directory before reading `.opencode/runtime/new-session-result.json`.
+This wrapper resolves the actual consumer project root from the current directory before reading the SQLite-backed control plane.
 
 Override `AUTODEV_HOME` first if the shared workflow repo is not installed at `~/apps/autodev`.
 

@@ -19,7 +19,7 @@ from scripts.opencode_session_trace import (
     read_session_summary,
     session_summary_abort_reason,
 )
-from scripts.orchestrator_sessions import (
+from scripts.opencode_host_adapter import (
     extract_session_id_from_run_output,
     find_session_id_in_db,
     read_initial_session_id,

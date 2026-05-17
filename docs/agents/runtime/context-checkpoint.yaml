@@ -34,29 +34,29 @@ state:
   completed:
     - "Late successful release result for issue #42 arrived after failure recovery. Reconcile the control plane into completed and continue issue selection."
   in_progress:
-    - "Continue supervisor recovery for issue #42."
+    - "Prepare the orchestrator session to enter issue #42 PR flow."
   next:
-    - "Select the next ready issue packet or remain in orchestrator recovery if none are available."
+    - "Run supervisor reconcile for issue #42 to persist issue_worker_execution before creating or switching the issue branch and launching the first issue_worker subagent."
   blockers:
-    - "Obtain required human approval, then rerun release_worker."
+    - "none"
 
 refs:
   issue_packet: "docs/agents/issue-packets/issue-42.yaml"
   worker_result: "docs/agents/worker-results/issue-42.yaml"
   evidence_packet: ""
   handoff: "docs/agents/handoffs/issue-41.yaml"
-  artifact_bundle: "docs/agents/release-results/issue-42-pr-88.yaml"
+  artifact_bundle: ""
 
 compact_payload:
   active_target: {issue_number: "42", branch: "agent/issue-42-demo", role: "main_orchestrator", agent: "build", next_flow: "per_issue_flow"}
   authoritative_refs: ["docs/agents/issue-packets/issue-42.yaml", "docs/agents/handoffs/issue-41.yaml", "/home/timmypai/apps/autodev/docs/agents/autonomous-development-workflow.yaml"]
   state_snapshot:
     completed: ["Late successful release result for issue #42 arrived after failure recovery. Reconcile the control plane into completed and continue issue selection."]
-    in_progress: ["Continue supervisor recovery for issue #42."]
-    next: ["Select the next ready issue packet or remain in orchestrator recovery if none are available."]
-    blockers: ["Obtain required human approval, then rerun release_worker."]
+    in_progress: ["Prepare the orchestrator session to enter issue #42 PR flow."]
+    next: ["Run supervisor reconcile for issue #42 to persist issue_worker_execution before creating or switching the issue branch and launching the first issue_worker subagent."]
+    blockers: ["none"]
   resume_rules: ["Resume from checkpoint and compact payload, not full chat history.", "Keep raw evidence as refs only; do not inline logs or traces."]
-  immediate_next_action: "Select the next ready issue packet or remain in orchestrator recovery if none are available."
+  immediate_next_action: "Run supervisor reconcile for issue #42 to persist issue_worker_execution before creating or switching the issue branch and launching the first issue_worker subagent."
 
 post_merge_workspace_hygiene:
   primary_workspace_branch_before: "main"
@@ -71,4 +71,4 @@ post_merge_workspace_hygiene:
 
 metadata:
   updated_by: "Build"
-  updated_at: "2026-05-07T17:23:00+08:00"
+  updated_at: "2026-05-07T17:10:00+08:00"
