@@ -45,7 +45,7 @@ priority_bridge:
       - run_review_work_as_main_agent_qa
 
 scope:
-  repository: paulpai0412/wferp
+  repository: paulpai0412/autodev
   issue_tracker: github
   tracker_commands_reference: docs/agents/issue-tracker.md
   domain_context:

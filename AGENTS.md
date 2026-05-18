@@ -44,7 +44,7 @@
 - Consumer projects keep `.autodev.yaml`, domain docs, generated artifacts, and runtime state; they must not keep local copies of workflow scripts, templates, command docs, or plugins.
 - Runtime source of truth is `.opencode/runtime/control-plane.sqlite3`; issue selection, lifecycle, audit, dispatch facts, and resume state must all be recoverable from SQLite.
 - Local issue packet / handoff / worker-result / evidence / release-result files must not be required for runtime progress on this branch. If compatibility artifacts still exist, they are historical projections only; runtime gates must read DB facts from `issues` and `issue_history`.
-- GitHub intake defaults to `paulpai0412/wferp`; override `AUTODEV_GITHUB_REPO` when this workspace should target a different tracker.
+- GitHub intake defaults to `paulpai0412/autodev`; override `AUTODEV_GITHUB_REPO` when this workspace should target a different tracker.
 - Keep repo artifacts compact and index-only. Any historical artifact docs that remain should stay compact and non-canonical.
 - `python3 scripts/agent_context_budget_check.py` is the artifact gate. Do not paste raw test logs, browser traces, screenshots, SQL logs, or full transcripts into repo docs or GitHub comments; store only compact summaries plus refs.
 

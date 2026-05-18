@@ -56,14 +56,14 @@ def test_init_creates_project_contract_dirs_and_agents_managed_block(tmp_path: P
                 "--project-root",
                 str(tmp_path),
                 "--github-repo",
-                "paulpai0412/wferp",
+                "paulpai0412/autodev",
             ]
         )
 
     assert exit_code == 0
     config = read(tmp_path / ".autodev.yaml")
     assert 'schema_version: "1.0"' in config
-    assert "github_repo: paulpai0412/wferp" in config
+    assert "github_repo: paulpai0412/autodev" in config
     assert "control_plane_db: .opencode/runtime/control-plane.sqlite3" in config
     assert (tmp_path / ".opencode/runtime/.gitkeep").exists()
     assert (tmp_path / ".opencode/runtime/control-plane.sqlite3").exists()
@@ -76,8 +76,8 @@ def test_init_creates_project_contract_dirs_and_agents_managed_block(tmp_path: P
     assert "Do not copy workflow implementation" in agents
     commands = [call.args[0] for call in run.call_args_list]
     assert ["git", "init", "-b", "main"] in commands
-    assert ["git", "remote", "add", "origin", "https://github.com/paulpai0412/wferp.git"] in commands
-    assert ["gh", "repo", "create", "paulpai0412/wferp", "--private", "--description", autodev_project.DEFAULT_REPO_DESCRIPTION] in commands
+    assert ["git", "remote", "add", "origin", "https://github.com/paulpai0412/autodev.git"] in commands
+    assert ["gh", "repo", "create", "paulpai0412/autodev", "--private", "--description", autodev_project.DEFAULT_REPO_DESCRIPTION] in commands
     label_commands = [command for command in commands if isinstance(command, list) and command[:3] == ["gh", "label", "create"]]
     assert len(label_commands) == len(autodev_project.BOOTSTRAP_LABELS)
 

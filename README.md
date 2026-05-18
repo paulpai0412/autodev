@@ -68,7 +68,7 @@ The active branch contract is:
 
 ## Tracker repo
 
-GitHub intake defaults to `paulpai0412/wferp`. Point it at the consumer project so `ready-for-agent` issues are synced into that project's SQLite-backed intake flow:
+GitHub intake defaults to `paulpai0412/autodev`. Point it at the consumer project so `ready-for-agent` issues are synced into that project's SQLite-backed intake flow:
 
 ```bash
 AUTODEV_GITHUB_REPO=<owner/repo> PYTHONPATH=. python3 scripts/issue_packet_intake.py --project-root /path/to/project

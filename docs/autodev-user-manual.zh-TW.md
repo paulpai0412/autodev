@@ -354,7 +354,7 @@ autodev project: no changes needed
 
 ### 5.1 同步 GitHub ready issues 到 SQLite intake
 
-預設 tracker repo 是 `paulpai0412/wferp`。請把 intake 指到 consumer project，這樣 ready issue 會直接同步進該專案的 SQLite-backed intake flow。若要指定其他 repo：
+預設 tracker repo 是 `paulpai0412/autodev`。請把 intake 指到 consumer project，這樣 ready issue 會直接同步進該專案的 SQLite-backed intake flow。若要指定其他 repo：
 
 ```bash
 AUTODEV_GITHUB_REPO=<owner/repo> PYTHONPATH=. python3 scripts/issue_packet_intake.py --project-root <project>

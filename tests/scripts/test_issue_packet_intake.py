@@ -14,8 +14,8 @@ def test_render_issue_packet_creates_compact_ready_packet():
     issue = GitHubIssue(
         number="42",
         title="Add governed SQL traceability",
-        body="1. Preserve verifier evidence\n2. Keep raw logs out of repo docs\nParent: https://github.com/paulpai0412/wferp/issues/1",
-        url="https://github.com/paulpai0412/wferp/issues/42",
+        body="1. Preserve verifier evidence\n2. Keep raw logs out of repo docs\nParent: https://github.com/paulpai0412/autodev/issues/1",
+        url="https://github.com/paulpai0412/autodev/issues/42",
         labels=["ready-for-agent"],
     )
 
@@ -36,7 +36,7 @@ def test_issue_packet_payload_contains_db_ready_fields():
         number="42",
         title="Add governed SQL traceability",
         body="- observable behavior",
-        url="https://github.com/paulpai0412/wferp/issues/42",
+        url="https://github.com/paulpai0412/autodev/issues/42",
         labels=["ready-for-agent"],
     )
 
@@ -54,7 +54,7 @@ def test_issue_packet_payload_preserves_explicit_base_branch():
         number="43",
         title="Build child feature",
         body="Base Branch: agent/issue-42-parent\n- observable behavior",
-        url="https://github.com/paulpai0412/wferp/issues/43",
+        url="https://github.com/paulpai0412/autodev/issues/43",
         labels=["ready-for-agent"],
     )
 
@@ -75,7 +75,7 @@ def test_render_issue_packet_infers_scope_and_relevant_paths_from_issue_body():
             "\n"
             "Use `docs/agents/issue-tracker.md` for tracking.\n"
         ),
-        url="https://github.com/paulpai0412/wferp/issues/44",
+        url="https://github.com/paulpai0412/autodev/issues/44",
         labels=["ready-for-agent"],
     )
 
@@ -92,7 +92,7 @@ def test_sync_issue_packets_to_db_ingests_packets(tmp_path: Path):
             number="42",
             title="Add governed SQL traceability",
             body="- observable behavior",
-            url="https://github.com/paulpai0412/wferp/issues/42",
+            url="https://github.com/paulpai0412/autodev/issues/42",
             labels=["ready-for-agent"],
         )
     ]
@@ -115,7 +115,7 @@ def test_main_reads_json_fixture(tmp_path: Path, capsys):
                     "number": 42,
                     "title": "Add governed SQL traceability",
                     "body": "- observable behavior",
-                    "url": "https://github.com/paulpai0412/wferp/issues/42",
+                    "url": "https://github.com/paulpai0412/autodev/issues/42",
                     "labels": ["ready-for-agent"],
                 }
             ]
@@ -145,7 +145,7 @@ def test_main_discovers_consumer_project_from_project_root(tmp_path: Path, capsy
                     "number": 42,
                     "title": "Add governed SQL traceability",
                     "body": "- observable behavior",
-                    "url": "https://github.com/paulpai0412/wferp/issues/42",
+                    "url": "https://github.com/paulpai0412/autodev/issues/42",
                     "labels": ["ready-for-agent"],
                 }
             ]
@@ -171,7 +171,7 @@ def test_main_requires_consumer_project_root(tmp_path: Path, capsys):
                     "number": 42,
                     "title": "Add governed SQL traceability",
                     "body": "- observable behavior",
-                    "url": "https://github.com/paulpai0412/wferp/issues/42",
+                    "url": "https://github.com/paulpai0412/autodev/issues/42",
                     "labels": ["ready-for-agent"],
                 }
             ]
@@ -199,7 +199,7 @@ def test_main_blocks_when_runtime_db_is_tracked(tmp_path: Path, capsys):
                     "number": 42,
                     "title": "Add governed SQL traceability",
                     "body": "- observable behavior",
-                    "url": "https://github.com/paulpai0412/wferp/issues/42",
+                    "url": "https://github.com/paulpai0412/autodev/issues/42",
                     "labels": ["ready-for-agent"],
                 }
             ]

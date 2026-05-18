@@ -22,7 +22,7 @@ from scripts.autodev_project import doctor_project
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_REPO = os.environ.get("AUTODEV_GITHUB_REPO", "paulpai0412/wferp")
+DEFAULT_REPO = os.environ.get("AUTODEV_GITHUB_REPO", "paulpai0412/autodev")
 AUTODEV_CONFIG_NAME = ".autodev.yaml"
 TRACKED_RUNTIME_BLOCK_PREFIX = "tracked autodev runtime files must be removed from git index:"
 

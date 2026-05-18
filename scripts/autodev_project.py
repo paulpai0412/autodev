@@ -675,7 +675,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     init = subparsers.add_parser("init", help="Initialize an autodev consumer project")
     _ = init.add_argument("--project-root", default=".")
-    _ = init.add_argument("--github-repo", default="paulpai0412/wferp")
+    _ = init.add_argument("--github-repo", default="paulpai0412/autodev")
     _ = init.add_argument("--dry-run", action="store_true")
     _ = init.add_argument("--check", action="store_true")
     _ = init.add_argument("--force", action="store_true")
