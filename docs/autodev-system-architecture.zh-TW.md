@@ -250,3 +250,8 @@ PYTHONPATH=. python3 scripts/autodev_project.py release --project-root <project>
 
 
 Bad Request: This model does not support assistant message prefill. The conversation must end with a user message.
+
+
+我想為autodev做一個網頁應用，除了自動開發流程外，還要加上由新增或維護一個專案開始，由grill-me-doc生成需求文檔，再由to-prd產生產品規格書，再交給to-issue生成github issue list,然後使用autodev進行自動化開發循環，使用autodev-flow skill由零到完成逐步完成專案推進，包含專案init,intake,start,reconcile,release,completed等步驟，可監控每個session執行進度，包含主seesion,issue worker,pr_verifier,release worker的交付狀況及SSE訊息流，需有主控看板可看全部issue執行狀態，並可手動介入進行recovery或reconcile,看板可看到整個完成進度KPI，請先看下autodev專案現有功能，設計WEB UI方案給我，並提供此專案定位建議，以利UI設計方向規劃
+
+/to-issues 整合prd及ui 原型，展開issues, 並記錄每個issue的相依性及依先後執行順序排列issue編號
