@@ -7,4 +7,8 @@ __pycache__/
 venv/
 
 .opencode/runtime/*.json
+.opencode/runtime/control-plane.sqlite3
 !.opencode/runtime/.gitkeep
+.playwright-mcp/
+issue*-modal-*.png
+issue*-snapshot-*.yml

@@ -27,6 +27,7 @@ ISSUE_COLUMNS: dict[str, str] = {
     "current_stage": "TEXT NOT NULL DEFAULT ''",
     "current_status": "TEXT NOT NULL DEFAULT ''",
     "current_session_id": "TEXT NOT NULL DEFAULT ''",
+    "worktree_path": "TEXT NOT NULL DEFAULT ''",
     "last_history_id": "INTEGER NOT NULL DEFAULT 0",
     "last_command_id": "TEXT NOT NULL DEFAULT ''",
     "last_event_at": "TEXT NOT NULL DEFAULT ''",
@@ -55,8 +56,20 @@ ISSUE_COLUMNS: dict[str, str] = {
 DEVELOPMENT_SLOT_STATES = ("claimed", "dispatching", "running", "verifying")
 
 
+def canonical_control_plane_base_dir(base_dir: Path) -> Path:
+    resolved = base_dir.resolve()
+    for candidate in (resolved, *resolved.parents):
+        parent = candidate.parent
+        runtime_dir = parent.parent
+        opencode_dir = runtime_dir.parent
+        if parent.name == "issue-worktrees" and runtime_dir.name == "runtime" and opencode_dir.name == ".opencode":
+            return opencode_dir.parent.resolve()
+    return resolved
+
+
 def control_plane_db_path(base_dir: Path) -> Path:
-    return base_dir / CONTROL_PLANE_DB_PATH
+    canonical_base_dir = canonical_control_plane_base_dir(base_dir)
+    return canonical_base_dir / CONTROL_PLANE_DB_PATH
 
 
 def _connect(base_dir: Path) -> sqlite3.Connection:
@@ -183,6 +196,14 @@ def _merge_runtime_context(
 def _ensure_base_schema(connection: sqlite3.Connection) -> None:
     issue_columns_sql = ",\n            ".join(f"{column} {definition}" for column, definition in ISSUE_COLUMNS.items())
     connection.execute(f"CREATE TABLE IF NOT EXISTS issues (\n            {issue_columns_sql}\n        )")
+    existing_columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(issues)").fetchall()
+    }
+    for column, definition in ISSUE_COLUMNS.items():
+        if column in existing_columns:
+            continue
+        connection.execute(f"ALTER TABLE issues ADD COLUMN {column} {definition}")
     connection.executescript(
         """
         CREATE TABLE IF NOT EXISTS issue_history (
@@ -310,48 +331,65 @@ def _append_history_entry(
     if existing_history_id is not None:
         return existing_history_id
 
-    cursor = connection.execute(
-        """
-        INSERT INTO issue_history (
-            issue_number,
-            entry_type,
-            role,
-            stage,
-            status,
-            session_id,
-            request_id,
-            command_id,
-            from_state,
-            to_state,
-            summary,
-            payload_json,
-            body_text,
-            content_hash,
-            created_at,
-            unique_key,
-            session_seq
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            issue_number,
-            entry_type,
-            role,
-            stage,
-            status,
-            session_id,
-            request_id,
-            command_id,
-            from_state,
-            to_state,
-            summary,
-            _json_dumps(payload or {}),
-            body_text,
-            content_hash,
-            created_at,
-            unique_key,
-            session_seq,
-        ),
-    )
+    try:
+        cursor = connection.execute(
+            """
+            INSERT INTO issue_history (
+                issue_number,
+                entry_type,
+                role,
+                stage,
+                status,
+                session_id,
+                request_id,
+                command_id,
+                from_state,
+                to_state,
+                summary,
+                payload_json,
+                body_text,
+                content_hash,
+                created_at,
+                unique_key,
+                session_seq
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                issue_number,
+                entry_type,
+                role,
+                stage,
+                status,
+                session_id,
+                request_id,
+                command_id,
+                from_state,
+                to_state,
+                summary,
+                _json_dumps(payload or {}),
+                body_text,
+                content_hash,
+                created_at,
+                unique_key,
+                session_seq,
+            ),
+        )
+    except sqlite3.IntegrityError:
+        if unique_key:
+            existing = connection.execute(
+                "SELECT history_id FROM issue_history WHERE unique_key = ?",
+                (unique_key,),
+            ).fetchone()
+            if existing is not None:
+                return int(existing["history_id"])
+        if session_id and session_seq > 0:
+            existing = connection.execute(
+                "SELECT history_id FROM issue_history WHERE session_id = ? AND session_seq = ? AND entry_type = ?",
+                (session_id, session_seq, entry_type),
+            ).fetchone()
+            if existing is not None:
+                return int(existing["history_id"])
+        raise
     history_id_raw = cursor.lastrowid
     if history_id_raw is None:
         raise RuntimeError("failed to insert issue_history row")
@@ -584,6 +622,7 @@ def sync_issue_runtime_context(
     artifact_refs: dict[str, Any] | None = None,
     artifact_status: dict[str, Any] | None = None,
     issue_packet: dict[str, Any] | None = None,
+    worktree_path: str | None = None,
 ) -> dict[str, Any]:
     ensure_control_plane_db(base_dir)
     with _connection(base_dir) as connection:
@@ -630,6 +669,8 @@ def sync_issue_runtime_context(
             updates["issue_packet_json"] = _json_dumps(issue_packet)
             updates["title"] = str(issue_packet.get("title") or existing.get("title") or "")
             updates["branch"] = str(issue_packet.get("branch") or existing.get("branch") or "")
+        if worktree_path is not None:
+            updates["worktree_path"] = worktree_path
         _update_issue_snapshot(connection, issue_number=issue_number, updates=updates)
         row = _read_issue_row(connection, issue_number)
     return row or {}

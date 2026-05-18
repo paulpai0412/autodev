@@ -2,6 +2,8 @@
 
 > 本文件以目前 repo 版本為準，對應此 workspace 內 `scripts/`、`docs/agents/` 與 `tests/scripts/` 的實作與命令 surface。
 
+> 操作入口原則：優先使用 `autodev-flow` skill（`C0..C6` lifecycle contracts）。本文中的 script/CLI 命令視為低階執行與除錯入口。
+
 ---
 
 ## 1. 系統定位
@@ -416,6 +418,12 @@ PYTHONPATH=. python3 scripts/autodev_project.py reconcile --project-root <projec
 
 這個 wrapper 會以 DB-backed issue state 執行 workspace reconcile，先處理所有 active / fenced issues，再視 available development capacity 啟動新的 ready issue；整個流程不依賴任何本地 ledger / request / session-result artifact。
 
+> 行為更新：`autodev_project.py reconcile` 不再要求「本地 SQLite 已先有 active/ready issue」才允許執行。即使目前沒有 active issue，仍會進入 workspace `reconcile-workspace`，由 supervisor 先嘗試 intake 再決定是否啟動新 issue。
+>
+> 實務建議：
+> - `start` 前仍建議先顯式執行一次 `issue_packet_intake.py`，避免指定 issue 時遇到 `issue packet not recorded in SQLite`。
+> - `reconcile` 可直接執行；若想降低對 GitHub/網路瞬時狀態的敏感度，仍可先手動 intake 再 reconcile。
+
 若你需要直接使用低階命令，對應的是：
 
 ```bash
@@ -674,6 +682,8 @@ PYTHONPATH=. python3 scripts/autodev_project.py start --project-root <project> -
 ```bash
 PYTHONPATH=. python3 scripts/autodev_project.py reconcile --project-root <project>
 ```
+
+> 補充：此步驟即使在「目前 SQLite 尚無 active issue」也可執行；reconcile 會走 workspace path，先嘗試 intake 再判斷是否可啟動新 issue。
 
 ### 步驟 6：必要時查看 session / inspect / quarantine
 

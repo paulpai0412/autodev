@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import sqlite3
+import subprocess
 from pathlib import Path
 from subprocess import CompletedProcess
 from typing import cast
@@ -10,8 +11,8 @@ from contextlib import redirect_stdout
 from unittest.mock import patch
 
 import scripts.orchestrator_supervisor as orchestrator_supervisor
-from scripts.control_plane_db import read_github_sync_attempt, read_issue, read_latest_issue_history
-from scripts.host_adapter import SessionStartContext, SessionStartResult
+from scripts.control_plane_db import read_github_sync_attempt, read_issue, read_latest_github_sync_attempt, read_latest_issue_history
+from scripts.host_adapter import SessionOutcome, SessionStartContext, SessionStartResult
 
 
 def _artifact_status(issue: dict[str, object] | None) -> dict[str, object]:
@@ -31,11 +32,25 @@ def _submit_artifact(
     body_text: str = "",
 ) -> None:
     orchestrator_supervisor.ensure_issue_row(tmp_path, issue_number=issue_number, updated_at=updated_at)
+    normalized_payload = dict(payload)
+    if artifact_kind == "worker_result" and not str(normalized_payload.get("branch") or "").strip():
+        issue = orchestrator_supervisor.read_issue(tmp_path, issue_number) or {}
+        normalized_payload["branch"] = str(issue.get("branch") or f"agent/issue-{issue_number}-demo")
+    if artifact_kind == "evidence_packet" and str(normalized_payload.get("status") or "").lower() == "pass":
+        normalized_payload.setdefault(
+            "gates",
+            {
+                "surface_qa_gate": {
+                    "status": "pass",
+                    "evidence_ref": "test fixture surface QA evidence",
+                }
+            },
+        )
     orchestrator_supervisor.submit_artifact(
         base_dir=tmp_path,
         issue_number=issue_number,
         artifact_kind=artifact_kind,
-        payload=payload,
+        payload=normalized_payload,
         body_text=body_text,
         updated_at=updated_at,
     )
@@ -122,7 +137,7 @@ class FakeHostAdapter:
         self.start_calls.append(context)
         return self.start_result
 
-    def read_session_outcome(self, runtime_session_id: str):
+    def read_session_outcome(self, runtime_session_id: str) -> SessionOutcome | None:
         del runtime_session_id
         return None
 
@@ -940,6 +955,21 @@ def test_build_orchestrator_request_requires_foreground_child_subagents():
     assert "Do not include karpathy-guidelines in load_skills for child subagents" not in request["prompt"]
 
 
+def test_build_orchestrator_request_includes_base_branch_plan():
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(
+        issue_packet=issue_packet,
+        base_branch="agent/issue-41-parent",
+        updated_at="2026-05-07T17:00:00+08:00",
+    )
+
+    request = build_orchestrator_request(ledger)
+
+    assert request["branch"] == "agent/issue-42-demo"
+    assert request.get("baseBranch") == "agent/issue-41-parent"
+    assert "target branch agent/issue-42-demo from base branch agent/issue-41-parent" in request["prompt"]
+
+
 def test_start_issue_records_db_backed_dispatch_result(tmp_path: Path):
     issue_packet_path = tmp_path / "docs/agents/issue-packets/issue-42.yaml"
     issue_packet_path.parent.mkdir(parents=True, exist_ok=True)
@@ -961,6 +991,7 @@ def test_start_issue_records_db_backed_dispatch_result(tmp_path: Path):
     issue = read_issue(tmp_path, "42")
     latest = orchestrator_supervisor.read_latest_dispatch_result(tmp_path, issue_number="42")
     runtime_transition = read_latest_issue_history(tmp_path, "42", entry_type="runtime_transition")
+    stack_base = read_latest_issue_history(tmp_path, "42", entry_type="stack_base_resolved")
 
     assert result.get("status") == "success"
     assert result.get("rootSessionID") == "ses_root_test"
@@ -975,6 +1006,10 @@ def test_start_issue_records_db_backed_dispatch_result(tmp_path: Path):
     assert issue["current_role"] == "issue_worker"
     assert issue["current_stage"] == "issue_worker_execution"
     assert issue["current_session_id"] == "ses_root_test"
+    assert stack_base is not None
+    assert '"base_branch": "main"' in str(stack_base["payload_json"])
+    runtime_context = orchestrator_supervisor.read_runtime_context(tmp_path, "42")
+    assert runtime_context.get("issue_worktree_path") == str(tmp_path)
 
 
 def test_start_issue_succeeds_without_legacy_runtime_files(tmp_path: Path):
@@ -1007,6 +1042,82 @@ def test_start_issue_succeeds_without_legacy_runtime_files(tmp_path: Path):
     assert latest is not None
     assert latest.get("rootSessionID") == "ses_root_test"
     assert not (tmp_path / "docs/agents/runtime/context-checkpoint.yaml").exists()
+    runtime_context = orchestrator_supervisor.read_runtime_context(tmp_path, "42")
+    assert runtime_context.get("issue_worktree_path") == str(tmp_path)
+
+
+def test_start_issue_creates_issue_specific_worktree_in_real_git_repo(tmp_path: Path):
+    _ = subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    _ = subprocess.run(["git", "config", "user.email", "autodev@example.com"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    _ = subprocess.run(["git", "config", "user.name", "autodev"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    readme = tmp_path / "README.md"
+    readme.write_text("demo\n", encoding="utf-8")
+    _ = subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    _ = subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    orchestrator_supervisor._sync_issue_packet_to_db(tmp_path, issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+
+    with patch(
+        "scripts.orchestrator_supervisor._default_host_adapter",
+        return_value=successful_host_adapter(session_id="ses_root_test", resume_command="opencode --session ses_root_test"),
+    ), patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+        result = orchestrator_supervisor.start_issue(
+            base_dir=tmp_path,
+            issue_number="42",
+            source_session_id="autodev-start",
+            updated_at="2026-05-07T17:10:00+08:00",
+        )
+
+    worktree_path = tmp_path / ".opencode/runtime/issue-worktrees/issue-42"
+    issue = read_issue(tmp_path, "42")
+    runtime_context = orchestrator_supervisor.read_runtime_context(tmp_path, "42")
+
+    assert result.get("status") == "success"
+    assert worktree_path.exists()
+    assert (worktree_path / ".git").exists()
+    assert issue is not None
+    assert issue.get("worktree_path") == str(worktree_path)
+    assert runtime_context.get("issue_worktree_path") == str(worktree_path)
+
+
+def test_start_issue_from_issue_worktree_uses_root_control_plane_db(tmp_path: Path):
+    _ = subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    _ = subprocess.run(["git", "config", "user.email", "autodev@example.com"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    _ = subprocess.run(["git", "config", "user.name", "autodev"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    readme = tmp_path / "README.md"
+    readme.write_text("demo\n", encoding="utf-8")
+    _ = subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    _ = subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    orchestrator_supervisor._sync_issue_packet_to_db(tmp_path, issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+
+    issue_worktree = tmp_path / ".opencode/runtime/issue-worktrees/issue-42"
+
+    with patch(
+        "scripts.orchestrator_supervisor._default_host_adapter",
+        return_value=successful_host_adapter(session_id="ses_root_test", resume_command="opencode --session ses_root_test"),
+    ), patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+        result = orchestrator_supervisor.start_issue(
+            base_dir=issue_worktree,
+            issue_number="42",
+            source_session_id="autodev-start",
+            updated_at="2026-05-07T17:10:00+08:00",
+        )
+
+    issue = read_issue(tmp_path, "42")
+    issue_from_worktree_base = read_issue(issue_worktree, "42")
+    runtime_context = orchestrator_supervisor.read_runtime_context(tmp_path, "42")
+
+    assert result.get("status") == "success"
+    assert issue is not None
+    assert issue_from_worktree_base is not None
+    assert issue_from_worktree_base["current_session_id"] == "ses_root_test"
+    assert issue["current_session_id"] == "ses_root_test"
+    assert issue["worktree_path"] == str(issue_worktree)
+    assert runtime_context.get("issue_worktree_path") == str(issue_worktree)
+    assert not (issue_worktree / ".opencode/runtime/control-plane.sqlite3").exists()
 
 
 def test_start_issue_rejects_packet_issue_number_mismatch(tmp_path: Path):
@@ -1076,10 +1187,233 @@ def test_show_latest_session_returns_host_neutral_db_state_when_issue_is_running
     assert "recommendedAction" not in payload
 
 
+def test_show_latest_session_hides_stale_root_dispatch_when_runtime_is_release_worker(tmp_path: Path) -> None:
+    _ingest_issue_packet_text(tmp_path, "42", SAMPLE_ISSUE_PACKET)
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="release_pending",
+        command_id="cmd-release-pending",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_session_id="ses-root-42",
+    )
+    orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_role="release_worker",
+        current_stage="release_worker_execution",
+        current_status="queued",
+    )
+    orchestrator_supervisor.append_issue_history(
+        tmp_path,
+        issue_number="42",
+        entry_type="dispatch_result",
+        created_at="2026-05-07T16:30:00+08:00",
+        role="main_orchestrator",
+        stage="orchestrator_bootstrap",
+        status="success",
+        session_id="ses-root-42",
+        payload={
+            "status": "success",
+            "rootSessionID": "ses-root-42",
+            "issueNumber": "42",
+            "role": "main_orchestrator",
+            "stage": "orchestrator_bootstrap",
+            "recordedAt": "2026-05-07T16:30:00+08:00",
+        },
+        unique_key="dispatch-result:stale-root-42",
+    )
+
+    payload = orchestrator_supervisor.show_latest_session(base_dir=tmp_path, issue_number="42")
+
+    assert payload is None
+
+
+def test_show_latest_session_prefers_latest_session_result_for_release_worker(tmp_path: Path) -> None:
+    _ingest_issue_packet_text(tmp_path, "42", SAMPLE_ISSUE_PACKET)
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="release_pending",
+        command_id="cmd-release-pending",
+        updated_at="2026-05-07T17:10:00+08:00",
+        current_session_id="ses-release-42",
+    )
+    orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:10:00+08:00",
+        current_role="release_worker",
+        current_stage="release_worker_execution",
+        current_status="running",
+    )
+    orchestrator_supervisor.append_issue_history(
+        tmp_path,
+        issue_number="42",
+        entry_type="dispatch_result",
+        created_at="2026-05-07T16:30:00+08:00",
+        role="main_orchestrator",
+        stage="orchestrator_bootstrap",
+        status="success",
+        session_id="ses-root-42",
+        payload={
+            "status": "success",
+            "rootSessionID": "ses-root-42",
+            "issueNumber": "42",
+            "role": "main_orchestrator",
+            "stage": "orchestrator_bootstrap",
+            "recordedAt": "2026-05-07T16:30:00+08:00",
+        },
+        unique_key="dispatch-result:stale-root-42",
+    )
+    orchestrator_supervisor.append_issue_history(
+        tmp_path,
+        issue_number="42",
+        entry_type="session_result",
+        created_at="2026-05-07T17:09:00+08:00",
+        role="release_worker",
+        stage="release_worker_execution",
+        status="success",
+        session_id="ses-release-42",
+        payload={
+            "status": "success",
+            "rootSessionID": "ses-release-42",
+            "issueNumber": "42",
+            "role": "release_worker",
+            "stage": "release_worker_execution",
+            "recordedAt": "2026-05-07T17:09:00+08:00",
+            "sourceSessionID": "ses-trigger-42",
+        },
+        unique_key="session-result:release-worker-42",
+    )
+
+    payload = orchestrator_supervisor.show_latest_session(base_dir=tmp_path, issue_number="42")
+
+    assert payload is not None
+    assert payload.get("rootSessionID") == "ses-release-42"
+    assert payload.get("role") == "release_worker"
+    assert payload.get("stage") == "release_worker_execution"
+
+
+def test_show_latest_session_workspace_fallback_prefers_newer_session_result(tmp_path: Path) -> None:
+    orchestrator_supervisor.append_issue_history(
+        tmp_path,
+        issue_number="42",
+        entry_type="dispatch_result",
+        created_at="2026-05-07T16:30:00+08:00",
+        role="main_orchestrator",
+        stage="orchestrator_bootstrap",
+        status="success",
+        session_id="ses-root-42",
+        payload={
+            "status": "success",
+            "rootSessionID": "ses-root-42",
+            "issueNumber": "42",
+            "role": "main_orchestrator",
+            "stage": "orchestrator_bootstrap",
+            "recordedAt": "2026-05-07T16:30:00+08:00",
+        },
+        unique_key="dispatch-result:root-42",
+    )
+    orchestrator_supervisor.append_issue_history(
+        tmp_path,
+        issue_number="42",
+        entry_type="session_result",
+        created_at="2026-05-07T17:10:00+08:00",
+        role="main_orchestrator",
+        stage="issue_selection_or_recovery",
+        status="success",
+        session_id="ses-main-42",
+        payload={
+            "status": "success",
+            "rootSessionID": "ses-main-42",
+            "issueNumber": "42",
+            "role": "main_orchestrator",
+            "stage": "issue_selection_or_recovery",
+            "recordedAt": "2026-05-07T17:10:00+08:00",
+        },
+        unique_key="session-result:main-42",
+    )
+
+    payload = orchestrator_supervisor.show_latest_session(base_dir=tmp_path)
+
+    assert payload is not None
+    assert payload.get("rootSessionID") == "ses-main-42"
+    assert payload.get("stage") == "issue_selection_or_recovery"
+
+
+def test_show_latest_session_prefers_running_issue_over_newer_quarantined_fence(tmp_path: Path) -> None:
+    # Quarantined issue has a newer timestamp but should not shadow an actively
+    # running issue when operators request the latest resumable session.
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="23",
+        state="quarantined",
+        command_id="cmd-quarantined-23",
+        updated_at="2026-05-07T17:20:00+08:00",
+        current_session_id="ses-quarantined-23",
+    )
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="25",
+        state="running",
+        command_id="cmd-running-25",
+        updated_at="2026-05-07T17:10:00+08:00",
+        current_session_id="ses-running-25",
+    )
+    orchestrator_supervisor.append_issue_history(
+        tmp_path,
+        issue_number="23",
+        entry_type="dispatch_result",
+        created_at="2026-05-07T17:20:00+08:00",
+        role="main_orchestrator",
+        stage="orchestrator_bootstrap",
+        status="success",
+        session_id="ses-quarantined-23",
+        payload={
+            "status": "success",
+            "rootSessionID": "ses-quarantined-23",
+            "issueNumber": "23",
+            "role": "main_orchestrator",
+            "stage": "orchestrator_bootstrap",
+            "recordedAt": "2026-05-07T17:20:00+08:00",
+        },
+        unique_key="dispatch-result:quarantined-23",
+    )
+    orchestrator_supervisor.append_issue_history(
+        tmp_path,
+        issue_number="25",
+        entry_type="dispatch_result",
+        created_at="2026-05-07T17:10:00+08:00",
+        role="main_orchestrator",
+        stage="orchestrator_bootstrap",
+        status="success",
+        session_id="ses-running-25",
+        payload={
+            "status": "success",
+            "rootSessionID": "ses-running-25",
+            "issueNumber": "25",
+            "role": "main_orchestrator",
+            "stage": "orchestrator_bootstrap",
+            "recordedAt": "2026-05-07T17:10:00+08:00",
+        },
+        unique_key="dispatch-result:running-25",
+    )
+
+    payload = orchestrator_supervisor.show_latest_session(base_dir=tmp_path)
+
+    assert payload is not None
+    assert payload.get("issueNumber") == "25"
+    assert payload.get("rootSessionID") == "ses-running-25"
+
+
 def test_reconcile_workspace_reconciles_active_issues_and_starts_ready_issue_with_free_capacity(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("AUTODEV_DEVELOPMENT_CAPACITY", "2")
+    monkeypatch.setenv("AUTODEV_RELEASE_CAPACITY", "1")
+    monkeypatch.setenv("AUTODEV_RELEASE_BACKFILL_MODE", "auto")
 
-    for issue_number in ("41", "42"):
+    for issue_number in ("41", "42", "43"):
         packet_text = (
             SAMPLE_ISSUE_PACKET.replace('"42"', f'"{issue_number}"')
             .replace('issue-42', f'issue-{issue_number}')
@@ -1108,10 +1442,210 @@ def test_reconcile_workspace_reconciles_active_issues_and_starts_ready_issue_wit
         current_stage="issue_worker_execution",
         current_status="queued",
     )
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="43",
+        state="verified",
+        command_id="cmd-verified-43",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_session_id="ses-v-43",
+    )
+    orchestrator_supervisor.record_pr_opened(
+        base_dir=tmp_path,
+        issue_number="43",
+        pr_number="143",
+        created_at="2026-05-07T17:00:00+08:00",
+        verifier_session_id="ses-v-43",
+        command_id="cmd-pr-43",
+        payload={"issue_number": "43", "pr_number": "143"},
+    )
 
-    adapter = successful_host_adapter(session_id="ses-root-42", resume_command="opencode --session ses-root-42")
+    adapter = successful_host_adapter(session_id="ses-shared", resume_command="opencode --session ses-shared")
     with patch("scripts.orchestrator_supervisor._default_host_adapter", return_value=adapter), patch(
         "scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""
+    ), patch("scripts.orchestrator_supervisor.run_issue_packet_intake", return_value=True) as run_intake:
+        payload = orchestrator_supervisor.reconcile_workspace_from_db(
+            base_dir=tmp_path,
+            updated_at="2026-05-07T17:10:00+08:00",
+            source_session_id="workspace-reconcile",
+        )
+
+    issue_42 = read_issue(tmp_path, "42")
+    issue_43 = read_issue(tmp_path, "43")
+
+    assert payload["status"] == "success"
+    assert payload["intake_status"] == "success"
+    assert payload["intake_error"] == ""
+    assert payload["development_capacity"] == 2
+    assert payload["release_capacity"] == 1
+    assert payload["release_backfill_mode"] == "auto"
+    assert payload["auto_release_approval_mode"] == "human_required"
+    assert payload["active_issue_numbers"] == ["41", "43"]
+    assert [entry["issue_number"] for entry in cast(list[dict[str, object]], payload["reconciled_issues"])] == ["41", "43"]
+    run_intake.assert_called_once_with(tmp_path)
+    started = cast(list[dict[str, object]], payload["started_issues"])
+    assert [entry["issue_number"] for entry in started] == ["42"]
+    started_releases = cast(list[dict[str, object]], payload["started_releases"])
+    assert [entry["issue_number"] for entry in started_releases] == ["43"]
+    assert cast(list[dict[str, object]], payload["release_backfill_errors"]) == []
+    assert issue_42 is not None
+    assert issue_42["state"] == "running"
+    assert issue_42["current_session_id"] == "ses-shared"
+    assert issue_43 is not None
+    assert issue_43["state"] == "release_pending"
+    assert issue_43["current_session_id"] == "ses-shared"
+
+
+def test_reconcile_workspace_respects_full_development_capacity(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AUTODEV_DEVELOPMENT_CAPACITY", "1")
+    monkeypatch.setenv("AUTODEV_RELEASE_CAPACITY", "1")
+    monkeypatch.setenv("AUTODEV_RELEASE_BACKFILL_MODE", "auto")
+
+    for issue_number in ("41", "42", "43"):
+        packet_text = (
+            SAMPLE_ISSUE_PACKET.replace('"42"', f'"{issue_number}"')
+            .replace('issue-42', f'issue-{issue_number}')
+            .replace('Demo issue', f'Issue {issue_number}')
+            .replace('agent/issue-42-demo', f'agent/issue-{issue_number}-demo')
+        )
+        orchestrator_supervisor._sync_issue_packet_to_db(
+            tmp_path,
+            parse_issue_packet_text(packet_text, f"docs/agents/issue-packets/issue-{issue_number}.yaml"),
+            updated_at="2026-05-07T17:00:00+08:00",
+        )
+
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="41",
+        state="running",
+        command_id="cmd-running-41",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_session_id="ses-root-41",
+    )
+    orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="41",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_role="issue_worker",
+        current_stage="issue_worker_execution",
+        current_status="queued",
+    )
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="43",
+        state="verified",
+        command_id="cmd-verified-43",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_session_id="ses-v-43",
+    )
+    orchestrator_supervisor.record_pr_opened(
+        base_dir=tmp_path,
+        issue_number="43",
+        pr_number="143",
+        created_at="2026-05-07T17:00:00+08:00",
+        verifier_session_id="ses-v-43",
+        command_id="cmd-pr-43",
+        payload={"issue_number": "43", "pr_number": "143"},
+    )
+
+    adapter = successful_host_adapter(session_id="ses-release-43", resume_command="opencode --session ses-release-43")
+
+    with patch("scripts.orchestrator_supervisor._default_host_adapter", return_value=adapter), patch(
+        "scripts.orchestrator_supervisor._sync_issue_progress_label",
+        return_value="",
+    ), patch(
+        "scripts.orchestrator_supervisor.run_issue_packet_intake", return_value=False
+    ) as run_intake:
+        payload = orchestrator_supervisor.reconcile_workspace_from_db(
+            base_dir=tmp_path,
+            updated_at="2026-05-07T17:10:00+08:00",
+            source_session_id="workspace-reconcile",
+        )
+
+    issue_42 = read_issue(tmp_path, "42")
+    issue_43 = read_issue(tmp_path, "43")
+
+    assert payload["status"] == "success"
+    assert payload["intake_status"] == "failed"
+    assert payload["intake_error"] == ""
+    assert payload["development_capacity"] == 1
+    assert payload["release_capacity"] == 1
+    assert payload["release_backfill_mode"] == "auto"
+    assert payload["auto_release_approval_mode"] == "human_required"
+    assert cast(list[dict[str, object]], payload["started_issues"]) == []
+    started_releases = cast(list[dict[str, object]], payload["started_releases"])
+    assert [entry["issue_number"] for entry in started_releases] == ["43"]
+    assert cast(list[dict[str, object]], payload["release_backfill_errors"]) == []
+    run_intake.assert_called_once_with(tmp_path)
+    assert issue_42 is not None
+    assert issue_42["state"] == "ready"
+    assert issue_43 is not None
+    assert issue_43["state"] == "release_pending"
+    assert issue_43["current_session_id"] == "ses-release-43"
+
+
+def test_reconcile_workspace_manual_release_backfill_mode_skips_release_starts(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AUTODEV_RELEASE_BACKFILL_MODE", "manual")
+    _ingest_issue_packet_text(tmp_path, "43", SAMPLE_ISSUE_PACKET.replace('"42"', '"43"').replace("issue-42", "issue-43"))
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="43",
+        state="verified",
+        command_id="cmd-verified-43",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_session_id="ses-v-43",
+    )
+    orchestrator_supervisor.record_pr_opened(
+        base_dir=tmp_path,
+        issue_number="43",
+        pr_number="143",
+        created_at="2026-05-07T17:00:00+08:00",
+        verifier_session_id="ses-v-43",
+        command_id="cmd-pr-43",
+        payload={"issue_number": "43", "pr_number": "143"},
+    )
+
+    with patch("scripts.orchestrator_supervisor.run_issue_packet_intake", return_value=True):
+        payload = orchestrator_supervisor.reconcile_workspace_from_db(
+            base_dir=tmp_path,
+            updated_at="2026-05-07T17:10:00+08:00",
+            source_session_id="workspace-reconcile",
+        )
+
+    issue_43 = read_issue(tmp_path, "43")
+    assert payload["release_backfill_mode"] == "manual"
+    assert cast(list[dict[str, object]], payload["started_releases"]) == []
+    assert cast(list[dict[str, object]], payload["release_backfill_errors"]) == []
+    assert issue_43 is not None
+    assert issue_43["state"] == "verified"
+
+
+def test_reconcile_workspace_auto_release_bypass_approval_injects_override(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AUTODEV_RELEASE_BACKFILL_MODE", "auto")
+    monkeypatch.setenv("AUTODEV_AUTO_RELEASE_APPROVAL_MODE", "bypass_approval")
+    _ingest_issue_packet_text(tmp_path, "43", SAMPLE_ISSUE_PACKET.replace('"42"', '"43"').replace("issue-42", "issue-43"))
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="43",
+        state="verified",
+        command_id="cmd-verified-43",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_session_id="ses-v-43",
+    )
+    orchestrator_supervisor.record_pr_opened(
+        base_dir=tmp_path,
+        issue_number="43",
+        pr_number="143",
+        created_at="2026-05-07T17:00:00+08:00",
+        verifier_session_id="ses-v-43",
+        command_id="cmd-pr-43",
+        payload={"issue_number": "43", "pr_number": "143"},
+    )
+
+    adapter = successful_host_adapter(session_id="ses-release-43", resume_command="opencode --session ses-release-43")
+
+    with patch("scripts.orchestrator_supervisor._default_host_adapter", return_value=adapter), patch(
+        "scripts.orchestrator_supervisor.run_issue_packet_intake", return_value=True
     ):
         payload = orchestrator_supervisor.reconcile_workspace_from_db(
             base_dir=tmp_path,
@@ -1119,66 +1653,129 @@ def test_reconcile_workspace_reconciles_active_issues_and_starts_ready_issue_wit
             source_session_id="workspace-reconcile",
         )
 
-    issue_42 = read_issue(tmp_path, "42")
+    issue_43 = read_issue(tmp_path, "43")
 
-    assert payload["status"] == "success"
-    assert payload["development_capacity"] == 2
-    assert payload["active_issue_numbers"] == ["41"]
-    assert [entry["issue_number"] for entry in cast(list[dict[str, object]], payload["reconciled_issues"])] == ["41"]
-    started = cast(list[dict[str, object]], payload["started_issues"])
-    assert [entry["issue_number"] for entry in started] == ["42"]
-    assert issue_42 is not None
-    assert issue_42["state"] == "running"
-    assert issue_42["current_session_id"] == "ses-root-42"
+    assert payload["release_backfill_mode"] == "auto"
+    assert payload["auto_release_approval_mode"] == "bypass_approval"
+    started_releases = cast(list[dict[str, object]], payload["started_releases"])
+    assert [entry["issue_number"] for entry in started_releases] == ["43"]
+    assert issue_43 is not None
+    runtime_context = json.loads(str(issue_43["runtime_context_json"]))
+    assert runtime_context["release_runtime_controls"] == {
+        "approval_override_mode": "bypass_approval",
+        "default_merge_approval_mode": "human_required",
+        "override_source": "workspace_reconcile_auto_release",
+        "human_approval_skipped": True,
+    }
+    assert "Current release override: approval_override_mode=bypass_approval" in adapter.start_calls[0].prompt
+    assert "override_source=workspace_reconcile_auto_release" in adapter.start_calls[0].prompt
 
 
-def test_reconcile_workspace_respects_full_development_capacity(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("AUTODEV_DEVELOPMENT_CAPACITY", "1")
-
-    for issue_number in ("41", "42"):
-        packet_text = (
-            SAMPLE_ISSUE_PACKET.replace('"42"', f'"{issue_number}"')
-            .replace('issue-42', f'issue-{issue_number}')
-            .replace('Demo issue', f'Issue {issue_number}')
-            .replace('agent/issue-42-demo', f'agent/issue-{issue_number}-demo')
-        )
-        orchestrator_supervisor._sync_issue_packet_to_db(
-            tmp_path,
-            parse_issue_packet_text(packet_text, f"docs/agents/issue-packets/issue-{issue_number}.yaml"),
-            updated_at="2026-05-07T17:00:00+08:00",
-        )
-
+def test_auto_release_backfill_bypass_approval_can_complete_end_to_end(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AUTODEV_RELEASE_BACKFILL_MODE", "auto")
+    monkeypatch.setenv("AUTODEV_AUTO_RELEASE_APPROVAL_MODE", "bypass_approval")
+    _ingest_issue_packet_text(tmp_path, "43", SAMPLE_ISSUE_PACKET.replace('"42"', '"43"').replace("issue-42", "issue-43"))
     orchestrator_supervisor.upsert_issue_state(
         tmp_path,
-        issue_number="41",
-        state="running",
-        command_id="cmd-running-41",
+        issue_number="43",
+        state="verified",
+        command_id="cmd-verified-43",
         updated_at="2026-05-07T17:00:00+08:00",
-        current_session_id="ses-root-41",
+        current_session_id="ses-v-43",
     )
-    orchestrator_supervisor.sync_issue_runtime_context(
-        tmp_path,
-        issue_number="41",
-        updated_at="2026-05-07T17:00:00+08:00",
-        current_role="issue_worker",
-        current_stage="issue_worker_execution",
-        current_status="queued",
+    orchestrator_supervisor.record_pr_opened(
+        base_dir=tmp_path,
+        issue_number="43",
+        pr_number="143",
+        created_at="2026-05-07T17:00:00+08:00",
+        verifier_session_id="ses-v-43",
+        command_id="cmd-pr-43",
+        payload={"issue_number": "43", "pr_number": "143"},
     )
 
-    with patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+    adapter = successful_host_adapter(session_id="ses-release-43", resume_command="opencode --session ses-release-43")
+
+    with patch("scripts.orchestrator_supervisor._default_host_adapter", return_value=adapter), patch(
+        "scripts.orchestrator_supervisor.run_issue_packet_intake", return_value=True
+    ):
         payload = orchestrator_supervisor.reconcile_workspace_from_db(
             base_dir=tmp_path,
             updated_at="2026-05-07T17:10:00+08:00",
             source_session_id="workspace-reconcile",
         )
 
-    issue_42 = read_issue(tmp_path, "42")
+    issue_43 = read_issue(tmp_path, "43")
+    assert payload["auto_release_approval_mode"] == "bypass_approval"
+    assert issue_43 is not None
+    assert issue_43["state"] == "release_pending"
+    assert issue_43["current_session_id"] == "ses-release-43"
+
+    _submit_artifact(
+        tmp_path,
+        issue_number="43",
+        artifact_kind="release_result",
+        payload={
+            "status": "success",
+            "blocked_reason": "none",
+            "next_recommended_step": "continue",
+            "failure_kind": "none",
+            "retryable": False,
+            "merge": {"attempted": True, "merged": True, "merged_sha": "abc143"},
+            "merge_approval_mode": "bypass_approval",
+            "human_approval_skipped": True,
+            "override_source": "workspace_reconcile_auto_release",
+            "pr_number": 143,
+            "pr_url": "https://github.com/example/repo/pull/143",
+            "base_branch": "main",
+            "head_branch": "agent/issue-43-demo",
+        },
+        updated_at="2026-05-07T17:12:00+08:00",
+        body_text="Auto release merged successfully with bypass approval override.",
+    )
+
+    with patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value="") as sync_labels, patch(
+        "scripts.orchestrator_lifecycle.subprocess.run",
+        return_value=CompletedProcess(["git"], 0, stdout="", stderr=""),
+    ):
+        orchestrator_supervisor.release_issue_execution(
+            base_dir=tmp_path,
+            issue_number="43",
+            restore_ready_for_agent=False,
+            final_state="completed",
+            updated_at="2026-05-07T17:13:00+08:00",
+        )
+
+    issue_43 = read_issue(tmp_path, "43")
+    assert issue_43 is not None
+    assert issue_43["state"] == "completed"
+    assert issue_43["current_session_id"] == ""
+    runtime_context = json.loads(str(issue_43["runtime_context_json"]))
+    assert runtime_context["release_runtime_controls"] == {
+        "approval_override_mode": "bypass_approval",
+        "default_merge_approval_mode": "human_required",
+        "override_source": "workspace_reconcile_auto_release",
+        "human_approval_skipped": True,
+    }
+    latest_release_result = read_latest_issue_history(tmp_path, "43", entry_type="release_result")
+    assert latest_release_result is not None
+    latest_payload = json.loads(str(latest_release_result["payload_json"]))
+    assert latest_payload["merge_approval_mode"] == "bypass_approval"
+    assert latest_payload["human_approval_skipped"] is True
+    assert latest_payload["override_source"] == "workspace_reconcile_auto_release"
+    sync_labels.assert_called_once()
+
+
+def test_reconcile_workspace_reports_intake_exception_without_blocking_scheduler(tmp_path: Path) -> None:
+    with patch("scripts.orchestrator_supervisor.run_issue_packet_intake", side_effect=RuntimeError("gh unavailable")):
+        payload = orchestrator_supervisor.reconcile_workspace_from_db(
+            base_dir=tmp_path,
+            updated_at="2026-05-07T17:10:00+08:00",
+            source_session_id="workspace-reconcile",
+        )
 
     assert payload["status"] == "success"
-    assert payload["development_capacity"] == 1
-    assert cast(list[dict[str, object]], payload["started_issues"]) == []
-    assert issue_42 is not None
-    assert issue_42["state"] == "ready"
+    assert payload["intake_status"] == "failed"
+    assert payload["intake_error"] == "gh unavailable"
 
 
 def test_start_release_claims_verified_issue_and_launches_independent_release_worker(tmp_path: Path) -> None:
@@ -1217,8 +1814,8 @@ def test_start_release_claims_verified_issue_and_launches_independent_release_wo
     request = read_latest_issue_history(tmp_path, "42", entry_type="dispatch_request")
     admin_action = read_latest_issue_history(tmp_path, "42", entry_type="admin_action")
 
-    assert result["status"] == "success"
-    assert result["role"] == "release_worker"
+    assert result.get("status") == "success"
+    assert result.get("role") == "release_worker"
     assert issue is not None
     assert issue["state"] == "release_pending"
     assert issue["current_session_id"] == "ses-release-42"
@@ -1266,6 +1863,117 @@ def test_start_release_refuses_verified_issue_without_pr_opened_fact(tmp_path: P
     issue = read_issue(tmp_path, "42")
     assert issue is not None
     assert issue["state"] == "verified"
+
+
+def test_start_release_backfills_pr_opened_from_passed_evidence_packet(tmp_path: Path) -> None:
+    _ingest_issue_packet_text(tmp_path, "42", SAMPLE_ISSUE_PACKET)
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="verified",
+        command_id="cmd-verified",
+        updated_at="2026-05-07T17:00:00+08:00",
+    )
+    orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:00:00+08:00",
+        runtime_context={"resolved_base_branch": "main"},
+    )
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="evidence_packet",
+        payload={
+            "status": "pass",
+            "pr_number": "77",
+            "verifier_session_id": "ses-v",
+            "next_recommended_step": "Release it",
+            "failure_kind": "none",
+            "retryable": True,
+        },
+        updated_at="2026-05-07T17:05:00+08:00",
+    )
+    adapter = successful_host_adapter(session_id="ses-release-42", resume_command="opencode --session ses-release-42")
+
+    with patch("scripts.orchestrator_supervisor._default_host_adapter", return_value=adapter):
+        result = orchestrator_supervisor.start_release(
+            base_dir=tmp_path,
+            issue_number="42",
+            source_session_id="manual-release",
+            updated_at="2026-05-07T17:10:00+08:00",
+        )
+
+    latest_pr_opened = read_latest_issue_history(tmp_path, "42", entry_type="pr_opened")
+
+    assert result.get("status") == "success"
+    assert latest_pr_opened is not None
+    assert latest_pr_opened["status"] == "opened"
+    payload = json.loads(str(latest_pr_opened["payload_json"]))
+    assert payload["pr_number"] == "77"
+    assert payload["source_artifact"] == "release_evidence_packet_fallback"
+    assert payload["base_branch"] == "main"
+
+
+def test_start_release_repairs_stale_release_pending_fence_without_dispatch_evidence(tmp_path: Path) -> None:
+    _ingest_issue_packet_text(tmp_path, "41", SAMPLE_ISSUE_PACKET.replace('"42"', '"41"').replace("issue-42", "issue-41"))
+    _ingest_issue_packet_text(tmp_path, "42", SAMPLE_ISSUE_PACKET)
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="41",
+        state="verified",
+        command_id="cmd-verified-41",
+        updated_at="2026-05-07T17:00:00+08:00",
+    )
+    orchestrator_supervisor.record_pr_opened(
+        base_dir=tmp_path,
+        issue_number="41",
+        pr_number="71",
+        created_at="2026-05-07T17:00:00+08:00",
+        verifier_session_id="ses-v-41",
+        command_id="cmd-pr-41",
+        payload={"issue_number": "41", "pr_number": "71"},
+    )
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="release_pending",
+        command_id="cmd-release-pending-42",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_session_id="ses-root-42",
+    )
+    orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_role="release_worker",
+        current_stage="release_worker_execution",
+        current_status="queued",
+    )
+    adapter = successful_host_adapter(session_id="ses-release-41", resume_command="opencode --session ses-release-41")
+
+    with patch("scripts.orchestrator_supervisor._default_host_adapter", return_value=adapter):
+        result = orchestrator_supervisor.start_release(
+            base_dir=tmp_path,
+            issue_number="41",
+            source_session_id="manual-release",
+            updated_at="2026-05-07T17:10:00+08:00",
+        )
+
+    issue_41 = read_issue(tmp_path, "41")
+    issue_42 = read_issue(tmp_path, "42")
+    repair_event = read_latest_issue_history(tmp_path, "42", entry_type="runtime_transition")
+
+    assert result.get("status") == "success"
+    assert result.get("role") == "release_worker"
+    assert issue_41 is not None
+    assert issue_41["state"] == "release_pending"
+    assert issue_42 is not None
+    assert issue_42["state"] == "release_pending"
+    assert issue_42["current_session_id"] == ""
+    assert issue_42["current_status"] == ""
+    assert repair_event is not None
+    assert "Cleared stale release_worker fence" in str(repair_event.get("summary") or "")
 
 
 def test_validate_session_request_rejects_completed_issue(tmp_path: Path):
@@ -2558,7 +3266,7 @@ def test_release_issue_execution_clears_session_ids_on_completed_terminal_state(
     sync_labels.assert_called_once()
     sync_kwargs = sync_labels.call_args.kwargs
     assert sync_kwargs["add_labels"] == []
-    assert sync_kwargs["remove_labels"] == ["agent-dispatching", "agent-in-progress", "quarantined"]
+    assert sync_kwargs["remove_labels"] == ["ready-for-agent", "agent-dispatching", "agent-in-progress", "quarantined"]
 
 
 def test_release_issue_execution_clears_session_ids_on_failed_terminal_state(tmp_path: Path):
@@ -2603,7 +3311,7 @@ def test_release_issue_execution_clears_session_ids_on_failed_terminal_state(tmp
     sync_labels.assert_called_once()
     sync_kwargs = sync_labels.call_args.kwargs
     assert sync_kwargs["add_labels"] == []
-    assert sync_kwargs["remove_labels"] == ["agent-dispatching", "agent-in-progress", "quarantined"]
+    assert sync_kwargs["remove_labels"] == ["ready-for-agent", "agent-dispatching", "agent-in-progress", "quarantined"]
 
 
 def test_release_issue_execution_returns_release_pending_to_verified_for_non_terminal_release_block(tmp_path: Path):
@@ -2648,7 +3356,7 @@ def test_release_issue_execution_returns_release_pending_to_verified_for_non_ter
     sync_labels.assert_called_once()
     sync_kwargs = sync_labels.call_args.kwargs
     assert sync_kwargs["add_labels"] == []
-    assert sync_kwargs["remove_labels"] == ["agent-dispatching", "agent-in-progress", "quarantined"]
+    assert sync_kwargs["remove_labels"] == ["ready-for-agent", "agent-dispatching", "agent-in-progress", "quarantined"]
 
 
 def test_release_issue_execution_completed_syncs_local_main_and_branch(tmp_path: Path):
@@ -2684,6 +3392,9 @@ def test_release_issue_execution_completed_syncs_local_main_and_branch(tmp_path:
 
     calls: list[list[str]] = []
 
+    config_path = tmp_path / ".autodev.yaml"
+    _ = config_path.write_text('schema_version: "1.0"\nproject:\n  github_repo: example/repo\n', encoding="utf-8")
+
     def fake_run(command, cwd, check, capture_output, text):
         calls.append(cast(list[str], command))
         return CompletedProcess(command, 0, stdout="", stderr="")
@@ -2714,8 +3425,12 @@ def test_release_issue_execution_completed_syncs_local_main_and_branch(tmp_path:
         ["git", "checkout", "agent/issue-42-demo"],
         ["git", "merge", "--ff-only", "main"],
         ["git", "checkout", "main"],
+        ["gh", "issue", "close", "42", "--repo", "example/repo", "--comment", "Closing after merged release completed in autodev."],
     ]
     sync_labels.assert_called_once()
+    latest_sync = read_latest_github_sync_attempt(tmp_path, "42")
+    assert latest_sync is not None
+    assert latest_sync["status"] == "success"
 
 
 def test_release_issue_execution_completed_raises_when_local_main_sync_fails(tmp_path: Path):
@@ -2772,6 +3487,117 @@ def test_release_issue_execution_completed_raises_when_local_main_sync_fails(tmp
     payload = json.loads(str(latest_admin_action["payload_json"] or "{}"))
     assert payload["decision_type"] == "admin_local_main_sync_failure"
     assert "failed local main sync after release merge" in str(latest_admin_action["summary"])
+
+
+def test_release_issue_execution_completed_raises_when_github_issue_close_fails(tmp_path: Path):
+    _ingest_issue_packet_text(tmp_path, "42", SAMPLE_ISSUE_PACKET)
+    config_path = tmp_path / ".autodev.yaml"
+    _ = config_path.write_text('schema_version: "1.0"\nproject:\n  github_repo: example/repo\n', encoding="utf-8")
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="release_pending",
+        command_id="cmd-release-pending",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_session_id="ses-release-42",
+    )
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="release_result",
+        payload={
+            "status": "success",
+            "merged": True,
+            "pr_number": 88,
+            "merge": {"merged": True, "merged_sha": "abc123"},
+        },
+        updated_at="2026-05-07T17:00:30+08:00",
+    )
+
+    def fake_run(command, cwd, check, capture_output, text):
+        command_list = cast(list[str], command)
+        if command_list[:3] == ["gh", "issue", "close"]:
+            return CompletedProcess(command_list, 1, stdout="", stderr="close failed")
+        return CompletedProcess(command_list, 0, stdout="", stderr="")
+
+    with patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""), patch(
+        "scripts.orchestrator_lifecycle.subprocess.run",
+        side_effect=fake_run,
+    ):
+        try:
+            orchestrator_supervisor.release_issue_execution(
+                base_dir=tmp_path,
+                issue_number="42",
+                restore_ready_for_agent=False,
+                final_state="completed",
+                updated_at="2026-05-07T17:01:00+08:00",
+            )
+        except RuntimeError as error:
+            assert "close failed" in str(error)
+        else:
+            raise AssertionError("expected release_issue_execution to fail when GitHub issue close fails")
+
+    issue = read_issue(tmp_path, "42")
+    latest_admin_action = read_latest_issue_history(tmp_path, "42", entry_type="admin_action")
+    latest_sync = read_latest_github_sync_attempt(tmp_path, "42")
+    assert issue is not None
+    assert issue["state"] == "release_pending"
+    assert latest_admin_action is not None
+    assert latest_admin_action["command_id"].endswith(":admin-github-issue-close-failed")
+    payload = json.loads(str(latest_admin_action["payload_json"] or "{}"))
+    assert payload["decision_type"] == "admin_github_issue_close_failure"
+    assert latest_sync is not None
+    assert latest_sync["status"] == "failed"
+    assert "close failed" in str(latest_sync["last_error"])
+
+
+def test_release_issue_execution_completed_skips_issue_close_for_local_seeded_issue(tmp_path: Path):
+    _ingest_issue_packet_text(
+        tmp_path,
+        "42",
+        SAMPLE_ISSUE_PACKET.replace('type: "github-issue"', 'type: "local-seeded-issue"').replace('"github"', '"local_seeded"', 1),
+    )
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="release_pending",
+        command_id="cmd-release-pending",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_session_id="ses-release-42",
+    )
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="release_result",
+        payload={
+            "status": "success",
+            "merge": {"merged": True, "merged_sha": "abc123"},
+        },
+        updated_at="2026-05-07T17:00:30+08:00",
+    )
+
+    calls: list[list[str]] = []
+
+    def fake_run(command, cwd, check, capture_output, text):
+        calls.append(cast(list[str], command))
+        return CompletedProcess(command, 0, stdout="", stderr="")
+
+    with patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""), patch(
+        "scripts.orchestrator_lifecycle.subprocess.run",
+        side_effect=fake_run,
+    ):
+        orchestrator_supervisor.release_issue_execution(
+            base_dir=tmp_path,
+            issue_number="42",
+            restore_ready_for_agent=False,
+            final_state="completed",
+            updated_at="2026-05-07T17:01:00+08:00",
+        )
+
+    assert all(command[:3] != ["gh", "issue", "close"] for command in calls)
+    latest_sync = read_latest_github_sync_attempt(tmp_path, "42")
+    assert latest_sync is not None
+    assert latest_sync["status"] == "skipped"
 
 
 def test_retry_github_sync_command_rejects_stale_failed_attempt(tmp_path: Path):
@@ -2908,6 +3734,68 @@ def test_dispatch_session_request_fails_when_same_repo_session_read_probe_fails(
     assert result.get("rootSessionID") == "ses_root_stdout"
     assert result.get("sessionReadabilityStatus") == "failed_same_repo_probe"
     assert "failed same-repo session_read probe" in str(result.get("error", ""))
+
+
+def test_dispatch_session_request_retries_without_source_session_on_prefill_error():
+    request: orchestrator_supervisor.SessionRequest = {
+        "requestGeneration": 1,
+        "nonce": "nonce-42",
+        "requestID": "request-42",
+        "createdAt": "2026-05-07T17:00:00+08:00",
+        "createdForLedgerRevision": "2026-05-07T17:00:00+08:00",
+        "reason": "orchestrator bootstrap continuation for issue #42",
+        "title": "Continue issue #42 on agent/issue-42-demo",
+        "agent": "build",
+        "prompt": "Bootstrap from the SQLite-backed control plane only.",
+        "role": "main_orchestrator",
+        "stage": "orchestrator_bootstrap",
+        "issueNumber": "42",
+        "branch": "agent/issue-42-demo",
+    }
+
+    class RetryWithoutSourceHostAdapter(FakeHostAdapter):
+        def __init__(self):
+            super().__init__(
+                SessionStartResult(
+                    status="error",
+                    error="Bad Request: This model does not support assistant message prefill. The conversation must end with a user message.",
+                    metadata={"retryWithoutSourceSession": True},
+                )
+            )
+            self.call_count = 0
+
+        def start_root_session(self, context: SessionStartContext):
+            self.start_calls.append(context)
+            self.call_count += 1
+            if self.call_count == 1:
+                return SessionStartResult(
+                    status="error",
+                    error="Bad Request: This model does not support assistant message prefill. The conversation must end with a user message.",
+                    metadata={"retryWithoutSourceSession": True},
+                )
+            return SessionStartResult(
+                status="success",
+                session_id="ses-retried",
+                resume_hint="resume in host",
+                resume_command="opencode --session ses-retried",
+                readability_status="verified_same_repo_probe",
+                metadata={"tuiResumeCommand": "/sessions", "stopContinuationStatus": "root_session_detached", "stopContinuationAttempts": 0},
+            )
+
+    adapter = RetryWithoutSourceHostAdapter()
+    with patch("scripts.orchestrator_supervisor._default_host_adapter", return_value=adapter):
+        result = orchestrator_supervisor.dispatch_session_request(
+            request,
+            workdir=Path("/tmp/demo"),
+            source_session_id="ses_source_test",
+            updated_at="2026-05-07T17:10:00+08:00",
+        )
+
+    assert result.get("status") == "success"
+    assert result.get("rootSessionID") == "ses-retried"
+    assert len(adapter.start_calls) == 2
+    assert adapter.start_calls[0].source_session_id == "ses_source_test"
+    assert adapter.start_calls[1].source_session_id == ""
 
 
 def test_dispatch_session_request_extracts_session_id_from_run_stdout_without_db_lookup():
@@ -3438,21 +4326,7 @@ next_recommended_step: \"Release it\"
             "next_recommended_step": "Release it",
             "failure_kind": "none",
             "retryable": True,
-        },
-        updated_at="2026-05-07T17:11:00+08:00",
-        body_text=evidence_path.read_text(encoding="utf-8"),
-    )
-    _submit_artifact(
-        tmp_path,
-        issue_number="42",
-        artifact_kind="evidence_packet",
-        payload={
-            "status": "pass",
-            "pr_number": "77",
-            "verifier_session_id": "ses-v",
-            "next_recommended_step": "Release it",
-            "failure_kind": "none",
-            "retryable": True,
+            "gates": {"surface_qa_gate": {"status": "pass", "evidence_ref": "db:evidence:42"}},
         },
         updated_at="2026-05-07T17:11:00+08:00",
         body_text=evidence_path.read_text(encoding="utf-8"),
@@ -3524,6 +4398,42 @@ next_recommended_step: \"Release it\"
     assert "ended without recording evidence_packet in SQLite" in cast(str, decision["summary"])
 
 
+def test_reconcile_verifier_keeps_recently_queued_dispatch_without_evidence(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "pr_verifier", "stage": "pr_verifier_execution", "status": "queued"}
+    cast(dict[str, str], ledger["artifacts"])["evidence_packet_ref"] = "docs/agents/evidence/issue-42-pr-77.yaml"
+
+    orchestrator_supervisor.ensure_issue_row(tmp_path, issue_number="42", updated_at="2026-05-07T17:09:00+08:00")
+    orchestrator_supervisor._record_runtime_transition_history(
+        base_dir=tmp_path,
+        issue_number="42",
+        recorded_at="2026-05-07T17:11:00+08:00",
+        from_role="issue_worker",
+        from_stage="issue_worker_execution",
+        to_role="pr_verifier",
+        to_stage="pr_verifier_execution",
+        reason="Issue worker succeeded and queued pr_verifier.",
+    )
+
+    attempts = cast(dict[str, int], ledger["attempts"])
+    attempts["pr_verifier"] = 1
+
+    with patch("scripts.orchestrator_supervisor._read_db_artifact_fact", return_value={}):
+        updated_ledger, decision, request = reconcile_ledger(
+            ledger,
+            artifact_base_dir=tmp_path,
+            updated_at="2026-05-07T17:11:10+08:00",
+        )
+
+    assert updated_ledger is not None
+    assert decision["action"] == "no_change"
+    assert decision["next_role"] == "pr_verifier"
+    assert request is None
+    assert attempts["pr_verifier"] == 1
+    assert "is queued and SQLite has not recorded evidence_packet yet" in cast(str, decision["summary"])
+
+
 def test_reconcile_verifier_uses_history_fallback_when_artifact_snapshot_missing(tmp_path: Path):
     issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
@@ -3541,6 +4451,7 @@ def test_reconcile_verifier_uses_history_fallback_when_artifact_snapshot_missing
             "next_recommended_step": "Release it",
             "failure_kind": "none",
             "retryable": True,
+            "gates": {"surface_qa_gate": {"status": "pass", "evidence_ref": "db:evidence:42"}},
         },
         updated_at="2026-05-07T17:11:00+08:00",
     )
@@ -3575,7 +4486,7 @@ def test_reconcile_verifier_uses_history_fallback_when_artifact_snapshot_missing
     assert '"pr_number": "77"' in str(latest_pr_opened["body_text"])
 
 
-def test_reconcile_verifier_pass_uses_worker_result_pr_fallback(tmp_path: Path):
+def test_reconcile_verifier_pass_without_evidence_pr_number_retries_verifier(tmp_path: Path):
     issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
     ledger["current"] = {"role": "pr_verifier", "stage": "pr_verifier_execution", "status": "queued"}
@@ -3588,6 +4499,7 @@ def test_reconcile_verifier_pass_uses_worker_result_pr_fallback(tmp_path: Path):
         artifact_kind="worker_result",
         payload={
             "status": "success",
+            "branch": "agent/issue-42-demo",
             "pr_number": "77",
             "pr_url": "https://example/pr/77",
             "next_recommended_step": "delegate_pr_verifier_subagent",
@@ -3609,6 +4521,7 @@ def test_reconcile_verifier_pass_uses_worker_result_pr_fallback(tmp_path: Path):
             "next_recommended_step": "Release it",
             "failure_kind": "none",
             "retryable": True,
+            "gates": {"surface_qa_gate": {"status": "pass", "evidence_ref": "db:evidence:42"}},
         },
         updated_at="2026-05-07T17:11:00+08:00",
     )
@@ -3631,16 +4544,256 @@ def test_reconcile_verifier_pass_uses_worker_result_pr_fallback(tmp_path: Path):
     latest_pr_opened = read_latest_issue_history(tmp_path, "42", entry_type="pr_opened")
 
     assert updated_ledger is not None
+    assert decision["action"] == "delegate_subagent"
+    assert decision["next_role"] == "pr_verifier"
+    assert request is None
+    assert cast(dict[str, object], updated_ledger["lastFailure"])["kind"] == "contract_invalid"
+    assert "without a PR number in evidence_packet" in cast(str, decision["summary"])
+    assert issue is not None
+    assert issue["state"] == "verifying"
+    assert latest_pr_opened is None
+
+
+def test_reconcile_verifier_pass_with_mismatched_pr_number_retries_verifier(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "pr_verifier", "stage": "pr_verifier_execution", "status": "queued"}
+    cast(dict[str, str], ledger["artifacts"])["worker_result_ref"] = "docs/agents/worker-results/issue-42.yaml"
+    cast(dict[str, str], ledger["artifacts"])["evidence_packet_ref"] = "docs/agents/evidence/issue-42-pr-88.yaml"
+
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="worker_result",
+        payload={
+            "status": "success",
+            "branch": "agent/issue-42-demo",
+            "pr_number": "77",
+            "pr_url": "https://example/pr/77",
+            "next_recommended_step": "delegate_pr_verifier_subagent",
+            "failure_kind": "none",
+            "retryable": True,
+            "completed_at": "2026-05-07T17:10:00+08:00",
+            "worker_session_id": "ses-w",
+        },
+        updated_at="2026-05-07T17:10:00+08:00",
+    )
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="evidence_packet",
+        payload={
+            "status": "pass",
+            "pr_number": "88",
+            "verifier_session_id": "ses-v",
+            "next_recommended_step": "Release it",
+            "failure_kind": "none",
+            "retryable": True,
+            "gates": {"surface_qa_gate": {"status": "pass", "evidence_ref": "db:evidence:42"}},
+        },
+        updated_at="2026-05-07T17:11:00+08:00",
+    )
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="running",
+        command_id="cmd-running",
+        updated_at="2026-05-07T17:09:00+08:00",
+        current_session_id="ses-root-42",
+    )
+
+    updated_ledger, decision, request = reconcile_ledger(
+        ledger,
+        artifact_base_dir=tmp_path,
+        updated_at="2026-05-07T17:11:00+08:00",
+    )
+
+    issue = read_issue(tmp_path, "42")
+    latest_pr_opened = read_latest_issue_history(tmp_path, "42", entry_type="pr_opened")
+
+    assert updated_ledger is not None
+    assert decision["action"] == "delegate_subagent"
+    assert decision["next_role"] == "pr_verifier"
+    assert request is None
+    assert cast(dict[str, object], updated_ledger["lastFailure"])["kind"] == "contract_invalid"
+    assert "but worker_result recorded PR #77" in cast(str, decision["summary"])
+    assert issue is not None
+    assert issue["state"] == "verifying"
+    assert latest_pr_opened is None
+
+
+def test_reconcile_verifier_pass_without_browser_gate_evidence_retries_when_ui_surface_required(tmp_path: Path):
+    issue_packet_text = """schema_version: \"1.0\"
+kind: issue_packet
+line_cap: 80
+
+issue:
+  number: \"42\"
+  title: \"Demo issue\"
+  url: \"https://github.com/example/issues/42\"
+  labels: [ready-for-agent]
+  parent: {type: \"prd\", reference: \"https://github.com/example/issues/1\"}
+
+branch: {name: \"agent/issue-42-demo\", base: \"main\"}
+
+bootstrap_context:
+  required_reads: [\"AGENTS.md\"]
+  context_budget: {checkpoint_warning_at_percent: 45, stop_and_rotate_at_percent: 50}
+  relevant_paths: [\"frontend\"]
+  prior_handoff: \"docs/agents/handoffs/issue-41.yaml\"
+
+verifier_manual_qa:
+  surface: \"browser\"
+  required_gates: [\"diagnostics_and_build_gate\", \"surface_qa_gate\", \"review_gate\"]
+"""
+    issue_packet = parse_issue_packet_text(issue_packet_text, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    _ingest_issue_packet_text(tmp_path, "42", issue_packet_text)
+    ledger["current"] = {"role": "pr_verifier", "stage": "pr_verifier_execution", "status": "queued"}
+    cast(dict[str, str], ledger["artifacts"])["worker_result_ref"] = "docs/agents/worker-results/issue-42.yaml"
+    cast(dict[str, str], ledger["artifacts"])["evidence_packet_ref"] = "docs/agents/evidence/issue-42-pr-77.yaml"
+    attempts = cast(dict[str, int], ledger["attempts"])
+    starting_attempts = attempts["pr_verifier"]
+
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="worker_result",
+        payload={
+            "status": "success",
+            "pr_number": "77",
+            "worker_session_id": "ses-w",
+            "files_changed": [{"path": "frontend/src/App.tsx", "summary": "UI update"}],
+            "failure_kind": "none",
+            "retryable": True,
+        },
+        updated_at="2026-05-07T17:10:00+08:00",
+    )
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="evidence_packet",
+        payload={
+            "status": "pass",
+            "pr_number": "77",
+            "verifier_session_id": "ses-v",
+            "next_recommended_step": "Release it",
+            "failure_kind": "none",
+            "retryable": True,
+            "gates": {"surface_qa_gate": {"status": "not_applicable", "evidence_ref": ""}},
+        },
+        updated_at="2026-05-07T17:11:00+08:00",
+    )
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="running",
+        command_id="cmd-running",
+        updated_at="2026-05-07T17:09:00+08:00",
+        current_session_id="ses-root-42",
+    )
+
+    updated_ledger, decision, request = reconcile_ledger(
+        ledger,
+        artifact_base_dir=tmp_path,
+        updated_at="2026-05-07T17:11:00+08:00",
+    )
+
+    issue = read_issue(tmp_path, "42")
+
+    assert updated_ledger is not None
+    assert decision["action"] == "delegate_subagent"
+    assert decision["next_role"] == "pr_verifier"
+    assert decision["next_stage"] == "pr_verifier_execution"
+    assert "browser_e2e_gate evidence" in cast(str, decision["summary"])
+    assert request is None
+    assert attempts["pr_verifier"] == starting_attempts + 1
+    assert issue is not None
+    assert issue["state"] == "verifying"
+
+
+def test_reconcile_verifier_pass_with_browser_gate_evidence_marks_verified(tmp_path: Path):
+    issue_packet_text = """schema_version: \"1.0\"
+kind: issue_packet
+line_cap: 80
+
+issue:
+  number: \"42\"
+  title: \"Demo issue\"
+  url: \"https://github.com/example/issues/42\"
+  labels: [ready-for-agent]
+  parent: {type: \"prd\", reference: \"https://github.com/example/issues/1\"}
+
+branch: {name: \"agent/issue-42-demo\", base: \"main\"}
+
+bootstrap_context:
+  required_reads: [\"AGENTS.md\"]
+  context_budget: {checkpoint_warning_at_percent: 45, stop_and_rotate_at_percent: 50}
+  relevant_paths: [\"frontend\"]
+  prior_handoff: \"docs/agents/handoffs/issue-41.yaml\"
+
+verifier_manual_qa:
+  surface: \"browser\"
+  required_gates: [\"diagnostics_and_build_gate\", \"surface_qa_gate\", \"review_gate\"]
+"""
+    issue_packet = parse_issue_packet_text(issue_packet_text, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    _ingest_issue_packet_text(tmp_path, "42", issue_packet_text)
+    ledger["current"] = {"role": "pr_verifier", "stage": "pr_verifier_execution", "status": "queued"}
+    cast(dict[str, str], ledger["artifacts"])["worker_result_ref"] = "docs/agents/worker-results/issue-42.yaml"
+    cast(dict[str, str], ledger["artifacts"])["evidence_packet_ref"] = "docs/agents/evidence/issue-42-pr-77.yaml"
+
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="worker_result",
+        payload={
+            "status": "success",
+            "pr_number": "77",
+            "worker_session_id": "ses-w",
+            "files_changed": [{"path": "frontend/src/App.tsx", "summary": "UI update"}],
+            "failure_kind": "none",
+            "retryable": True,
+        },
+        updated_at="2026-05-07T17:10:00+08:00",
+    )
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="evidence_packet",
+        payload={
+            "status": "pass",
+            "pr_number": "77",
+            "verifier_session_id": "ses-v",
+            "next_recommended_step": "Release it",
+            "failure_kind": "none",
+            "retryable": True,
+            "gates": {"surface_qa_gate": {"status": "pass", "evidence_ref": "artifacts/browser-e2e/report.html"}},
+        },
+        updated_at="2026-05-07T17:11:00+08:00",
+    )
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="running",
+        command_id="cmd-running",
+        updated_at="2026-05-07T17:09:00+08:00",
+        current_session_id="ses-root-42",
+    )
+
+    updated_ledger, decision, request = reconcile_ledger(
+        ledger,
+        artifact_base_dir=tmp_path,
+        updated_at="2026-05-07T17:11:00+08:00",
+    )
+
+    issue = read_issue(tmp_path, "42")
+
+    assert updated_ledger is not None
     assert decision["action"] == "release_waiting"
     assert request is None
-    assert cast(dict[str, object], updated_ledger["lastFailure"])["kind"] == "none"
-    assert "recorded PR #77" in cast(str, decision["summary"])
     assert issue is not None
     assert issue["state"] == "verified"
-    assert latest_pr_opened is not None
-    payload = json.loads(str(latest_pr_opened["payload_json"]))
-    assert payload["pr_number"] == "77"
-    assert payload["source_artifact"] == "worker_result_fallback"
 
 
 def test_reconcile_release_worker_running_without_release_result_stays_no_change(tmp_path: Path):
@@ -3672,6 +4825,49 @@ def test_reconcile_release_worker_running_without_release_result_stays_no_change
     assert decision["next_stage"] == "release_worker_execution"
     assert "Keep the queued/running dispatch state unchanged" in cast(str, decision["summary"])
     assert request is None
+    assert issue is not None
+    assert issue["state"] == "release_pending"
+
+
+def test_reconcile_release_worker_terminal_without_release_result_redispatches_subagent(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "release_worker", "stage": "release_worker_execution", "status": "running"}
+    cast(dict[str, str], ledger["artifacts"])["release_result_ref"] = "docs/agents/release-results/issue-42-pr-88.yaml"
+    attempts = cast(dict[str, int], ledger["attempts"])
+    initial_attempts = attempts["release_worker"]
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="release_pending",
+        command_id="cmd-release-running",
+        updated_at="2026-05-07T17:10:00+08:00",
+        current_session_id="ses-release-42",
+    )
+
+    class TerminalOutcomeHostAdapter(FakeHostAdapter):
+        def read_session_outcome(self, runtime_session_id: str):
+            del runtime_session_id
+            return SessionOutcome(status="completed", session_id="ses-release-42")
+
+    with patch("scripts.orchestrator_supervisor._default_host_adapter", return_value=TerminalOutcomeHostAdapter(successful_host_adapter(session_id="ses-ignored").start_result)), patch(
+        "scripts.orchestrator_supervisor._read_db_artifact_fact", return_value={}
+    ), patch("scripts.orchestrator_supervisor._transition_issue_state_if_possible"):
+        updated_ledger, decision, request = reconcile_ledger(
+            ledger,
+            artifact_base_dir=tmp_path,
+            updated_at="2026-05-07T17:11:00+08:00",
+        )
+
+    issue = read_issue(tmp_path, "42")
+
+    assert updated_ledger is not None
+    assert decision["action"] == "delegate_subagent"
+    assert decision["next_role"] == "release_worker"
+    assert decision["next_stage"] == "release_worker_execution"
+    assert "without recording release_result" in cast(str, decision["summary"])
+    assert request is None
+    assert attempts["release_worker"] == initial_attempts + 1
     assert issue is not None
     assert issue["state"] == "release_pending"
 
@@ -3772,7 +4968,7 @@ def test_resume_quarantined_issue_execution_restores_running(tmp_path: Path):
         updated_at="2026-05-07T17:00:00+08:00",
     )
 
-    with patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+    with patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value="") as sync_labels:
         orchestrator_supervisor.resume_quarantined_issue_execution(
             base_dir=tmp_path,
             issue_number="42",
@@ -3784,6 +4980,10 @@ def test_resume_quarantined_issue_execution_restores_running(tmp_path: Path):
 
     assert issue is not None
     assert issue["state"] == "running"
+    sync_labels.assert_called_once()
+    sync_kwargs = sync_labels.call_args.kwargs
+    assert sync_kwargs["add_labels"] == ["agent-in-progress"]
+    assert sync_kwargs["remove_labels"] == ["ready-for-agent", "quarantined", "agent-dispatching"]
 
 
 def test_redispatch_quarantined_command_creates_fresh_root_session(tmp_path: Path, capsys) -> None:
@@ -3802,7 +5002,7 @@ def test_redispatch_quarantined_command_creates_fresh_root_session(tmp_path: Pat
     with patch(
         "scripts.orchestrator_supervisor._default_host_adapter",
         return_value=successful_host_adapter(session_id="ses_root_retry", resume_command="opencode --session ses_root_retry"),
-    ), patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+    ), patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value="") as sync_labels:
         exit_code = orchestrator_supervisor.main(
             [
                 "redispatch-quarantined",
@@ -3831,6 +5031,10 @@ def test_redispatch_quarantined_command_creates_fresh_root_session(tmp_path: Pat
     assert issue["current_session_id"] == "ses_root_retry"
     assert artifact_refs["rootSessionID"] == "ses_root_retry"
     assert artifact_refs["status"] == "root_session_started"
+    assert sync_labels.call_count >= 2
+    dispatch_sync_kwargs = sync_labels.call_args_list[0].kwargs
+    assert dispatch_sync_kwargs["add_labels"] == ["agent-dispatching"]
+    assert dispatch_sync_kwargs["remove_labels"] == ["ready-for-agent", "quarantined", "agent-in-progress"]
 
 
 def test_redispatch_quarantined_command_does_not_write_legacy_runtime_files(tmp_path: Path) -> None:
@@ -3916,6 +5120,46 @@ def test_redispatch_quarantined_command_restores_quarantine_when_dispatch_fails(
     assert issue is not None
     assert issue["state"] == "quarantined"
     assert issue["current_session_id"] == ""
+
+
+def test_dispatch_failure_quarantine_rollback_removes_ready_label(tmp_path: Path) -> None:
+    _ingest_issue_packet_text(tmp_path, "42", SAMPLE_ISSUE_PACKET)
+    request: orchestrator_supervisor.SessionRequest = {
+        "requestGeneration": 1,
+        "nonce": "nonce-42",
+        "requestID": "request-42",
+        "createdAt": "2026-05-07T17:00:00+08:00",
+        "createdForLedgerRevision": "2026-05-07T17:00:00+08:00",
+        "reason": "redispatch",
+        "title": "Continue issue #42 on agent/issue-42-demo",
+        "agent": "build",
+        "prompt": "dispatch",
+        "role": "main_orchestrator",
+        "stage": "orchestrator_bootstrap",
+        "issueNumber": "42",
+        "branch": "agent/issue-42-demo",
+    }
+
+    with patch(
+        "scripts.orchestrator_supervisor.dispatch_session_request",
+        return_value={
+            "status": "error",
+            "error": "dispatch failed",
+            "recordedAt": "2026-05-07T17:01:00+08:00",
+        },
+    ), patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value="") as sync_labels:
+        _ = orchestrator_supervisor.dispatch_request_from_db(
+            request,
+            base_dir=tmp_path,
+            source_session_id="ses-source",
+            updated_at="2026-05-07T17:01:00+08:00",
+            failure_restore_state="quarantined",
+        )
+
+    assert sync_labels.call_count == 1
+    sync_kwargs = sync_labels.call_args.kwargs
+    assert sync_kwargs["add_labels"] == ["quarantined"]
+    assert sync_kwargs["remove_labels"] == ["ready-for-agent", "agent-dispatching", "agent-in-progress"]
 
 
 def test_fail_quarantined_issue_execution_marks_issue_failed(tmp_path: Path):
@@ -5057,9 +6301,107 @@ def test_reconcile_issue_selection_or_recovery_queues_retryable_failed_issue_rec
     assert request["stage"] == "issue_selection_or_recovery"
 
 
-def test_inspect_command_prints_control_plane_snapshot(tmp_path: Path):
+def test_reconcile_issue_selection_or_recovery_recovers_ready_issue_to_verified_from_late_evidence(tmp_path: Path):
+    issue_packet_text = """schema_version: \"1.0\"
+kind: issue_packet
+line_cap: 80
+
+issue:
+  number: \"42\"
+  title: \"Demo issue\"
+  url: \"https://github.com/example/issues/42\"
+  labels: [ready-for-agent]
+  parent: {type: \"prd\", reference: \"https://github.com/example/issues/1\"}
+
+branch: {name: \"agent/issue-42-demo\", base: \"main\"}
+
+bootstrap_context:
+  required_reads: [\"AGENTS.md\"]
+  context_budget: {checkpoint_warning_at_percent: 45, stop_and_rotate_at_percent: 50}
+  relevant_paths: [\"frontend\"]
+  prior_handoff: \"docs/agents/handoffs/issue-41.yaml\"
+
+verifier_manual_qa:
+  surface: \"browser\"
+  required_gates: [\"diagnostics_and_build_gate\", \"surface_qa_gate\", \"review_gate\"]
+"""
+    issue_packet = parse_issue_packet_text(issue_packet_text, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "main_orchestrator", "stage": "issue_selection_or_recovery", "status": "queued"}
+    cast(dict[str, str], ledger["artifacts"])["worker_result_ref"] = "docs/agents/worker-results/issue-42.yaml"
+    cast(dict[str, str], ledger["artifacts"])["evidence_packet_ref"] = "docs/agents/evidence/issue-42-pr-77.yaml"
+    _ingest_issue_packet_text(tmp_path, "42", issue_packet_text)
+
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="ready",
+        command_id="cmd-ready",
+        updated_at="2026-05-07T17:21:00+08:00",
+    )
+
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="worker_result",
+        payload={
+            "status": "success",
+            "pr_number": "77",
+            "files_changed": [{"path": "index.html", "summary": "UI update"}],
+            "failure_kind": "none",
+            "retryable": True,
+        },
+        updated_at="2026-05-07T17:10:00+08:00",
+    )
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="evidence_packet",
+        payload={
+            "status": "pass",
+            "pr_number": "77",
+            "verifier_session_id": "ses-v",
+            "failure_kind": "none",
+            "retryable": True,
+            "gates": {
+                "surface_qa_gate": {"status": "pass", "evidence_ref": "artifacts/browser-e2e/report.html"},
+                "browser_e2e_gate": "pass",
+            },
+            "browser_e2e_evidence": {"method": "playwright"},
+        },
+        updated_at="2026-05-07T17:11:00+08:00",
+    )
+
+    with patch("scripts.orchestrator_supervisor.run_issue_packet_intake", return_value=False):
+        updated_ledger, decision, request = reconcile_ledger(ledger, artifact_base_dir=tmp_path,
+        updated_at="2026-05-07T17:23:00+08:00",)
+
+    issue = read_issue(tmp_path, "42")
+
+    assert updated_ledger is not None
+    assert decision["action"] == "queue_next_session"
+    assert request is not None
+    assert issue is not None
+    assert issue["state"] == "verified"
+
+
+def test_inspect_command_prints_control_plane_snapshot(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AUTODEV_RELEASE_CAPACITY", "3")
+    monkeypatch.setenv("AUTODEV_RELEASE_BACKFILL_MODE", "manual")
     issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
     orchestrator_supervisor._sync_issue_packet_to_db(tmp_path, issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    issue_43_packet = parse_issue_packet_text(
+        SAMPLE_ISSUE_PACKET.replace('"42"', '"43"').replace("issue-42", "issue-43").replace("Demo issue", "Issue 43"),
+        "docs/agents/issue-packets/issue-43.yaml",
+    )
+    orchestrator_supervisor._sync_issue_packet_to_db(tmp_path, issue_43_packet, updated_at="2026-05-07T17:00:00+08:00")
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="43",
+        state="verified",
+        command_id="cmd-verified-43",
+        updated_at="2026-05-07T17:00:30+08:00",
+    )
     orchestrator_supervisor.transition_issue_state(
         tmp_path,
         issue_number="42",
@@ -5098,7 +6440,7 @@ def test_inspect_command_prints_control_plane_snapshot(tmp_path: Path):
     issue_column_names = [str(column["name"]) for column in issue_columns]
 
     assert exit_code == 0
-    assert set(payload) == {"schema", "issue", "latestDecision", "latestGitHubSyncAttempt"}
+    assert set(payload) == {"schema", "issue", "latestDecision", "latestGitHubSyncAttempt", "releaseBackfill"}
     assert schema["dbPath"] == str(tmp_path / ".opencode/runtime/control-plane.sqlite3")
     assert "artifact_refs_json" in issue_column_names
     assert "artifact_status_json" in issue_column_names
@@ -5106,6 +6448,11 @@ def test_inspect_command_prints_control_plane_snapshot(tmp_path: Path):
     assert cast(dict[str, object], payload["issue"])["issue_number"] == "42"
     assert cast(dict[str, object], payload["latestDecision"])["command_id"] == "cmd-claim"
     assert cast(dict[str, object], payload["latestGitHubSyncAttempt"])["command_id"] == "cmd-gh"
+    release_backfill = cast(dict[str, object], payload["releaseBackfill"])
+    assert release_backfill["mode"] == "manual"
+    assert release_backfill["releaseCapacity"] == 3
+    assert release_backfill["availableReleaseSlots"] == 3
+    assert release_backfill["verifiedWaitingCount"] == 1
 
 
 def test_retry_github_sync_command_replays_failed_attempt(tmp_path: Path):

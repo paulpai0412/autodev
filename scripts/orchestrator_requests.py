@@ -36,6 +36,7 @@ def build_common_prompt_lines(ledger: JsonObject, *, default_supervisor_doc_path
     workflow = cast(dict[str, object], ledger["workflow"])
     automation = cast(dict[str, object], ledger.get("automation", {}))
     primary_workspace_root = str(automation.get("primaryWorkspaceRoot") or "")
+    base_branch = str(issue.get("baseBranch") or "main")
 
     shared_runtime_root = _shared_runtime_root(ledger, fallback_workflow_policy_path=default_supervisor_doc_path)
 
@@ -49,6 +50,7 @@ def build_common_prompt_lines(ledger: JsonObject, *, default_supervisor_doc_path
         f"Read {workflow['workflowPolicyPath']} for role boundaries and gates.",
         f"Read {default_supervisor_doc_path} for the nonstop supervisor contract.",
         f"Active issue: #{issue['number']} on branch {issue['branch']}.",
+        f"Branch plan: create or update target branch {issue['branch']} from base branch {base_branch}.",
         "Do not wait for a user reply before advancing the workflow.",
         (
             "Report worker/verifier/release outcomes by calling "
@@ -86,6 +88,7 @@ def build_prompt(
     queued_next_issue_record = cast(dict[str, object], queued_next_issue.get("record", {}))
     queued_next_issue_number = str(queued_next_issue_record.get("issue_number") or "")
     queued_next_issue_branch = str(queued_next_issue_record.get("branch") or "")
+    queued_next_issue_base_branch = str(queued_next_issue_record.get("base_branch") or "")
     def shared_runtime_command(relative_script_path: str) -> str:
         if shared_runtime_root:
             return f'PYTHONPATH="{shared_runtime_root}" python3 "{shared_runtime_root}/{relative_script_path}"'
@@ -113,9 +116,14 @@ def build_prompt(
             "Do not implement issue scope directly.",
             "You own orchestration for the whole selected issue inside this root session.",
             "Before launching the first child subagent, run the supervisor reconcile path once in this same turn so the bootstrap -> issue_worker_execution transition is persisted to the DB-backed control plane.",
+            "If the first reconcile decision returns start_issue_required, run start-issue for this issue immediately, then run reconcile again before creating/switching branches or launching child subagents.",
             'Run issue_worker and pr_verifier as subagents from this root orchestrator session with task(subagent_type="general", ..., run_in_background=false). Wait for each child task call to finish in the foreground before continuing.',
+            'When launching issue_worker, always include load_skills=["tdd", "karpathy-guidelines", "git-master"]. Do not omit tdd for code-changing issue work.',
+            'If issue scope includes web UI/static HTML implementation, launch issue_worker with load_skills=["tdd", "karpathy-guidelines", "git-master", "web-design-engineer"].',
             "Do not launch release_worker from this root session; PR merge/release is claimed later by the independent release command.",
-            "Choose child load_skills normally for the task at hand.",
+            'When launching pr_verifier, always include load_skills=["review-work", "karpathy-guidelines"].',
+            'If issue scope includes web UI/static HTML verification, launch pr_verifier with load_skills=["review-work", "karpathy-guidelines", "browser-qa", "e2e-testing"].',
+            "For release_worker, choose child load_skills normally for the task at hand.",
             (
                 f"The authoritative shared workflow policy is {workflow['workflowPolicyPath']}."
                 if workflow.get("workflowPolicyPath")
@@ -141,7 +149,10 @@ def build_prompt(
                 else "This issue is GitHub-backed. Use the DB-backed issue packet context and GitHub issue metadata together when needed."
             ),
             "Persist the normalized worker_result into SQLite with submit-artifact instead of writing YAML files.",
+            'When implementing web UI/static HTML scope, include "web-design-engineer" in issue_worker load_skills before coding.',
+            "Before claiming status=success, fetch and merge the latest base branch into your issue branch, resolve conflicts, and rerun focused checks so release is not blocked by stale branch divergence.",
             "Do not report status=success until the implementation branch is pushed and branch or commit metadata is populated in the worker_result payload.",
+            f"Create or update the implementation branch {issue['branch']} from base branch {issue.get('baseBranch') or 'main'}; do not assume main when the base branch differs.",
             "Do not create the formal PR; verifier-owned acceptance creates or records the PR after checking the branch.",
             "If implementation is done but branch push has not succeeded yet, submit blocked or failed instead of success so reconcile can classify the state honestly.",
             "If the worker is blocked or failed, include failure_kind, retryable, and next_recommended_step in the submitted payload.",
@@ -149,12 +160,27 @@ def build_prompt(
             "After submit-artifact succeeds, return control to the main_orchestrator root session; do not launch a root session.",
         ]
     elif role == "pr_verifier":
+        inspect_command = (
+            f"{shared_runtime_command('scripts/orchestrator_supervisor.py')} "
+            f"inspect --base-dir \"{primary_workspace_root or '.'}\" --issue-number {issue['number']}"
+        )
         lines = common + [
             f"You are the pr_verifier subagent for issue #{issue['number']}.",
             "Read the DB-backed issue packet context and the persisted worker_result context before touching anything else.",
             "Persist verifier acceptance or failure as an evidence_packet via submit-artifact instead of writing YAML files.",
+            "Evidence payload contract: prefer gates.surface_qa_gate as an object {status: 'pass', evidence_ref: '<non-empty>'}. Legacy flat gate strings are accepted only when browser_e2e evidence fields are also present.",
+            'Run pr_verifier with load_skills containing "review-work" for every verification run.',
+            "If the worker changed web UI or static HTML surface files, browser_e2e_gate is mandatory before status=pass.",
+            'When browser_e2e_gate is mandatory, include both "browser-qa" and "e2e-testing" in pr_verifier load_skills before executing checks.',
+            "For mandatory browser_e2e_gate runs, execute a real browser flow (happy path plus one refusal/error path), check console/network failures, and include compact evidence refs in the evidence_packet.",
+            "Do not mark status=pass when browser_e2e_gate applies but was not executed; submit blocked or fail with failure_kind and retryable.",
             "After acceptance passes, create or record the formal PR and include pr_number in the evidence_packet payload.",
+            f"When creating the formal PR, use head branch {issue['branch']} and base branch {issue.get('baseBranch') or 'main'}; include base_branch in the evidence_packet payload.",
             "Do not stop, summarize, or report verification progress until the evidence_packet payload is stored in SQLite.",
+            "Immediately after submit-artifact for evidence_packet, run inspect and confirm latest refs/artifact status show a persisted evidence_packet fact (parse_ok=true) for this issue.",
+            f"Inspect command: {inspect_command}",
+            "If inspect does not show persisted evidence_packet (or pr_number/base_branch binding is missing), retry submit-artifact in the same verifier session; do not exit.",
+            "Only return after SQLite persistence is visible via inspect for the same issue and the evidence payload includes pr_number/base_branch.",
             "If verification is blocked or fails, include failure_kind, retryable, next_recommended_step, verifier_session_id, and pr_number in the submitted payload.",
             "Final acceptance belongs to this verifier role; keep raw logs outside repo docs.",
             "After submit-artifact succeeds, return control to the main_orchestrator root session; do not launch a root session.",
@@ -193,7 +219,8 @@ def build_prompt(
                 [
                     (
                         f"Supervisor already selected issue #{queued_next_issue_number} on branch "
-                        f"{queued_next_issue_branch or 'unknown'} from DB-backed intake state."
+                        f"{queued_next_issue_branch or 'unknown'} from DB-backed intake state; base branch "
+                        f"{queued_next_issue_base_branch or 'main'}."
                     ),
                     "Do not recompute selection from the live queue or rerun intake unless this exact selected issue is now invalid.",
                     "Bootstrap exactly this selected issue through the DB-backed supervisor start path.",
@@ -244,14 +271,17 @@ def build_session_request(
         "stage": stage,
         "issueNumber": issue["number"],
         "branch": issue["branch"],
+        "baseBranch": str(issue.get("baseBranch") or "main"),
     }
     queued_next_issue = cast(dict[str, object], ledger.get("queuedNextIssue", {}))
     queued_next_issue_record = cast(dict[str, object], queued_next_issue.get("record", {}))
     selected_issue_number = str(queued_next_issue_record.get("issue_number") or "")
     selected_issue_branch = str(queued_next_issue_record.get("branch") or "")
+    selected_issue_base_branch = str(queued_next_issue_record.get("base_branch") or "")
     if selected_issue_number:
         request["selectedIssueNumber"] = selected_issue_number
         request["selectedIssueBranch"] = selected_issue_branch
+        request["selectedIssueBaseBranch"] = selected_issue_base_branch or "main"
     return request
 
 

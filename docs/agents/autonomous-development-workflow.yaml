@@ -147,6 +147,14 @@ global_gates:
       - every_acceptance_criterion_maps_to_evidence
       - evidence_includes_tests_or_manual_surface_qa
       - known_limitations_are_documented
+  ui_prototype_gate:
+    required_when:
+      - prd_or_requirements_include_user_interface_scope
+    pass_when:
+      - web_design_engineer_generated_html_prototype_exists
+      - prototype_covers_primary_user_journeys_and_key_states
+      - prototype_has_received_human_approval_before_issue_generation
+      - to_issues_acceptance_criteria_reference_the_approved_prototype_when_ui_scope_is_implemented
   tdd_gate:
     required_for_code_changes: true
     pass_when:
@@ -732,17 +740,35 @@ phases:
       - store_local_copy_when_useful
     exit_gate: spec_gate
 
+  - id: create_ui_prototype
+    goal: Produce and approve a Web UI prototype before generating implementation issues when the PRD includes user interface scope.
+    conditional: prd_or_requirements_include_user_interface_scope
+    primary_skills:
+      - web-design-engineer
+    actions:
+      - derive_core_screens_user_journeys_states_and_visual_direction_from_prd
+      - generate_html_ui_prototype
+      - review_prototype_with_operator_or_stakeholder
+      - revise_until_primary_user_journeys_and_key_states_are_clear
+      - receive_human_approval_for_ui_prototype
+      - record_approved_prototype_reference_for_issue_generation
+    exit_gate: ui_prototype_gate
+
   - id: create_vertical_slice_issues
     goal: Break the PRD into independently verifiable tracer-bullet issues.
     primary_skills:
       - to-issues
       - triage
     actions:
+      - if_ui_scope_exists_require_approved_ui_prototype_reference_before_drafting_issues
       - draft_AFk_and_HITL_vertical_slices
       - confirm_granularity_dependencies_and_AFk_status
+      - include_prototype_based_acceptance_criteria_for_ui_slices
       - publish_issues_in_dependency_order
       - label_ready_for_agent_when_fully_specified
-    exit_gate: traceability_gate
+    gates:
+      - traceability_gate
+      - ui_prototype_gate_when_ui_scope_exists
 
   - id: environment_setup
     goal: Prepare local dependencies and test surfaces.

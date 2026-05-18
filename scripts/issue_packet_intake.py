@@ -8,10 +8,14 @@ import json
 import os
 import re
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import cast
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.control_plane_db import ingest_issue_packet
 from scripts.autodev_project import doctor_project
@@ -59,6 +63,13 @@ def infer_dependencies(issue: GitHubIssue) -> list[str]:
     return dependencies or ["none"]
 
 
+def infer_base_branch(issue: GitHubIssue) -> str:
+    match = re.search(r"(?im)^(?:base branch|base_branch|base)\s*:\s*(.+)$", issue.body)
+    if match:
+        return match.group(1).strip()
+    return "main"
+
+
 def infer_acceptance_criteria(issue: GitHubIssue) -> list[tuple[str, str]]:
     criteria: list[tuple[str, str]] = []
     for line in issue.body.splitlines():
@@ -74,9 +85,143 @@ def infer_acceptance_criteria(issue: GitHubIssue) -> list[tuple[str, str]]:
     return [("AC1", issue.title)]
 
 
+def _strip_markdown_prefix(text: str) -> str:
+    cleaned = text.strip()
+    cleaned = re.sub(r"^#{1,6}\s*", "", cleaned)
+    cleaned = re.sub(r"^[-*]\s+", "", cleaned)
+    cleaned = re.sub(r"^\d+[.)]\s+", "", cleaned)
+    return cleaned.strip()
+
+
 def infer_objective(issue: GitHubIssue) -> str:
-    first_sentence = issue.body.strip().splitlines()[0].strip() if issue.body.strip() else issue.title
-    return first_sentence[:160]
+    if issue.body.strip():
+        for line in issue.body.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            cleaned = _strip_markdown_prefix(stripped)
+            if cleaned:
+                return cleaned[:160]
+    return issue.title[:160]
+
+
+def infer_scope_in(issue: GitHubIssue) -> list[str]:
+    scope_items: list[str] = []
+    in_scope_section = False
+    for line in issue.body.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if re.match(r"^#{1,6}\s*scope\b", stripped, flags=re.IGNORECASE):
+            in_scope_section = True
+            continue
+        if in_scope_section and re.match(r"^#{1,6}\s+", stripped):
+            break
+        if not in_scope_section:
+            continue
+        if re.match(r"^[-*]\s+", stripped) or re.match(r"^\d+[.)]\s+", stripped):
+            text = re.sub(r"^[-*]\s+", "", stripped)
+            text = re.sub(r"^\d+[.)]\s+", "", text)
+            if text:
+                scope_items.append(text)
+    if scope_items:
+        return scope_items[:5]
+    return [infer_objective(issue)]
+
+
+def infer_relevant_paths(issue: GitHubIssue) -> list[str]:
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"`([^`]+)`", issue.body):
+        token = match.group(1).strip()
+        if not token:
+            continue
+        if token.startswith(("http://", "https://")):
+            continue
+        if "/" not in token and "." not in token:
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        candidates.append(token)
+    if candidates:
+        return candidates[:5]
+    return ["."]
+
+
+def infer_fallback_relevant_paths(issue: GitHubIssue) -> list[str]:
+    inferred: list[str] = []
+    seen: set[str] = set()
+    body = issue.body.lower()
+    title = issue.title.lower()
+
+    def add(path: str) -> None:
+        if path in seen:
+            return
+        seen.add(path)
+        inferred.append(path)
+
+    if "index.html" in body or "index.html" in title:
+        add("index.html")
+
+    if any(keyword in body or keyword in title for keyword in ["web", "ui", "frontend", "html", "badge", "filter", "dashboard", "page"]):
+        add("index.html")
+        add("smoke_test.js")
+
+    if any(keyword in body or keyword in title for keyword in ["quiz", "vocab", "word", "review", "spaced repetition", "practice"]):
+        add("index.html")
+        add("smoke_test.js")
+
+    if not inferred:
+        add("index.html")
+        add("smoke_test.js")
+
+    return inferred[:5]
+
+
+def _looks_like_placeholder(value: str) -> bool:
+    lowered = value.strip().lower()
+    if not lowered:
+        return True
+    if "<fill-" in lowered or "<file-or-directory-path>" in lowered:
+        return True
+    if lowered in {".", "./", "todo", "tbd", "none", "unknown"}:
+        return True
+    return False
+
+
+def validate_issue_packet_handoff_fields(issue: GitHubIssue, *, scope_in: list[str], relevant_paths: list[str]) -> list[str]:
+    problems: list[str] = []
+    if not scope_in:
+        problems.append("scope.in is empty")
+    if any(_looks_like_placeholder(item) for item in scope_in):
+        problems.append(f"scope.in contains placeholder-like item(s): {scope_in}")
+
+    if not relevant_paths:
+        problems.append("bootstrap_context.relevant_paths is empty")
+    if any(_looks_like_placeholder(item) for item in relevant_paths):
+        problems.append(f"bootstrap_context.relevant_paths contains placeholder-like item(s): {relevant_paths}")
+    if any(path.strip() == "." for path in relevant_paths):
+        problems.append("bootstrap_context.relevant_paths contains '.' which is too broad")
+
+    issue_context = f"issue #{issue.number}"
+    return [f"{issue_context}: {problem}" for problem in problems]
+
+
+def resolve_worker_handoff_fields(issue: GitHubIssue) -> tuple[list[str], list[str]]:
+    scope_in = infer_scope_in(issue)
+    relevant_paths = infer_relevant_paths(issue)
+    fallback_relevant_paths = infer_fallback_relevant_paths(issue)
+    worker_handoff_scope_in = scope_in[:5]
+    worker_handoff_relevant_paths = relevant_paths[:5]
+    if worker_handoff_scope_in == [infer_objective(issue)] and fallback_relevant_paths:
+        worker_handoff_scope_in = [
+            f"Implement issue behavior in {path}."
+            for path in fallback_relevant_paths[:2]
+        ]
+    if worker_handoff_relevant_paths == ["."] and fallback_relevant_paths:
+        worker_handoff_relevant_paths = fallback_relevant_paths
+    return worker_handoff_scope_in, worker_handoff_relevant_paths
 
 
 def fetch_ready_issues(repo: str) -> list[GitHubIssue]:
@@ -132,6 +277,8 @@ def render_issue_packet(issue: GitHubIssue, *, actor: str = "Hephaestus", prepar
     acceptance_criteria = infer_acceptance_criteria(issue)
     parent_reference = infer_parent_reference(issue)
     dependencies = infer_dependencies(issue)
+    base_branch = infer_base_branch(issue)
+    worker_handoff_scope_in, worker_handoff_relevant_paths = resolve_worker_handoff_fields(issue)
 
     lines = [
         'schema_version: "1.0"',
@@ -146,7 +293,7 @@ def render_issue_packet(issue: GitHubIssue, *, actor: str = "Hephaestus", prepar
         f"  labels: [{', '.join(json.dumps(label, ensure_ascii=False) for label in issue.labels)}]",
         f'  parent: {{type: "github-issue", reference: {json.dumps(parent_reference, ensure_ascii=False)}}}',
         "",
-        f'branch: {{name: "{branch_name}", base: "main"}}',
+        f'branch: {{name: "{branch_name}", base: {json.dumps(base_branch, ensure_ascii=False)}}}',
         f"objective: {json.dumps(infer_objective(issue), ensure_ascii=False)}",
         "",
         "acceptance_criteria:",
@@ -166,16 +313,16 @@ def render_issue_packet(issue: GitHubIssue, *, actor: str = "Hephaestus", prepar
             '  expected_outcome: ""',
             "  regression_bucket: []",
             "scope:",
-            '  in: ["<fill-from-issue-or-worker-discovery>"]',
+            f"  in: [{', '.join(json.dumps(item, ensure_ascii=False) for item in worker_handoff_scope_in)}]",
             '  out: ["Human-only scope decisions", "Raw logs in repo docs"]',
             "bootstrap_context:",
             '  required_reads: ["AGENTS.md", "docs/agents/autonomous-development-workflow.yaml", "docs/agents/issue-tracker.md"]',
-            '  relevant_paths: ["<fill-from-issue-or-worker-discovery>"]',
+            f"  relevant_paths: [{', '.join(json.dumps(item, ensure_ascii=False) for item in worker_handoff_relevant_paths)}]",
             '  prior_handoff: "none"',
             '  context_budget: {checkpoint_warning_at_percent: 45, stop_and_rotate_at_percent: 50}',
             "implementation_notes:",
             '  constraints: ["Keep artifacts compact and index-only."]',
-            f"  risks: [{json.dumps('Issue body requires worker verification for exact scope.', ensure_ascii=False)}]",
+            f"  risks: [{json.dumps('Scope inferred from issue text; verifier must confirm acceptance behavior against user surface.', ensure_ascii=False)}]",
             f"  dependencies: [{', '.join(json.dumps(item, ensure_ascii=False) for item in dependencies)}]",
             "verification_plan:",
             "  worker_self_checks:",
@@ -200,6 +347,7 @@ def issue_packet_payload(issue: GitHubIssue, *, actor: str = "Hephaestus", prepa
         "issue_number": issue.number,
         "title": issue.title,
         "branch": build_branch_name(issue),
+        "base_branch": infer_base_branch(issue),
         "backing_type": "github",
         "prior_handoff": "",
         "labels": list(issue.labels),
@@ -212,6 +360,20 @@ def issue_packet_payload(issue: GitHubIssue, *, actor: str = "Hephaestus", prepa
 def sync_issue_packets_to_db(issues: list[GitHubIssue], *, project_root: Path, actor: str = "Hephaestus", prepared_at: str | None = None) -> list[str]:
     ingested: list[str] = []
     for issue in issues:
+        worker_handoff_scope_in, worker_handoff_relevant_paths = resolve_worker_handoff_fields(issue)
+
+        validation_problems = validate_issue_packet_handoff_fields(
+            issue,
+            scope_in=worker_handoff_scope_in,
+            relevant_paths=worker_handoff_relevant_paths,
+        )
+        if validation_problems:
+            details = "\n".join(f"- {problem}" for problem in validation_problems)
+            raise ValueError(
+                "Issue packet intake validation failed; refusing to ingest placeholder/ambiguous handoff fields:\n"
+                f"{details}"
+            )
+
         payload = issue_packet_payload(issue, actor=actor, prepared_at=prepared_at)
         _ = ingest_issue_packet(
             project_root,

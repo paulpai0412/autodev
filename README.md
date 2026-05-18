@@ -34,8 +34,9 @@ Install user-global autodev host commands (the shipped default is the OpenCode a
 PYTHONPATH=. python3 scripts/autodev_project.py install-commands
 ```
 
-From an initialized project, use `/autodev-start <issue-number>`, `/autodev-reconcile`, `/autodev-release [issue-number]`, `/autodev-show-session`, and `/autodev-doctor`.
-These commands are host-entrypoint wrappers over the DB-only control plane in `.opencode/runtime/control-plane.sqlite3`.
+From an initialized project, prefer the `autodev-flow` skill contracts (`C0..C6`) as the primary operator entrypoint.
+Keep `/autodev-start <issue-number>`, `/autodev-reconcile`, `/autodev-release [issue-number]`, `/autodev-show-session`, and `/autodev-doctor` only as host wrappers behind that skill.
+These wrappers sit over the same DB-only control plane in `.opencode/runtime/control-plane.sqlite3`.
 
 For continuous development backfill, run the high-level watch wrapper:
 

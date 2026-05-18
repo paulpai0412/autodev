@@ -6,7 +6,7 @@ import subprocess
 from pathlib import Path
 from typing import Callable, Protocol
 
-from scripts.control_plane_db import available_development_slots, completed_issue_numbers, ingest_issue_packet, issue_rows_with_packets, issues_in_states, read_issue_packet, ready_issues_for_selection, upsert_issue_ranking
+from scripts.control_plane_db import available_development_slots, completed_issue_numbers, ingest_issue_packet, issue_rows_with_packets, issues_in_states, read_issue, read_issue_packet, read_latest_history_entry, ready_issues_for_selection, upsert_issue_ranking
 
 
 JsonObject = dict[str, object]
@@ -17,6 +17,7 @@ class IssuePacketRecord(Protocol):
     issue_number: str
     title: str
     branch: str
+    base_branch: str
     backing_type: str
     prior_handoff: str
     labels: list[str]
@@ -30,6 +31,35 @@ READY_FOR_AGENT_LABEL = "ready-for-agent"
 AGENT_DISPATCHING_LABEL = "agent-dispatching"
 AGENT_IN_PROGRESS_LABEL = "agent-in-progress"
 QUARANTINED_LABEL = "quarantined"
+
+
+def _stackable_dependency_branch(base_dir: Path, issue_number: str) -> str:
+    issue = read_issue(base_dir, issue_number)
+    if issue is None:
+        return ""
+    state = str(issue.get("state") or "")
+    if state not in {"verified", "release_pending"}:
+        return ""
+    pr_opened = read_latest_history_entry(base_dir, issue_number=issue_number, entry_type="pr_opened")
+    if pr_opened is None:
+        return ""
+    return str(issue.get("branch") or "")
+
+
+def resolve_issue_base_branch(
+    base_dir: Path,
+    *,
+    issue_number: str,
+    dependencies: list[str],
+    default_base_branch: str,
+    dependency_issue_numbers: Callable[[str, list[str]], list[str]],
+) -> str:
+    dependency_numbers = dependency_issue_numbers(issue_number, dependencies)
+    completed = completed_issue_numbers(base_dir)
+    unresolved = [number for number in dependency_numbers if number not in completed]
+    if not unresolved:
+        return default_base_branch or "main"
+    return ""
 
 
 def sync_issue_packet_to_db(
@@ -138,10 +168,14 @@ def select_issue_packets_for_capacity(
             and QUARANTINED_LABEL not in packet.labels
             and (not current_parent or packet.parent_reference == current_parent)
         ):
-            unmet_dependencies = [
-                number for number in dependency_issue_numbers(packet.issue_number, packet.dependencies) if number not in completed
-            ]
-            if not unmet_dependencies:
+            base_branch = resolve_issue_base_branch(
+                base_dir,
+                issue_number=packet.issue_number,
+                dependencies=packet.dependencies,
+                default_base_branch=packet.base_branch,
+                dependency_issue_numbers=dependency_issue_numbers,
+            )
+            if base_branch:
                 try:
                     numeric_issue = int(packet.issue_number)
                 except ValueError:

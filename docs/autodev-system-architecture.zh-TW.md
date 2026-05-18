@@ -247,3 +247,6 @@ PYTHONPATH=. python3 scripts/autodev_project.py release --project-root <project>
 - `docs/agents/runtime/multi-issue-concurrency.md`
 - `docs/agents/runtime/host-adapter-strategy.md`
 - `docs/autodev-user-manual.zh-TW.md`
+
+
+Bad Request: This model does not support assistant message prefill. The conversation must end with a user message.

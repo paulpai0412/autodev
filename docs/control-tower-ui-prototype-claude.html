@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Autodev Control Tower v0 · Claude-inspired Prototype</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --canvas: #f7f3ea;
+      --canvas-2: #eee7dc;
+      --surface: #fffdf8;
+      --surface-2: #f2ece2;
+      --surface-3: #e7ded2;
+      --ink: #201b16;
+      --ink-soft: #5c554c;
+      --ink-faint: #8a8175;
+      --border: #ded3c4;
+      --border-soft: rgba(82, 69, 55, .14);
+      --accent: #c55f3b;
+      --accent-strong: #a9472b;
+      --accent-soft: #f4d9ca;
+      --success: #56785b;
+      --success-soft: #dfe9dc;
+      --warning: #b37a2d;
+      --warning-soft: #f2e1bf;
+      --danger: #a94f45;
+      --danger-soft: #efd1cb;
+      --verified: #7567a8;
+      --verified-soft: #ded9ef;
+      --shadow: 0 18px 54px rgba(68, 55, 42, .11);
+      --shadow-soft: 0 8px 24px rgba(68, 55, 42, .08);
+      --radius-lg: 18px;
+      --radius-md: 12px;
+      --radius-sm: 8px;
+      --font-ui: "Aptos", "Segoe UI", "Helvetica Neue", sans-serif;
+      --font-serif: Georgia, "Iowan Old Style", "Times New Roman", serif;
+      --font-mono: "SFMono-Regular", "Cascadia Code", "Liberation Mono", monospace;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      font-family: var(--font-ui);
+      background:
+        radial-gradient(circle at 12% -8%, rgba(197, 95, 59, .10), transparent 28%),
+        linear-gradient(135deg, var(--canvas) 0%, #fbf7ef 46%, var(--canvas-2) 100%);
+      overflow: hidden;
+      text-wrap: pretty;
+    }
+
+    button, input, select { font: inherit; }
+
+    .app-shell {
+      height: 100vh;
+      display: grid;
+      grid-template-rows: 66px 1fr;
+      gap: 12px;
+      padding: 14px;
+    }
+
+    .topbar,
+    .sidebar,
+    .workspace,
+    .chat-sidecar {
+      background: rgba(255, 253, 248, .86);
+      border: 1px solid var(--border-soft);
+      box-shadow: var(--shadow-soft);
+    }
+
+    .topbar {
+      display: grid;
+      grid-template-columns: 292px 1fr auto;
+      align-items: center;
+      gap: 16px;
+      padding: 0 16px;
+      border-radius: 16px;
+    }
+
+    .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
+    .brand-mark {
+      width: 38px;
+      height: 38px;
+      border-radius: 10px;
+      display: grid;
+      place-items: center;
+      background: var(--ink);
+      color: #fff7ec;
+      font-family: var(--font-serif);
+      font-size: 17px;
+      letter-spacing: -.05em;
+    }
+    .brand h1 { margin: 0; font-size: 15px; font-weight: 650; letter-spacing: -.01em; }
+    .brand p { margin: 2px 0 0; color: var(--ink-faint); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    .project-switcher {
+      justify-self: start;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+      padding: 8px 11px;
+      border: 1px solid var(--border-soft);
+      border-radius: 999px;
+      background: rgba(247, 243, 234, .72);
+      color: var(--ink-soft);
+    }
+    .project-switcher strong { color: var(--ink); font-size: 13px; }
+    .project-switcher span { color: var(--ink-faint); font-family: var(--font-mono); font-size: 11px; }
+
+    .top-actions { display: flex; align-items: center; gap: 9px; }
+    .identity-pill, .status-pill {
+      padding: 8px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border-soft);
+      background: #fbf7ef;
+      color: var(--ink-soft);
+      font-size: 12px;
+    }
+    .status-pill strong { color: var(--success); }
+
+    .main-grid {
+      display: grid;
+      grid-template-columns: 220px minmax(690px, 1fr) 390px;
+      gap: 12px;
+      min-height: 0;
+    }
+    .sidebar, .workspace, .chat-sidecar { min-height: 0; border-radius: var(--radius-lg); }
+
+    .sidebar { padding: 13px; display: flex; flex-direction: column; gap: 16px; }
+    .nav-section-title {
+      margin: 9px 8px 6px;
+      color: var(--ink-faint);
+      font-size: 10px;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+    .nav-item {
+      width: 100%;
+      border: 0;
+      background: transparent;
+      color: var(--ink-soft);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 9px 10px;
+      border-radius: 9px;
+      cursor: pointer;
+      transition: background .16s ease, color .16s ease, transform .16s ease;
+    }
+    .nav-item:hover { background: rgba(197, 95, 59, .06); color: var(--ink); }
+    .nav-item.active { background: var(--accent-soft); color: var(--accent-strong); }
+    .nav-item .badge { color: var(--ink-faint); font-size: 11px; }
+
+    .policy-card {
+      margin-top: auto;
+      padding: 14px;
+      border-radius: 14px;
+      border: 1px solid rgba(197, 95, 59, .18);
+      background: #fbefe6;
+    }
+    .policy-card h3 { margin: 0 0 6px; font-size: 13px; }
+    .policy-card p { margin: 0 0 12px; color: var(--ink-soft); font-size: 12px; line-height: 1.45; }
+    .mini-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 7px; }
+    .mini-stat { padding: 8px; border-radius: 9px; border: 1px solid rgba(82,69,55,.10); background: rgba(255,253,248,.7); }
+    .mini-stat b { display:block; font-size: 14px; }
+    .mini-stat span { display:block; color: var(--ink-faint); font-size: 10px; margin-top: 2px; }
+
+    .workspace { overflow: hidden; display: grid; grid-template-rows: auto 1fr; box-shadow: var(--shadow); }
+    .workspace-header { padding: 24px 26px 14px; display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
+    .eyebrow { color: var(--accent-strong); font-family: var(--font-mono); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; }
+    .workspace-header h2 { margin: 6px 0 8px; max-width: 760px; font-family: var(--font-serif); font-size: clamp(31px, 3.2vw, 48px); line-height: 1.02; letter-spacing: -.045em; font-weight: 500; }
+    .workspace-header p { margin: 0; color: var(--ink-soft); font-size: 14px; line-height: 1.52; max-width: 720px; }
+    .header-actions { display: flex; gap: 9px; flex-shrink: 0; }
+
+    .btn {
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      background: #fffaf2;
+      color: var(--ink);
+      padding: 9px 12px;
+      cursor: pointer;
+      transition: transform .16s ease, border-color .16s ease, background .16s ease;
+    }
+    .btn:hover { transform: translateY(-1px); background: #fff4e8; border-color: #c8b8a6; }
+    .btn.primary { background: var(--accent); color: #fffaf2; border-color: var(--accent); }
+    .btn.primary:hover { background: var(--accent-strong); }
+    .btn.warning { background: var(--warning-soft); border-color: #d8b977; color: #6f4710; }
+    .btn:disabled { opacity: .52; cursor: not-allowed; transform: none; }
+
+    .content-scroll { overflow: auto; padding: 0 26px 26px; }
+    .content-scroll::-webkit-scrollbar, .chat-stream::-webkit-scrollbar { width: 10px; }
+    .content-scroll::-webkit-scrollbar-thumb, .chat-stream::-webkit-scrollbar-thumb { background: #d2c6b8; border-radius: 999px; }
+
+    .screen { display: none; animation: fadeUp .22s ease both; }
+    .screen.active { display: block; }
+    @keyframes fadeUp { from { opacity: 0; transform: translateY(7px); } to { opacity: 1; transform: translateY(0); } }
+
+    .kpi-row { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 11px; margin-bottom: 14px; }
+    .kpi, .panel, .lane, .issue-card, .event, .check-row, .step-card, .policy-option, .approval-card, .message {
+      border: 1px solid var(--border-soft);
+      background: rgba(255,253,248,.72);
+    }
+    .kpi { padding: 14px; border-radius: 13px; }
+    .kpi span { color: var(--ink-faint); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
+    .kpi strong { display:block; margin-top: 8px; font-family: var(--font-serif); font-size: 30px; font-weight: 500; letter-spacing: -.04em; }
+    .kpi small { display:block; margin-top: 3px; color: var(--ink-soft); font-size: 11px; }
+
+    .grid-2 { display: grid; grid-template-columns: 1.08fr .92fr; gap: 14px; }
+    .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    .panel { border-radius: 15px; overflow: hidden; }
+    .panel-header { padding: 13px 15px; display:flex; justify-content:space-between; align-items:center; border-bottom: 1px solid var(--border-soft); background: rgba(242,236,226,.58); }
+    .panel-header h3 { margin:0; font-size:14px; }
+    .panel-header span { color: var(--ink-faint); font-size: 12px; }
+    .panel-body { padding: 15px; }
+
+    .lane-board { display:grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+    .lane { min-height: 306px; border-radius: 13px; padding: 10px; background: rgba(242,236,226,.42); }
+    .lane h4 { margin:0 0 10px; display:flex; justify-content:space-between; color: var(--ink-soft); font-size:12px; }
+    .issue-card { padding: 11px; border-radius: 11px; margin-bottom: 9px; box-shadow: none; }
+    .issue-card strong { display:block; font-size:13px; line-height:1.35; }
+    .issue-card p { margin:8px 0 0; color: var(--ink-soft); font-size:11px; line-height:1.4; }
+    .status-dot { width:8px; height:8px; border-radius:50%; display:inline-block; margin-right:6px; background: var(--accent); }
+    .issue-card.warning .status-dot { background: var(--warning); }
+    .issue-card.success .status-dot { background: var(--success); }
+    .issue-card.verified .status-dot { background: var(--verified); }
+    .issue-card.danger .status-dot { background: var(--danger); }
+
+    .timeline { display:flex; flex-direction:column; gap:10px; }
+    .event { display:grid; grid-template-columns: 92px 1fr auto; gap:12px; align-items:center; padding:11px 12px; border-radius:11px; }
+    .event time { color: var(--ink-faint); font-family: var(--font-mono); font-size:11px; }
+    .event b { font-size:13px; }
+    .event p { margin:3px 0 0; color: var(--ink-soft); font-size:12px; }
+
+    .tag { display:inline-flex; align-items:center; gap:5px; padding:5px 8px; border-radius:999px; border:1px solid var(--border-soft); color:var(--ink-soft); background: rgba(255,253,248,.54); font-size:11px; white-space:nowrap; }
+    .tag.active { color: var(--accent-strong); border-color: rgba(197,95,59,.28); background: var(--accent-soft); }
+    .tag.success { color: #385d3f; border-color: rgba(86,120,91,.24); background: var(--success-soft); }
+    .tag.warning { color: #7b4e12; border-color: rgba(179,122,45,.28); background: var(--warning-soft); }
+    .tag.danger { color: #81382f; border-color: rgba(169,79,69,.28); background: var(--danger-soft); }
+
+    .readiness-list, .env-list { display:grid; gap:9px; }
+    .check-row { display:flex; justify-content:space-between; align-items:center; padding:11px 12px; border-radius:11px; }
+    .check-row strong { font-size:13px; }
+    .check-row small { display:block; margin-top:3px; color:var(--ink-soft); }
+
+    .pipeline-steps { display:grid; grid-template-columns: repeat(5, 1fr); gap:9px; margin-bottom:14px; }
+    .step-card { min-height:118px; padding:13px; border-radius:13px; }
+    .step-card b { display:block; margin:8px 0 6px; font-size:13px; }
+    .step-card p { margin:0; color:var(--ink-soft); font-size:11px; line-height:1.42; }
+    .step-index { font-family:var(--font-mono); color:var(--ink-faint); font-size:11px; }
+
+    .policy-options { display:grid; grid-template-columns: repeat(3, 1fr); gap:12px; }
+    .policy-option { border-radius:14px; padding:15px; }
+    .policy-option.selected { border-color: rgba(197,95,59,.38); background: #fbefe6; }
+    .policy-option h4 { margin:0 0 8px; }
+    .policy-option p { margin:0 0 12px; color:var(--ink-soft); font-size:12px; line-height:1.45; }
+    .env-row { display:flex; justify-content:space-between; gap:12px; font-family:var(--font-mono); font-size:11px; color:var(--ink-soft); }
+    .env-row strong { color:var(--ink); }
+    .approval-card { display:grid; grid-template-columns: 1fr auto; gap:16px; padding:14px; border-radius:14px; margin-bottom:12px; }
+    .approval-card h4 { margin:0 0 5px; }
+    .approval-card p { margin:0 0 10px; color:var(--ink-soft); font-size:12px; }
+    .approval-actions { display:flex; align-items:center; gap:8px; }
+
+    .chat-sidecar { display:grid; grid-template-rows:auto 1fr auto; overflow:hidden; }
+    .chat-header { padding:18px 18px 12px; border-bottom:1px solid var(--border-soft); background: rgba(242,236,226,.38); }
+    .chat-header h3 { margin:0; font-family:var(--font-serif); font-size:20px; font-weight:500; letter-spacing:-.025em; }
+    .chat-header p { margin:5px 0 0; color:var(--ink-soft); font-size:12px; line-height:1.4; }
+    .chat-stream { padding:16px; overflow:auto; display:flex; flex-direction:column; gap:12px; }
+    .message { border-radius:14px; padding:13px; }
+    .message.operator { background:#fbefe6; border-color:rgba(197,95,59,.22); }
+    .message h4 { margin:0 0 7px; color:var(--accent-strong); font-size:12px; display:flex; justify-content:space-between; }
+    .message p { margin:0; color:var(--ink-soft); line-height:1.5; font-size:13px; }
+    .message .stream-line { margin-top:8px; color:var(--ink-faint); font-family:var(--font-mono); font-size:11px; }
+    .question-card { background: var(--warning-soft); border-color: rgba(179,122,45,.28); }
+    .question-card h4 { color:#7b4e12; }
+    .question-actions { display:grid; grid-template-columns: 1fr 1fr; gap:8px; margin-top:12px; }
+    .chat-composer { padding:12px; border-top:1px solid var(--border-soft); display:flex; gap:8px; background: rgba(242,236,226,.34); }
+    .chat-composer input { flex:1; min-width:0; border:1px solid var(--border); background:#fffdf8; border-radius:10px; color:var(--ink); padding:10px; }
+
+    .tweaks { position:fixed; right:24px; bottom:24px; z-index:5; }
+    .tweaks-panel { display:none; width:260px; padding:14px; border:1px solid var(--border-soft); border-radius:14px; background:#fffdf8; box-shadow:var(--shadow); margin-bottom:10px; }
+    .tweaks.open .tweaks-panel { display:block; }
+    .tweaks-panel h4 { margin:0 0 10px; }
+    .tweak-row { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-top:10px; color:var(--ink-soft); font-size:12px; }
+    .tweak-row select { background:#fffaf2; color:var(--ink); border:1px solid var(--border); border-radius:8px; padding:6px 8px; }
+
+    body.clay-mode { --canvas:#efe1d4; --canvas-2:#dfcbbb; --surface:#fff6ec; --accent:#a84c2c; --accent-soft:#efd1c0; }
+    body.compact .kpi-row { gap:8px; }
+    body.compact .kpi, body.compact .panel-body, body.compact .issue-card { padding:10px; }
+
+    @media (max-width:1260px) {
+      body { overflow:auto; }
+      .app-shell { height:auto; min-height:100vh; }
+      .main-grid { grid-template-columns: 180px 1fr; }
+      .chat-sidecar { grid-column:1 / -1; min-height:520px; }
+      .kpi-row, .pipeline-steps { grid-template-columns:repeat(2,1fr); }
+      .grid-2, .policy-options { grid-template-columns:1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand"><div class="brand-mark">A</div><div><h1>Autodev Control Tower</h1><p>Local operator cockpit · warm control-plane edition</p></div></div>
+      <div class="project-switcher"><strong>wferp</strong><span>/home/timmypai/apps/wferp</span><span class="tag success">ready</span></div>
+      <div class="top-actions"><div class="identity-pill">GitHub identity · <strong>paulpai0412</strong></div><div class="status-pill">Flow Run · <strong>active</strong></div><button class="btn primary" data-screen-target="spec">New Flow</button></div>
+    </header>
+    <main class="main-grid">
+      <aside class="sidebar">
+        <div><div class="nav-section-title">Control</div><button class="nav-item active" data-screen-target="dashboard">Run Dashboard <span class="badge">home</span></button><button class="nav-item" data-screen-target="projects">Project Registry <span class="badge">3</span></button><button class="nav-item" data-screen-target="readiness">Readiness Gate <span class="badge">pass</span></button><button class="nav-item" data-screen-target="spec">Spec Pipeline <span class="badge">live</span></button><button class="nav-item" data-screen-target="issueplan">Issue Plan <span class="badge">DAG</span></button></div>
+        <div><div class="nav-section-title">Runtime</div><button class="nav-item" data-screen-target="policy">Run Policy <span class="badge">balanced</span></button><button class="nav-item" data-screen-target="issue">Issue Detail <span class="badge">#142</span></button><button class="nav-item" data-screen-target="approvals">PR Approval Queue <span class="badge">2</span></button><button class="nav-item" data-screen-target="recovery">Recovery Center <span class="badge">1</span></button></div>
+        <div class="policy-card"><h3>Balanced Auto</h3><p>Auto backfill enabled. Release worker may start, but GitHub review remains human-required.</p><div class="mini-grid"><div class="mini-stat"><b>2</b><span>dev slots</span></div><div class="mini-stat"><b>1</b><span>release slot</span></div><div class="mini-stat"><b>auto</b><span>backfill</span></div><div class="mini-stat"><b>human</b><span>approval</span></div></div></div>
+      </aside>
+      <section class="workspace">
+        <div class="workspace-header"><div><div class="eyebrow" id="screen-eyebrow">Run Dashboard</div><h2 id="screen-title">A calmer control surface for active autodev runs.</h2><p id="screen-copy">Monitor issue states, capacity, session ownership, verifier evidence, release queues, and intervention needs without turning the product into a chat app.</p></div><div class="header-actions"><button class="btn">Refresh DB</button><button class="btn primary">Reconcile Workspace</button></div></div>
+        <div class="content-scroll">
+          <section class="screen active" id="screen-dashboard" data-title="A calmer control surface for active autodev runs." data-copy="Monitor issue states, capacity, session ownership, verifier evidence, release queues, and intervention needs without turning the product into a chat app." data-eyebrow="Run Dashboard">
+            <div class="kpi-row"><div class="kpi"><span>Active issues</span><strong>4</strong><small>2 running · 1 verifying · 1 release</small></div><div class="kpi"><span>Dev capacity</span><strong>2/2</strong><small>slot pool saturated</small></div><div class="kpi"><span>Release queue</span><strong>3</strong><small>2 awaiting approval</small></div><div class="kpi"><span>Blocked</span><strong>1</strong><small>stale verifier heartbeat</small></div><div class="kpi"><span>Completed today</span><strong>5</strong><small>all with evidence refs</small></div></div>
+            <div class="grid-2"><div class="panel"><div class="panel-header"><h3>Issue execution lanes</h3><span>DB snapshot · 11:42:08</span></div><div class="panel-body lane-board"><div class="lane"><h4>Ready <span>5</span></h4><div class="issue-card"><strong><span class="status-dot"></span>#146 Build Flow Run DB</strong><p>Depends on Project Registry schema.</p></div><div class="issue-card"><strong><span class="status-dot"></span>#147 SSE event replay</strong><p>Ready after Flow Run persistence.</p></div></div><div class="lane"><h4>Running <span>2</span></h4><div class="issue-card"><strong><span class="status-dot"></span>#142 Project Registry</strong><p>main_orchestrator · issue_worker_execution</p></div><div class="issue-card"><strong><span class="status-dot"></span>#143 Readiness Gate</strong><p>worker_result expected.</p></div></div><div class="lane"><h4>Verifying <span>1</span></h4><div class="issue-card verified"><strong><span class="status-dot"></span>#139 Runtime DB reader</strong><p>pr_verifier · evidence_packet gate.</p></div></div><div class="lane"><h4>Needs operator <span>3</span></h4><div class="issue-card warning"><strong><span class="status-dot"></span>#132 GitHub approval</strong><p>PR #88 awaiting review identity confirmation.</p></div><div class="issue-card danger"><strong><span class="status-dot"></span>#128 Stale verifier</strong><p>last_event_at exceeded threshold.</p></div></div></div></div><div class="panel"><div class="panel-header"><h3>Recent control-plane events</h3><span>issue_history</span></div><div class="panel-body timeline"><div class="event"><time>11:42</time><div><b>state_transition</b><p>#142 dispatching → running</p></div><span class="tag active">root_event</span></div><div class="event"><time>11:39</time><div><b>evidence_packet</b><p>#139 verifier accepted surface QA gate</p></div><span class="tag success">verified</span></div><div class="event"><time>11:35</time><div><b>admin_action</b><p>#128 quarantined by monitor heartbeat rule</p></div><span class="tag danger">recovery</span></div><div class="event"><time>11:31</time><div><b>pr_opened</b><p>#132 formal PR opened by verifier</p></div><span class="tag warning">approval</span></div></div></div></div>
+          </section>
+          <section class="screen" id="screen-projects" data-title="Repo switching without centralizing runtime truth." data-copy="The Project Registry indexes consumer repos and points to each local DB-only control plane; All Projects remains read-only in v0." data-eyebrow="Project Registry"><div class="grid-3"><div class="panel"><div class="panel-header"><h3>wferp</h3><span class="tag success">ready</span></div><div class="panel-body"><p class="tag active">/home/timmypai/apps/wferp</p><br><br><div class="env-list"><div class="env-row"><span>GitHub</span><strong>paulpai0412/wferp</strong></div><div class="env-row"><span>Runtime DB</span><strong>valid</strong></div><div class="env-row"><span>OpenCode</span><strong>available</strong></div></div></div></div><div class="panel"><div class="panel-header"><h3>crm-next</h3><span class="tag warning">partial</span></div><div class="panel-body"><p class="tag">/home/timmypai/apps/crm-next</p><br><br><div class="env-list"><div class="env-row"><span>GitHub</span><strong>auth missing</strong></div><div class="env-row"><span>Runtime DB</span><strong>created</strong></div><div class="env-row"><span>Flow Run</span><strong>blocked</strong></div></div></div></div><div class="panel"><div class="panel-header"><h3>inventory</h3><span class="tag">read-only</span></div><div class="panel-body"><p class="tag">/home/timmypai/apps/inventory</p><br><br><div class="env-list"><div class="env-row"><span>Active</span><strong>0</strong></div><div class="env-row"><span>Completed</span><strong>12</strong></div><div class="env-row"><span>Last sync</span><strong>2h ago</strong></div></div></div></div></div></section>
+          <section class="screen" id="screen-readiness" data-title="Setup-time checks before one-stop development starts." data-copy="Project init can partially complete, but Flow Run start remains blocked until filesystem, GitHub, runtime DB, and host adapter checks pass." data-eyebrow="Project Readiness Gate"><div class="grid-2"><div class="panel"><div class="panel-header"><h3>Readiness checklist</h3><span>wferp</span></div><div class="panel-body readiness-list"><div class="check-row"><div><strong>Git repository</strong><small>main branch and origin detected</small></div><span class="tag success">pass</span></div><div class="check-row"><div><strong>gh auth</strong><small>authenticated as paulpai0412</small></div><span class="tag success">pass</span></div><div class="check-row"><div><strong>PR review permission</strong><small>can submit GitHub review approval</small></div><span class="tag success">pass</span></div><div class="check-row"><div><strong>Runtime control plane</strong><small>issues + issue_history schema valid</small></div><span class="tag success">pass</span></div><div class="check-row"><div><strong>Host adapter</strong><small>OpenCode CLI and session DB readable</small></div><span class="tag success">pass</span></div></div></div><div class="panel"><div class="panel-header"><h3>Identity preview</h3><span>approval safety</span></div><div class="panel-body"><div class="kpi"><span>GitHub approval identity</span><strong>paulpai0412</strong><small>Shown again before PR review approval is submitted.</small></div><br><button class="btn primary">Start Flow Run</button></div></div></div></section>
+          <section class="screen" id="screen-spec" data-title="Interactive spec pipeline with streamed skill execution." data-copy="The Chat Sidecar drives /grill-with-docs, to-prd, to-issues, approvals, and transition into autodev-flow while structured artifacts remain reviewable here." data-eyebrow="Spec Pipeline"><div class="pipeline-steps"><div class="step-card"><span class="step-index">01</span><b>Requirements</b><p>grill-with-docs asks blocking questions and updates domain terms.</p><span class="tag success">approved</span></div><div class="step-card"><span class="step-index">02</span><b>PRD</b><p>Generated product document for Control Tower v0.</p><span class="tag success">approved</span></div><div class="step-card"><span class="step-index">03</span><b>Issue Plan</b><p>DAG dependencies and execution lanes.</p><span class="tag warning">reviewing</span></div><div class="step-card"><span class="step-index">04</span><b>Publish</b><p>GitHub issue creation after approval.</p><span class="tag">pending</span></div><div class="step-card"><span class="step-index">05</span><b>Autodev</b><p>Intake, start, reconcile, release.</p><span class="tag">blocked</span></div></div><div class="panel"><div class="panel-header"><h3>Current artifact review</h3><span>Issue Plan v3</span></div><div class="panel-body"><p style="color:var(--ink-soft);line-height:1.6;margin-top:0">14 generated issues, 4 execution lanes, 2 explicit approval gates, and 1 blocked dependency cycle resolved by splitting GitHub approval identity from PR queue implementation.</p><button class="btn primary">Approve Issue Plan</button> <button class="btn">Request revision</button></div></div></section>
+          <section class="screen" id="screen-issueplan" data-title="DAG dependency planning with simplified execution lanes." data-copy="The Issue Plan is not a flat list; dependencies determine ready work while lanes let operators understand parallelizable slices." data-eyebrow="Issue Plan"><div class="panel"><div class="panel-header"><h3>Execution lanes</h3><span>14 issues · 4 lanes</span></div><div class="panel-body lane-board"><div class="lane"><h4>Foundation <span>ready</span></h4><div class="issue-card success"><strong><span class="status-dot"></span>I-001 App DB schema</strong><p>depends_on: none</p></div><div class="issue-card"><strong><span class="status-dot"></span>I-002 Project Registry</strong><p>depends_on: I-001</p></div></div><div class="lane"><h4>Interaction <span>blocked</span></h4><div class="issue-card warning"><strong><span class="status-dot"></span>I-006 SSE event layer</strong><p>depends_on: I-001, I-004</p></div><div class="issue-card"><strong><span class="status-dot"></span>I-007 Chat Sidecar</strong><p>depends_on: I-006</p></div></div><div class="lane"><h4>Runtime <span>parallel</span></h4><div class="issue-card"><strong><span class="status-dot"></span>I-009 Runtime DB reader</strong><p>depends_on: I-002</p></div><div class="issue-card"><strong><span class="status-dot"></span>I-010 Dashboard</strong><p>depends_on: I-009</p></div></div><div class="lane"><h4>Release <span>later</span></h4><div class="issue-card warning"><strong><span class="status-dot"></span>I-012 PR Queue</strong><p>depends_on: I-010</p></div><div class="issue-card danger"><strong><span class="status-dot"></span>I-013 GitHub approval</strong><p>requires gh identity gate</p></div></div></div></div></section>
+          <section class="screen" id="screen-policy" data-title="Operator-approved automation settings before autodev execution." data-copy="Presets keep the policy safe, while advanced settings expose the environment variables that drive capacity, release backfill, and approval behavior." data-eyebrow="Run Policy"><div class="policy-options"><div class="policy-option"><h4>Safe Manual</h4><p>Single lane, manual start and manual release. Best for risky repos.</p><span class="tag">manual</span></div><div class="policy-option selected"><h4>Balanced Auto</h4><p>Auto backfill with human-required GitHub approval. Default for v0.</p><span class="tag active">selected</span></div><div class="policy-option"><h4>Aggressive Auto</h4><p>Higher slot counts and bypass approval when explicitly approved.</p><span class="tag warning">high risk</span></div></div><br><div class="panel"><div class="panel-header"><h3>Advanced environment settings</h3><span>preview</span></div><div class="panel-body env-list"><div class="env-row"><span>AUTODEV_DEVELOPMENT_CAPACITY</span><strong>2</strong></div><div class="env-row"><span>AUTODEV_RELEASE_CAPACITY</span><strong>1</strong></div><div class="env-row"><span>AUTODEV_RELEASE_BACKFILL_MODE</span><strong>auto</strong></div><div class="env-row"><span>AUTODEV_AUTO_RELEASE_APPROVAL_MODE</span><strong>human_required</strong></div><div class="env-row"><span>reconcile interval</span><strong>30s</strong></div></div></div></section>
+          <section class="screen" id="screen-issue" data-title="Single issue timeline across root, worker, verifier, and release." data-copy="Issue detail combines current snapshot fields with append-only history so operators can inspect runtime truth without opening raw SQLite." data-eyebrow="Issue Detail"><div class="grid-2"><div class="panel"><div class="panel-header"><h3>#142 Project Registry</h3><span class="tag active">running</span></div><div class="panel-body env-list"><div class="env-row"><span>current_role</span><strong>main_orchestrator</strong></div><div class="env-row"><span>current_stage</span><strong>issue_worker_execution</strong></div><div class="env-row"><span>current_session_id</span><strong>ses_1c516...</strong></div><div class="env-row"><span>branch</span><strong>agent/issue-142</strong></div></div></div><div class="panel"><div class="panel-header"><h3>Session ownership</h3><span>OpenCode adapter</span></div><div class="panel-body"><span class="tag active">root session live</span> <span class="tag">worker child pending</span><br><br><button class="btn">Open Session</button> <button class="btn warning">Quarantine</button></div></div></div><br><div class="panel"><div class="panel-header"><h3>Timeline</h3><span>issue_history</span></div><div class="panel-body timeline"><div class="event"><time>11:42</time><div><b>dispatch_result</b><p>rootSessionID persisted</p></div><span class="tag active">running</span></div><div class="event"><time>11:41</time><div><b>dispatch_request</b><p>main_orchestrator launch requested</p></div><span class="tag">request</span></div><div class="event"><time>11:40</time><div><b>state_transition</b><p>claimed → dispatching</p></div><span class="tag success">fenced</span></div></div></div></section>
+          <section class="screen" id="screen-approvals" data-title="GitHub-native PR approval without leaving the Control Tower." data-copy="Human-required release flows collect review context, show the local GitHub identity, submit GitHub review approval, and let release_worker continue." data-eyebrow="PR Approval Queue"><div class="approval-card"><div><h4>PR #88 · Control Tower App DB schema</h4><p>#132 verified · checks passing · mergeable · approving as paulpai0412</p><span class="tag success">verifier evidence</span> <span class="tag active">GitHub ready</span></div><div class="approval-actions"><button class="btn">Open PR</button><button class="btn primary">Approve as paulpai0412</button></div></div><div class="approval-card"><div><h4>PR #91 · Runtime DB reader</h4><p>#139 verified · required check still running · approval available after green checks</p><span class="tag warning">checks running</span> <span class="tag">release pending</span></div><div class="approval-actions"><button class="btn">Open PR</button><button class="btn" disabled>Approve blocked</button></div></div></section>
+          <section class="screen" id="screen-recovery" data-title="Issue-scoped recovery without collapsing workspace throughput." data-copy="Recovery actions are local to the selected issue and append admin_action rows so the audit trail remains complete." data-eyebrow="Recovery Center"><div class="grid-2"><div class="panel"><div class="panel-header"><h3>Blocked issue</h3><span class="tag danger">quarantined</span></div><div class="panel-body"><h3>#128 Stale verifier heartbeat</h3><p style="color:var(--ink-soft)">last_event_at exceeded threshold while current_stage was pr_verifier_execution. Other ready issues may continue because quarantine is issue-local.</p><button class="btn primary">Resume quarantined</button> <button class="btn">Retry failed</button> <button class="btn warning">Fail quarantined</button></div></div><div class="panel"><div class="panel-header"><h3>Suggested command</h3><span>audit-safe</span></div><div class="panel-body"><code style="font-family:var(--font-mono);color:var(--accent-strong);line-height:1.7">orchestrator_supervisor.py resume-quarantined --issue-number 128 --reason "verifier session recovered"</code></div></div></div></section>
+        </div>
+      </section>
+      <aside class="chat-sidecar"><div class="chat-header"><h3>Interactive Flow Chat</h3><p>SSE stream · ask-question · approvals · skill orchestration</p></div><div class="chat-stream"><div class="message operator"><h4>Operator <span>11:17</span></h4><p>Build a Control Tower for autodev, with full one-stop development flow and GitHub approval integration.</p></div><div class="message"><h4>/grill-with-docs <span>11:20</span></h4><p>Resolved primary persona as Technical Operator / Engineering Lead and wrote product terms into CONTEXT.md.</p><div class="stream-line">event: artifact.updated · CONTEXT.md</div></div><div class="message"><h4>to-prd <span>11:31</span></h4><p>Generated PRD: Autodev Control Tower v0. Waiting for Issue Plan approval.</p><div class="stream-line">event: skill.completed · artifact: PRD</div></div><div class="message question-card"><h4>Question required <span>now</span></h4><p>Approve Issue Plan DAG with 14 issues, 4 lanes, and Balanced Auto run policy?</p><div class="question-actions"><button class="btn primary">Approve</button><button class="btn">Request revision</button></div></div></div><div class="chat-composer"><input value="Ask Control Tower to revise scope or continue..." aria-label="Chat input"><button class="btn primary">Send</button></div></aside>
+    </main>
+  </div>
+  <div class="tweaks" id="tweaks"><div class="tweaks-panel"><h4>Tweaks</h4><div class="tweak-row"><span>Tone</span><select id="tone-select"><option value="paper">Warm paper</option><option value="clay">Deeper clay</option></select></div><div class="tweak-row"><span>Density</span><select id="density-select"><option value="normal">Normal</option><option value="compact">Compact</option></select></div></div><button class="btn" id="tweaks-toggle">Tweaks</button></div>
+  <script>
+    const navButtons = document.querySelectorAll('[data-screen-target]');
+    const screens = document.querySelectorAll('.screen');
+    const title = document.getElementById('screen-title');
+    const copy = document.getElementById('screen-copy');
+    const eyebrow = document.getElementById('screen-eyebrow');
+    function setScreen(name) {
+      screens.forEach((screen) => screen.classList.toggle('active', screen.id === `screen-${name}`));
+      navButtons.forEach((button) => button.classList.toggle('active', button.dataset.screenTarget === name && button.classList.contains('nav-item')));
+      const active = document.getElementById(`screen-${name}`);
+      if (active) { title.textContent = active.dataset.title; copy.textContent = active.dataset.copy; eyebrow.textContent = active.dataset.eyebrow; }
+    }
+    navButtons.forEach((button) => button.addEventListener('click', () => setScreen(button.dataset.screenTarget)));
+    document.getElementById('tweaks-toggle').addEventListener('click', () => document.getElementById('tweaks').classList.toggle('open'));
+    document.getElementById('tone-select').addEventListener('change', (event) => document.body.classList.toggle('clay-mode', event.target.value === 'clay'));
+    document.getElementById('density-select').addEventListener('change', (event) => document.body.classList.toggle('compact', event.target.value === 'compact'));
+  </script>
+</body>
+</html>

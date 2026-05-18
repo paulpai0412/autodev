@@ -17,7 +17,7 @@ from typing import cast
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts.control_plane_db import ensure_control_plane_db
+from scripts.control_plane_db import canonical_control_plane_base_dir, ensure_control_plane_db
 from scripts.orchestrator_supervisor import show_latest_session
 from scripts.control_plane_db import list_issues
 from scripts.orchestrator_sessions import default_host_adapter
@@ -53,6 +53,7 @@ ARTIFACT_DIRS = [
 RUNTIME_GITIGNORE_LINES = [
     "# autodev runtime state",
     ".opencode/runtime/*",
+    ".opencode/runtime/control-plane.sqlite3",
     "!.opencode/runtime/.gitkeep",
 ]
 
@@ -76,7 +77,7 @@ def _default_commands_dir() -> Path:
 
 
 def _command_templates() -> dict[str, str]:
-    autodev_home = '${AUTODEV_HOME:-$HOME/apps/autodev}'
+    autodev_home = f'${{AUTODEV_HOME:-{ROOT}}}'
     entrypoints = _operator_entrypoints()
     start_filename = entrypoints.get("start", "autodev-start.md")
     reconcile_filename = entrypoints.get("reconcile", "autodev-reconcile.md")
@@ -181,6 +182,10 @@ def _consumer_project_root(path: str | None) -> Path:
     return candidate
 
 
+def _canonical_project_root(path: str | None) -> Path:
+    return canonical_control_plane_base_dir(_consumer_project_root(path))
+
+
 def _write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     _ = path.write_text(text, encoding="utf-8")
@@ -268,6 +273,16 @@ def _is_git_repo(root: Path) -> bool:
     return result.returncode == 0 and stdout.strip() == "true"
 
 
+def _has_head_commit(root: Path) -> bool:
+    result = _run_command(["git", "rev-parse", "--verify", "HEAD"], cwd=root, check=False)
+    return result.returncode == 0
+
+
+def _git_ref_exists(root: Path, ref: str) -> bool:
+    result = _run_command(["git", "rev-parse", "--verify", "--quiet", ref], cwd=root, check=False)
+    return result.returncode == 0
+
+
 def _git_remote_url(root: Path, remote: str) -> str | None:
     result = _run_command(["git", "remote", "get-url", remote], cwd=root, check=False)
     if result.returncode != 0:
@@ -287,6 +302,34 @@ def _ensure_git_repository(root: Path, *, dry_run: bool, check: bool, report: Ac
     if dry_run or check:
         return
     _ = _run_command(["git", "init", "-b", "main"], cwd=root)
+
+
+def _ensure_main_branch_baseline(root: Path, *, dry_run: bool, check: bool, report: ActionReport) -> None:
+    if not _is_git_repo(root):
+        return
+    if _has_head_commit(root):
+        return
+
+    if _git_remote_url(root, "origin") is not None:
+        if dry_run or check:
+            report.actions.append("attempt to seed local main from origin/main")
+        else:
+            _ = _run_command(["git", "fetch", "origin", "main"], cwd=root, check=False)
+        if _git_ref_exists(root, "refs/remotes/origin/main"):
+            report.actions.append("reset local main from origin/main for bootstrap baseline")
+            if dry_run or check:
+                return
+            _ = _run_command(["git", "checkout", "-B", "main", "refs/remotes/origin/main"], cwd=root)
+            return
+
+    report.actions.append("create initial main baseline commit for worktree compatibility")
+    if dry_run or check:
+        return
+    readme = root / "README.md"
+    if not readme.exists():
+        _write_text(readme, f"# {root.name}\n")
+        _ = _run_command(["git", "add", "README.md"], cwd=root)
+    _ = _run_command(["git", "commit", "--allow-empty", "-m", "chore: bootstrap repository"], cwd=root)
 
 
 def _ensure_git_remote(root: Path, *, github_repo: str, dry_run: bool, check: bool, force: bool, report: ActionReport) -> None:
@@ -345,6 +388,8 @@ def _bootstrap_project_repository(root: Path, *, github_repo: str, dry_run: bool
         report.actions.append("initialize git repository")
         report.actions.append(f"add git remote origin {_repo_https_url(github_repo)}")
         report.actions.append(f"create GitHub repository {github_repo}")
+        report.actions.append("attempt to seed local main from origin/main")
+        report.actions.append("create initial main baseline commit for worktree compatibility")
         for name, _, _ in BOOTSTRAP_LABELS:
             report.actions.append(f"ensure GitHub label {name}")
         return
@@ -352,6 +397,7 @@ def _bootstrap_project_repository(root: Path, *, github_repo: str, dry_run: bool
         _ensure_git_repository(root, dry_run=dry_run, check=check, report=report)
         _ensure_git_remote(root, github_repo=github_repo, dry_run=dry_run, check=check, force=force, report=report)
         _ensure_github_repo(github_repo, dry_run=dry_run, check=check, report=report)
+        _ensure_main_branch_baseline(root, dry_run=dry_run, check=check, report=report)
         _ensure_github_labels(github_repo, dry_run=dry_run, check=check, report=report)
     except FileNotFoundError as error:
         missing = str(getattr(error, "filename", "") or error)
@@ -545,13 +591,6 @@ def _reconcile_issue_number(project_root: Path) -> str:
     raise RuntimeError("no DB-backed autodev issue is currently active for reconcile")
 
 
-def _has_reconcileable_issue(project_root: Path) -> bool:
-    active_states = ["claimed", "dispatching", "running", "verifying", "verified", "release_pending", "quarantined", "failed"]
-    if list_issues(project_root, states=active_states):
-        return True
-    return bool(list_issues(project_root, states=["ready"]))
-
-
 def _print_report(report: ActionReport, *, json_output: bool) -> None:
     if json_output:
         print(json.dumps({"status": "fail" if report.has_findings() else "pass", "actions": report.actions, "findings": report.findings}, ensure_ascii=False))
@@ -714,11 +753,11 @@ def main(argv: list[str] | None = None) -> int:
         _print_report(report, json_output=json_output)
         return 1 if report.has_findings() else 0
     if command == "doctor":
-        report = doctor_project(_consumer_project_root(cast(str, args.project_root)))
+        report = doctor_project(_canonical_project_root(cast(str, args.project_root)))
         _print_report(report, json_output=json_output)
         return 1 if report.has_findings() else 0
     if command == "start":
-        project_root = _consumer_project_root(cast(str, args.project_root))
+        project_root = _canonical_project_root(cast(str, args.project_root))
         _print_runtime_path_confirmation(project_root=project_root, command=command)
         if not _enforce_runtime_db_untracked(project_root=project_root, command=command):
             return 1
@@ -728,15 +767,13 @@ def main(argv: list[str] | None = None) -> int:
             env=_shared_workflow_env(),
         ).returncode
     if command == "reconcile":
-        project_root = _consumer_project_root(cast(str, args.project_root))
+        project_root = _canonical_project_root(cast(str, args.project_root))
         _print_runtime_path_confirmation(project_root=project_root, command=command)
         if not _enforce_runtime_db_untracked(project_root=project_root, command=command):
             return 1
-        if not _has_reconcileable_issue(project_root):
-            raise RuntimeError("no DB-backed autodev issue is currently active for reconcile")
         return _run_reconcile_workspace(project_root)
     if command == "reconcile-watch":
-        project_root = _consumer_project_root(cast(str, args.project_root))
+        project_root = _canonical_project_root(cast(str, args.project_root))
         _print_runtime_path_confirmation(project_root=project_root, command=command)
         if not _enforce_runtime_db_untracked(project_root=project_root, command=command):
             return 1
@@ -747,7 +784,7 @@ def main(argv: list[str] | None = None) -> int:
             stop_on_error=cast(bool, args.stop_on_error),
         )
     if command == "release":
-        project_root = _consumer_project_root(cast(str, args.project_root))
+        project_root = _canonical_project_root(cast(str, args.project_root))
         _print_runtime_path_confirmation(project_root=project_root, command=command)
         if not _enforce_runtime_db_untracked(project_root=project_root, command=command):
             return 1
@@ -780,7 +817,7 @@ def main(argv: list[str] | None = None) -> int:
             env=_shared_workflow_env(),
         ).returncode
     if command == "show-session":
-        exit_code, output = _show_session_result(_consumer_project_root(cast(str, args.project_root)))
+        exit_code, output = _show_session_result(_canonical_project_root(cast(str, args.project_root)))
         print(output, end="")
         return exit_code
     return 2

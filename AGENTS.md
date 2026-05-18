@@ -16,6 +16,7 @@
 - Script-level regressions live in `tests/scripts/`. If you change one orchestrator script, update the matching test file.
 
 ## Exact operator commands
+- Preferred operator interface: `autodev-flow` skill contracts (`C0..C6`). Use script-level commands below only as low-level execution/debug surfaces.
 - Minimal verified setup: `python3 -m pip install pytest`
 - Initialize a consumer project and bootstrap git/GitHub wiring: `PYTHONPATH=. python3 scripts/autodev_project.py init --project-root <project> --github-repo <owner/repo>`
 - Install user-global autodev host commands (OpenCode adapter by default): `PYTHONPATH=. python3 scripts/autodev_project.py install-commands`

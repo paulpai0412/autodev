@@ -13,6 +13,7 @@ from scripts.control_plane_db import (
     ensure_issue_row,
     read_artifact_fact,
     read_issue,
+    read_runtime_context,
     record_admin_decision,
     record_github_sync_attempt,
     sync_issue_runtime_context,
@@ -25,6 +26,8 @@ SyncProgressLabel = Callable[..., str]
 TransitionIssueState = Callable[..., None]
 ReleaseIssueExecution = Callable[..., None]
 SyncLocalMainAfterReleaseMerge = Callable[..., str]
+CloseGitHubIssueAfterReleaseMerge = Callable[..., str]
+
 
 READY_FOR_AGENT_LABEL = "ready-for-agent"
 AGENT_DISPATCHING_LABEL = "agent-dispatching"
@@ -206,16 +209,32 @@ def sync_local_main_after_release_merge(
         return ""
 
     branch = str(issue.get("branch") or "").strip()
+    issue_worktree_path = str((read_runtime_context(base_dir, issue_number) or {}).get("issue_worktree_path") or "").strip()
 
-    def _run_git(command: list[str]) -> str:
-        completed = subprocess.run(command, cwd=base_dir, check=False, capture_output=True, text=True)
+    workspace_dir = Path(issue_worktree_path) if issue_worktree_path else base_dir
+
+    def _run_git(command: list[str], *, cwd: Path) -> str:
+        completed = subprocess.run(command, cwd=cwd, check=False, capture_output=True, text=True)
         if completed.returncode == 0:
             return ""
         return (completed.stderr or completed.stdout).strip() or (
             f"{' '.join(command)} failed with exit code {completed.returncode}"
         )
 
-    repo_probe = _run_git(["git", "rev-parse", "--is-inside-work-tree"])
+    if workspace_dir != base_dir:
+        repo_probe = _run_git(["git", "rev-parse", "--is-inside-work-tree"], cwd=workspace_dir)
+        if repo_probe:
+            return ""
+        sync_error = _run_git(["git", "fetch", "origin", "main"], cwd=workspace_dir)
+        if sync_error:
+            return f"failed issue worktree sync after release merge for issue #{issue_number}: {sync_error}"
+        if branch and branch != "main":
+            sync_error = _run_git(["git", "merge", "--ff-only", "origin/main"], cwd=workspace_dir)
+            if sync_error:
+                return f"failed issue worktree branch sync after release merge for issue #{issue_number}: {sync_error}"
+        return ""
+
+    repo_probe = _run_git(["git", "rev-parse", "--is-inside-work-tree"], cwd=base_dir)
     if repo_probe:
         return ""
 
@@ -224,23 +243,109 @@ def sync_local_main_after_release_merge(
         ["git", "checkout", "main"],
         ["git", "pull", "--ff-only", "origin", "main"],
     ):
-        sync_error = _run_git(command)
+        sync_error = _run_git(command, cwd=base_dir)
         if sync_error:
             return f"failed local main sync after release merge for issue #{issue_number}: {sync_error}"
 
     if branch and branch != "main":
-        branch_exists_error = _run_git(["git", "rev-parse", "--verify", branch])
+        branch_exists_error = _run_git(["git", "rev-parse", "--verify", branch], cwd=base_dir)
         if not branch_exists_error:
             for command in (
                 ["git", "checkout", branch],
                 ["git", "merge", "--ff-only", "main"],
                 ["git", "checkout", "main"],
             ):
-                sync_error = _run_git(command)
+                sync_error = _run_git(command, cwd=base_dir)
                 if sync_error:
                     return f"failed local branch/main sync after release merge for issue #{issue_number}: {sync_error}"
 
     return ""
+
+
+def close_github_issue_after_release_merge(
+    *,
+    base_dir: Path,
+    issue_number: str,
+    repo: str,
+    now: NowFunc,
+    run: Callable[..., subprocess.CompletedProcess[str]],
+    command_id: str | None = None,
+    updated_at: str | None = None,
+) -> str:
+    backing_type = _issue_backing_type(base_dir, issue_number)
+    timestamp = now(updated_at)
+    if backing_type == "local_seeded":
+        if command_id:
+            record_github_sync_attempt(
+                base_dir,
+                command_id=command_id,
+                issue_number=issue_number,
+                add_labels=[],
+                remove_labels=[],
+                status="skipped",
+                updated_at=timestamp,
+                last_error="skipped GitHub issue close for local-seeded issue",
+            )
+        return ""
+    if not repo:
+        if command_id:
+            record_github_sync_attempt(
+                base_dir,
+                command_id=command_id,
+                issue_number=issue_number,
+                add_labels=[],
+                remove_labels=[],
+                status="skipped",
+                updated_at=timestamp,
+                last_error="skipped GitHub issue close because project github_repo is unset",
+            )
+        return ""
+
+    release_result = read_artifact_fact(base_dir, issue_number, "release_result")
+    if not bool(release_result.get("parse_ok")):
+        return ""
+    status = str(release_result.get("status") or "").strip().lower()
+    if status not in {"success", "completed"}:
+        return ""
+    merge_payload_raw = release_result.get("merge")
+    merge_payload = cast(dict[str, object], merge_payload_raw) if isinstance(merge_payload_raw, dict) else {}
+    merged = bool(release_result.get("merged")) or bool(merge_payload.get("merged")) or bool(str(merge_payload.get("merged_sha") or ""))
+    if not merged:
+        return ""
+
+    pr_number = str(release_result.get("pr_number") or "")
+    comment = (
+        f"Closing after PR #{pr_number} was merged by autodev release workflow."
+        if pr_number
+        else "Closing after merged release completed in autodev."
+    )
+    command = ["gh", "issue", "close", issue_number, "--repo", repo, "--comment", comment]
+    completed = run(command, cwd=base_dir, check=False, capture_output=True, text=True)
+    if completed.returncode == 0:
+        if command_id:
+            record_github_sync_attempt(
+                base_dir,
+                command_id=command_id,
+                issue_number=issue_number,
+                add_labels=[],
+                remove_labels=[],
+                status="success",
+                updated_at=timestamp,
+            )
+        return ""
+    error = (completed.stderr or completed.stdout).strip() or f"gh issue close failed with exit code {completed.returncode}"
+    if command_id:
+        record_github_sync_attempt(
+            base_dir,
+            command_id=command_id,
+            issue_number=issue_number,
+            add_labels=[],
+            remove_labels=[],
+            status="failed",
+            updated_at=timestamp,
+            last_error=error,
+        )
+    return error
 
 
 def claim_issue_execution(
@@ -327,6 +432,7 @@ def release_issue_execution(
     now: NowFunc,
     sync_progress_label: SyncProgressLabel,
     sync_local_main_after_release_merge: SyncLocalMainAfterReleaseMerge,
+    close_github_issue_after_release_merge: CloseGitHubIssueAfterReleaseMerge,
     transition_state: TransitionIssueState,
     final_state: str | None = None,
     updated_at: str | None = None,
@@ -335,6 +441,8 @@ def release_issue_execution(
     ensure_control_plane_db(base_dir)
 
     remove_labels = [AGENT_DISPATCHING_LABEL, AGENT_IN_PROGRESS_LABEL, QUARANTINED_LABEL]
+    if not restore_ready_for_agent:
+        remove_labels = [READY_FOR_AGENT_LABEL, *remove_labels]
     add_labels = [READY_FOR_AGENT_LABEL] if restore_ready_for_agent else []
     command_id = uuid4().hex
     _ = sync_progress_label(
@@ -374,6 +482,25 @@ def release_issue_execution(
             )
             raise RuntimeError(sync_error)
 
+        close_error = close_github_issue_after_release_merge(
+            base_dir=base_dir,
+            issue_number=issue_number,
+            command_id=f"{command_id}:github-close",
+            updated_at=timestamp,
+        )
+        if close_error:
+            record_admin_decision(
+                base_dir,
+                command_id=f"{command_id}:admin-github-issue-close-failed",
+                issue_number=issue_number,
+                decision_type="admin_github_issue_close_failure",
+                from_state=current_state,
+                to_state=current_state,
+                reason=close_error,
+                updated_at=timestamp,
+            )
+            raise RuntimeError(close_error)
+
     if target_state == "ready" and current_state in {"ready", "claimed", "dispatching"}:
         clear_issue_execution_claim_projection(base_dir=base_dir, issue_number=issue_number, updated_at=timestamp)
     elif target_state in {"verified", "failed", "completed"}:
@@ -406,6 +533,27 @@ def release_issue_execution(
             reason=f"Return issue #{issue_number} to verified after non-terminal release block.",
             from_state="release_pending",
             current_session_id="",
+        )
+        return
+
+    if target_state == "verified" and current_state in {"ready", "failed"}:
+        _ = upsert_issue_state(
+            base_dir,
+            issue_number=issue_number,
+            state="verified",
+            command_id=command_id,
+            updated_at=timestamp,
+            current_session_id="",
+        )
+        record_admin_decision(
+            base_dir,
+            command_id=f"{command_id}:admin-verified",
+            issue_number=issue_number,
+            decision_type="admin_verified_recovery",
+            from_state=current_state,
+            to_state="verified",
+            reason=f"Recover issue #{issue_number} into verified after a late successful verifier evidence packet arrived.",
+            updated_at=timestamp,
         )
         return
 
@@ -525,7 +673,7 @@ def quarantine_issue_execution(
         base_dir=base_dir,
         issue_number=issue_number,
         add_labels=[QUARANTINED_LABEL],
-        remove_labels=[AGENT_IN_PROGRESS_LABEL, AGENT_DISPATCHING_LABEL],
+        remove_labels=[READY_FOR_AGENT_LABEL, AGENT_IN_PROGRESS_LABEL, AGENT_DISPATCHING_LABEL],
         command_id=uuid4().hex,
         updated_at=timestamp,
     )
@@ -556,7 +704,7 @@ def resume_quarantined_issue_execution(
         base_dir=base_dir,
         issue_number=issue_number,
         add_labels=[AGENT_IN_PROGRESS_LABEL],
-        remove_labels=[QUARANTINED_LABEL, AGENT_DISPATCHING_LABEL],
+        remove_labels=[READY_FOR_AGENT_LABEL, QUARANTINED_LABEL, AGENT_DISPATCHING_LABEL],
         command_id=uuid4().hex,
         updated_at=timestamp,
     )
@@ -611,7 +759,7 @@ def redispatch_quarantined_issue_execution(
         base_dir=base_dir,
         issue_number=issue_number,
         add_labels=[AGENT_DISPATCHING_LABEL],
-        remove_labels=[QUARANTINED_LABEL, AGENT_IN_PROGRESS_LABEL],
+        remove_labels=[READY_FOR_AGENT_LABEL, QUARANTINED_LABEL, AGENT_IN_PROGRESS_LABEL],
         command_id=f"{command_id}:dispatching-labels",
         updated_at=timestamp,
     )

@@ -389,10 +389,13 @@ class OpenCodeHostAdapter(HostAdapter):
         if not session_id:
             if process.poll() is None:
                 process.terminate()
+            error_text = (stderr_text or stdout_text).strip() or "opencode run did not emit a sessionID before timeout"
+            retry_without_source_session = self._is_prefill_error_message(error_text)
             return SessionStartResult(
                 status="error",
                 launch_title=launch_title,
-                error=(stderr_text or stdout_text).strip() or "opencode run did not emit a sessionID before timeout",
+                error=error_text,
+                metadata={"retryWithoutSourceSession": retry_without_source_session},
             )
         readable, readability_detail = probe_same_repo_session_readability(
             cli_command,
@@ -418,6 +421,11 @@ class OpenCodeHostAdapter(HostAdapter):
             readability_status="verified_same_repo_probe",
             metadata={"stopContinuationStatus": "root_session_detached", "stopContinuationAttempts": 0, "command": command},
         )
+
+    @staticmethod
+    def _is_prefill_error_message(error_text: str) -> bool:
+        lowered = error_text.lower()
+        return "assistant message prefill" in lowered or "conversation must end with a user message" in lowered
 
     def start_child_role(self, role: str, context: SessionStartContext) -> SessionStartResult:
         child_context = SessionStartContext(

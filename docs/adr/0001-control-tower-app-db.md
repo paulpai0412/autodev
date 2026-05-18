@@ -1,0 +1,3 @@
+# Use a separate Control Tower App DB for interactive flow state
+
+The Control Tower Web App needs to store project registry entries, interactive chat messages, ask-question prompts, approvals, generated requirements/PRD/issues, skill execution state, and replayable streaming events. These are product UI and Spec Pipeline concerns, not autodev runtime control-plane facts, so they will live in a separate Control Tower App DB while each consumer repo keeps its own DB-only runtime truth in `.opencode/runtime/control-plane.sqlite3` tables `issues` and `issue_history`. This preserves the existing runtime contract, supports multi-repo switching, and prevents chat/spec state from polluting per-repo issue lifecycle data.

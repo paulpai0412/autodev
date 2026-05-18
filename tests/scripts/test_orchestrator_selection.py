@@ -1,0 +1,135 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from scripts.control_plane_db import ingest_issue_packet, record_pr_opened, upsert_issue_state
+from scripts.orchestrator_artifacts import _dependency_issue_numbers, issue_packet_record_from_json
+from scripts.orchestrator_selection import select_issue_packets_for_capacity
+
+
+def _unused_parse_issue_packet_text(_text: str, _path: str):
+    raise AssertionError("parse_issue_packet_text should not be called in this test")
+
+
+def _packet(issue_number: str, *, branch: str, dependencies: list[str]) -> dict[str, object]:
+    return {
+        "issue_number": issue_number,
+        "title": f"Issue {issue_number}",
+        "branch": branch,
+        "base_branch": "main",
+        "backing_type": "github",
+        "prior_handoff": "",
+        "labels": ["ready-for-agent"],
+        "parent_reference": "none",
+        "dependencies": dependencies,
+        "raw_text": "kind: issue_packet\n",
+    }
+
+
+def test_select_blocks_child_issue_until_parent_completed(tmp_path: Path) -> None:
+    ingest_issue_packet(
+        tmp_path,
+        issue_number="11",
+        issue_packet=_packet("11", branch="agent/issue-11-parent", dependencies=["none"]),
+        updated_at="2026-05-16T10:00:00+08:00",
+    )
+    ingest_issue_packet(
+        tmp_path,
+        issue_number="12",
+        issue_packet=_packet("12", branch="agent/issue-12-child", dependencies=["depends on issue #11"]),
+        updated_at="2026-05-16T10:01:00+08:00",
+    )
+    upsert_issue_state(
+        tmp_path,
+        issue_number="11",
+        state="verified",
+        command_id="verify-11",
+        updated_at="2026-05-16T10:02:00+08:00",
+    )
+    record_pr_opened(
+        tmp_path,
+        issue_number="11",
+        pr_number="13",
+        created_at="2026-05-16T10:03:00+08:00",
+        payload={"head_branch": "agent/issue-11-parent", "base_branch": "main"},
+    )
+
+    selected = select_issue_packets_for_capacity(
+        tmp_path,
+        workflow={},
+        current_issue={"number": "", "parentReference": ""},
+        completed_issue_numbers_func=lambda _base_dir: set(),
+        parse_issue_packet_text=_unused_parse_issue_packet_text,
+        sync_issue_packet_to_db_func=lambda *_args, **_kwargs: None,
+        issue_packet_record_from_json=issue_packet_record_from_json,
+        dependency_issue_numbers=_dependency_issue_numbers,
+        now=lambda value: value or "2026-05-16T10:04:00+08:00",
+        development_capacity=1,
+    )
+
+    assert "12" not in [packet.issue_number for packet in selected]
+
+    upsert_issue_state(
+        tmp_path,
+        issue_number="11",
+        state="completed",
+        command_id="complete-11",
+        updated_at="2026-05-16T10:05:00+08:00",
+    )
+
+    selected_after_complete = select_issue_packets_for_capacity(
+        tmp_path,
+        workflow={},
+        current_issue={"number": "", "parentReference": ""},
+        completed_issue_numbers_func=lambda _base_dir: {"11"},
+        parse_issue_packet_text=_unused_parse_issue_packet_text,
+        sync_issue_packet_to_db_func=lambda *_args, **_kwargs: None,
+        issue_packet_record_from_json=issue_packet_record_from_json,
+        dependency_issue_numbers=_dependency_issue_numbers,
+        now=lambda value: value or "2026-05-16T10:06:00+08:00",
+        development_capacity=1,
+    )
+
+    assert [packet.issue_number for packet in selected_after_complete] == ["12"]
+
+
+def test_dependency_issue_numbers_parses_depends_on_hash_number() -> None:
+    dependencies = ["Depends on #11"]
+    numbers = _dependency_issue_numbers("12", dependencies)
+    assert numbers == ["11"]
+
+
+def test_dependency_issue_numbers_parses_blocked_by_hash_number() -> None:
+    dependencies = ["blocked by #11"]
+    numbers = _dependency_issue_numbers("12", dependencies)
+    assert numbers == ["11"]
+
+
+def test_select_blocks_child_issue_when_parent_pr_is_not_stackable(tmp_path: Path) -> None:
+    ingest_issue_packet(
+        tmp_path,
+        issue_number="11",
+        issue_packet=_packet("11", branch="agent/issue-11-parent", dependencies=["none"]),
+        updated_at="2026-05-16T10:00:00+08:00",
+    )
+    ingest_issue_packet(
+        tmp_path,
+        issue_number="12",
+        issue_packet=_packet("12", branch="agent/issue-12-child", dependencies=["depends on issue #11"]),
+        updated_at="2026-05-16T10:01:00+08:00",
+    )
+
+    selected = select_issue_packets_for_capacity(
+        tmp_path,
+        workflow={},
+        current_issue={"number": "", "parentReference": ""},
+        completed_issue_numbers_func=lambda _base_dir: set(),
+        parse_issue_packet_text=_unused_parse_issue_packet_text,
+        sync_issue_packet_to_db_func=lambda *_args, **_kwargs: None,
+        issue_packet_record_from_json=issue_packet_record_from_json,
+        dependency_issue_numbers=_dependency_issue_numbers,
+        now=lambda value: value or "2026-05-16T10:04:00+08:00",
+        development_capacity=1,
+    )
+
+    assert "12" not in [packet.issue_number for packet in selected]

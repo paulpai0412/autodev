@@ -115,8 +115,8 @@ These are the main OpenCode-coupled surfaces that should move behind the adapter
 - `scripts/orchestrator_sessions.py`
 - `scripts/opencode_session_trace.py`
 - `scripts/subagent_startup_repro.py`
-- `.opencode/commands/auto-dev.md`
-- `.opencode/commands/supervisor-reconcile.md`
+- `.opencode/commands/autodev-start.md`
+- `.opencode/commands/autodev-reconcile.md`
 - `scripts/autodev_project.py install-commands`
 
 ## Platform fit
