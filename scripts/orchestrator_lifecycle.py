@@ -9,6 +9,8 @@ from typing import Callable, cast
 from uuid import uuid4
 
 from scripts.control_plane_db import (
+    append_issue_history,
+    claim_issue_if_ready,
     ensure_control_plane_db,
     ensure_issue_row,
     read_artifact_fact,
@@ -361,28 +363,19 @@ def claim_issue_execution(
 ) -> None:
     timestamp = now(updated_at)
     ensure_control_plane_db(base_dir)
-    existing_issue = read_issue(base_dir, issue_number)
-    if existing_issue is not None and str(existing_issue.get("state") or "") in {
-        "claimed",
-        "dispatching",
-        "running",
-        "verifying",
-        "quarantined",
-    }:
-        holder = str(existing_issue.get("current_session_id") or source_session_id or "unknown-session")
-        created_at = str(
-            existing_issue.get("claimed_at")
-            or existing_issue.get("dispatching_at")
-            or existing_issue.get("running_at")
-            or existing_issue.get("updated_at")
-            or "unknown-time"
-        )
-        raise RuntimeError(
-            f"issue #{issue_number} is already in progress via {holder} since {created_at}; refusing duplicate start."
-        )
-
     command_id = uuid4().hex
     ensure_issue_row(base_dir, issue_number=issue_number, updated_at=timestamp)
+    try:
+        _ = claim_issue_if_ready(
+            base_dir,
+            issue_number=issue_number,
+            command_id=command_id,
+            scheduler_id=scheduler_id(base_dir),
+            reason=f"Claim issue #{issue_number} for scheduler dispatch.",
+            updated_at=timestamp,
+        )
+    except ValueError as error:
+        raise RuntimeError(str(error)) from error
     _ = sync_issue_runtime_context(
         base_dir,
         issue_number=issue_number,
@@ -394,15 +387,6 @@ def claim_issue_execution(
             "createdAt": timestamp,
             "status": "claimed",
         },
-    )
-    transition_state(
-        base_dir=base_dir,
-        issue_number=issue_number,
-        to_state="claimed",
-        command_id=command_id,
-        updated_at=timestamp,
-        reason=f"Claim issue #{issue_number} for scheduler dispatch.",
-        from_state="ready",
     )
     sync_error = sync_progress_label(
         base_dir=base_dir,
@@ -434,6 +418,7 @@ def release_issue_execution(
     sync_local_main_after_release_merge: SyncLocalMainAfterReleaseMerge,
     close_github_issue_after_release_merge: CloseGitHubIssueAfterReleaseMerge,
     transition_state: TransitionIssueState,
+    rollback_reason: str = "",
     final_state: str | None = None,
     updated_at: str | None = None,
 ) -> None:
@@ -512,6 +497,22 @@ def release_issue_execution(
         return
 
     if target_state == "ready" and current_state in {"claimed", "dispatching"}:
+        payload = {
+            "rollback_reason": rollback_reason or "unspecified",
+            "restored_ready_for_agent": True,
+            "from_state": current_state,
+        }
+        _ = append_issue_history(
+            base_dir,
+            issue_number=issue_number,
+            entry_type="admin_action",
+            created_at=timestamp,
+            status="ready_rollback",
+            command_id=f"{command_id}:rollback-reason",
+            summary=f"Rollback issue #{issue_number} to ready-for-agent: {payload['rollback_reason']}",
+            payload=payload,
+            unique_key=f"ready-rollback:{issue_number}:{command_id}",
+        )
         transition_state(
             base_dir=base_dir,
             issue_number=issue_number,
