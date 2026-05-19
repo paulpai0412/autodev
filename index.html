@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Control Tower Flow Run Skeleton</title>
+  <style>
+    :root {
+      --bg: #f2f4f8;
+      --surface: #ffffff;
+      --text: #182033;
+      --muted: #54627a;
+      --accent: #0f5fff;
+      --danger: #bf1f3b;
+      --line: #d5dce8;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: "Plus Jakarta Sans", "Segoe UI", sans-serif;
+      background: radial-gradient(circle at top left, #ffffff, var(--bg));
+      color: var(--text);
+      min-height: 100vh;
+      padding: 24px;
+    }
+
+    .shell {
+      max-width: 900px;
+      margin: 0 auto;
+      border: 1px solid var(--line);
+      background: var(--surface);
+      border-radius: 14px;
+      padding: 20px;
+      display: grid;
+      gap: 16px;
+    }
+
+    .row {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    input, button {
+      font: inherit;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      padding: 10px 12px;
+    }
+
+    input { min-width: 240px; }
+
+    button {
+      border-color: var(--accent);
+      background: var(--accent);
+      color: #fff;
+      cursor: pointer;
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .muted { color: var(--muted); }
+    .error { color: var(--danger); }
+    .list { margin: 0; padding-left: 20px; }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <h1>Control Tower App DB + Flow Run Skeleton</h1>
+    <p class="muted">Flow Runs are bound to a selected consumer repo and stored in App DB localStorage only.</p>
+
+    <section>
+      <h2>1) Select Consumer Repo</h2>
+      <div class="row">
+        <input id="repo-id" placeholder="owner/repo" value="paulpai0412/autodev-demo-todo">
+        <button id="select-repo" type="button">Select Repo</button>
+      </div>
+      <p id="selected-repo" class="muted">No repo selected.</p>
+    </section>
+
+    <section>
+      <h2>2) Create Flow Run</h2>
+      <div class="row">
+        <button id="create-flow" type="button">Create Flow Run</button>
+        <button id="advance-stage" type="button">Advance To Planning</button>
+      </div>
+      <p id="error" class="error" aria-live="polite"></p>
+    </section>
+
+    <section>
+      <h2>Stored Flow Runs</h2>
+      <ul id="flow-runs" class="list"></ul>
+    </section>
+  </main>
+
+  <script id="control-tower-core">
+    (function () {
+      var APP_DB_KEY = "control-tower-app-db.v1";
+
+      function nowIso() {
+        return new Date().toISOString();
+      }
+
+      function makeId(prefix) {
+        return prefix + "-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+      }
+
+      function normalizeDb(raw) {
+        if (!raw || typeof raw !== "object") {
+          return { selectedRepo: null, flowRuns: [] };
+        }
+
+        return {
+          selectedRepo: raw.selectedRepo || null,
+          flowRuns: Array.isArray(raw.flowRuns) ? raw.flowRuns : [],
+        };
+      }
+
+      function createControlTowerApp(options) {
+        var opts = options || {};
+        var storage = opts.storage || (typeof window !== "undefined" ? window.localStorage : null);
+
+        if (!storage || typeof storage.getItem !== "function" || typeof storage.setItem !== "function") {
+          throw new Error("createControlTowerApp requires a storage with getItem/setItem.");
+        }
+
+        function readAppDb() {
+          var raw = storage.getItem(APP_DB_KEY);
+          if (!raw) {
+            return { selectedRepo: null, flowRuns: [] };
+          }
+
+          try {
+            return normalizeDb(JSON.parse(raw));
+          } catch (error) {
+            return { selectedRepo: null, flowRuns: [] };
+          }
+        }
+
+        function writeAppDb(db) {
+          storage.setItem(APP_DB_KEY, JSON.stringify(db));
+          return db;
+        }
+
+        function selectConsumerRepo(input) {
+          if (!input || !input.repoId) {
+            throw new Error("A consumer repo is required.");
+          }
+
+          var db = readAppDb();
+          db.selectedRepo = {
+            repoId: String(input.repoId),
+            displayName: input.displayName ? String(input.displayName) : String(input.repoId),
+            selectedAt: nowIso(),
+          };
+          writeAppDb(db);
+          return db.selectedRepo;
+        }
+
+        function createFlowRun(input) {
+          var db = readAppDb();
+          if (!db.selectedRepo || !db.selectedRepo.repoId) {
+            throw new Error("Flow Run creation requires a selected consumer repo.");
+          }
+
+          var createdAt = nowIso();
+          var flowRun = {
+            flowRunId: makeId("flow"),
+            repoId: db.selectedRepo.repoId,
+            stage: input && input.stage ? String(input.stage) : "spec_pipeline",
+            createdAt: createdAt,
+            updatedAt: createdAt,
+          };
+
+          db.flowRuns.push(flowRun);
+          writeAppDb(db);
+          return flowRun;
+        }
+
+        function setFlowRunStage(flowRunId, stage) {
+          var db = readAppDb();
+          var nextStage = String(stage || "");
+          var found = null;
+
+          db.flowRuns = db.flowRuns.map(function (run) {
+            if (run.flowRunId !== flowRunId) {
+              return run;
+            }
+
+            found = {
+              flowRunId: run.flowRunId,
+              repoId: run.repoId,
+              stage: nextStage,
+              createdAt: run.createdAt,
+              updatedAt: nowIso(),
+            };
+            return found;
+          });
+
+          if (!found) {
+            throw new Error("Flow Run not found: " + flowRunId);
+          }
+
+          writeAppDb(db);
+          return found;
+        }
+
+        function saveChatSpecState(flowRunId, payload) {
+          var db = readAppDb();
+          var updated = null;
+
+          db.flowRuns = db.flowRuns.map(function (run) {
+            if (run.flowRunId !== flowRunId) {
+              return run;
+            }
+
+            updated = {
+              flowRunId: run.flowRunId,
+              repoId: run.repoId,
+              stage: run.stage,
+              createdAt: run.createdAt,
+              updatedAt: nowIso(),
+              chatSpecState: payload || {},
+            };
+            return updated;
+          });
+
+          if (!updated) {
+            throw new Error("Flow Run not found: " + flowRunId);
+          }
+
+          writeAppDb(db);
+          return updated;
+        }
+
+        return {
+          APP_DB_KEY: APP_DB_KEY,
+          readAppDb: readAppDb,
+          selectConsumerRepo: selectConsumerRepo,
+          createFlowRun: createFlowRun,
+          setFlowRunStage: setFlowRunStage,
+          saveChatSpecState: saveChatSpecState,
+        };
+      }
+
+      var exportsObject = {
+        APP_DB_KEY: APP_DB_KEY,
+        createControlTowerApp: createControlTowerApp,
+      };
+
+      if (typeof module !== "undefined" && module.exports) {
+        module.exports = exportsObject;
+      }
+
+      if (typeof window !== "undefined") {
+        window.ControlTowerCore = exportsObject;
+      }
+    })();
+  </script>
+
+  <script>
+    (function () {
+      if (typeof window === "undefined" || !window.ControlTowerCore) {
+        return;
+      }
+
+      var app = window.ControlTowerCore.createControlTowerApp();
+      var repoInput = document.getElementById("repo-id");
+      var selectedRepoText = document.getElementById("selected-repo");
+      var errorText = document.getElementById("error");
+      var flowRunsList = document.getElementById("flow-runs");
+
+      function render() {
+        var db = app.readAppDb();
+        selectedRepoText.textContent = db.selectedRepo
+          ? "Selected: " + db.selectedRepo.repoId
+          : "No repo selected.";
+
+        flowRunsList.innerHTML = "";
+        db.flowRuns.forEach(function (run) {
+          var item = document.createElement("li");
+          item.textContent = run.flowRunId + " | " + run.repoId + " | " + run.stage + " | " + run.updatedAt;
+          flowRunsList.appendChild(item);
+        });
+      }
+
+      function safeCall(fn) {
+        errorText.textContent = "";
+        try {
+          fn();
+          render();
+        } catch (error) {
+          errorText.textContent = error && error.message ? error.message : "Unknown error";
+        }
+      }
+
+      document.getElementById("select-repo").addEventListener("click", function () {
+        safeCall(function () {
+          var repoId = repoInput.value.trim();
+          app.selectConsumerRepo({ repoId: repoId, displayName: repoId });
+        });
+      });
+
+      document.getElementById("create-flow").addEventListener("click", function () {
+        safeCall(function () {
+          app.createFlowRun({ stage: "spec_pipeline" });
+        });
+      });
+
+      document.getElementById("advance-stage").addEventListener("click", function () {
+        safeCall(function () {
+          var db = app.readAppDb();
+          if (!db.flowRuns.length) {
+            throw new Error("Create a Flow Run first.");
+          }
+
+          var latest = db.flowRuns[db.flowRuns.length - 1];
+          app.setFlowRunStage(latest.flowRunId, "planning");
+          app.saveChatSpecState(latest.flowRunId, { note: "spec notes" });
+        });
+      });
+
+      render();
+    })();
+  </script>
+</body>
+</html>
