@@ -501,6 +501,47 @@
     }
 
     .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .metric.intervention { border-color: var(--red); background: var(--red-soft); }
+    .metric.intervention span { color: var(--red); }
+    .metric.intervention strong { color: var(--red); }
+    .intervention-card { border:1px solid var(--red); border-radius:12px; padding:12px 16px; background:var(--red-soft); display:flex; align-items:center; gap:12px; margin-bottom:8px; }
+    .intervention-card .itag { background:var(--red); color:#fff; border-radius:6px; font-size:11px; padding:2px 7px; white-space:nowrap; font-weight:600; }
+    .role-row { display:grid; grid-template-columns:120px 90px 1fr; gap:8px; align-items:center; padding:8px 0; border-bottom:1px solid var(--line); font-size:13px; }
+    .role-row:last-child { border-bottom:none; }
+    .role-name { font-weight:600; color:var(--ink-soft); }
+    .role-status-tag { border-radius:6px; padding:2px 8px; font-size:11px; font-weight:600; text-align:center; }
+    .rs-pending { background:var(--bg-soft); color:var(--ink-faint); }
+    .rs-running { background:var(--amber-soft); color:var(--amber); }
+    .rs-done { background:var(--green-soft); color:var(--green); }
+    .rs-failed { background:var(--red-soft); color:var(--red); }
+    #run-issues-table td { padding:6px 10px; border-bottom:1px solid var(--line); vertical-align:middle; }
+    #run-issues-table tr:last-child td { border-bottom:none; }
+    .state-badge { border-radius:6px; padding:2px 7px; font-size:11px; font-weight:600; }
+    .sb-running { background:var(--amber-soft); color:var(--amber); }
+    .sb-verified { background:var(--green-soft); color:var(--green); }
+    .sb-quarantined,.sb-failed { background:var(--red-soft); color:var(--red); }
+    .sb-ready { background:var(--bg-soft); color:var(--ink-faint); }
+    .sb-completed { background:var(--green-soft); color:var(--green); }
+    .metric.intervention { border-color: var(--red); background: var(--red-soft); }
+    .metric.intervention strong { color: var(--red); }
+    .intervention-signal { display:flex; align-items:center; gap:10px; padding:10px 14px; border-radius:10px; background:var(--red-soft); border:1px solid var(--red); margin-bottom:8px; font-size:13px; }
+    .intervention-signal .signal-badge { font-weight:700; color:var(--red); white-space:nowrap; }
+    .run-issue-row td { padding:7px 10px; border-bottom:1px solid var(--line); }
+    .run-issue-row:last-child td { border-bottom:none; }
+    .state-running { color:var(--blue); font-weight:600; }
+    .state-verifying { color:var(--amber); font-weight:600; }
+    .state-quarantined, .state-failed { color:var(--red); font-weight:600; }
+    .state-verified, .state-completed { color:var(--green); font-weight:600; }
+    .role-progression { display:flex; flex-direction:column; gap:0; }
+    .role-row { display:flex; align-items:flex-start; gap:14px; padding:12px 0; border-bottom:1px solid var(--line); }
+    .role-row:last-child { border-bottom:none; }
+    .role-icon { width:36px; height:36px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:15px; flex-shrink:0; background:var(--bg-soft); border:1px solid var(--line); }
+    .role-icon.done { background:var(--green-soft); border-color:var(--green); }
+    .role-icon.active { background:var(--blue-soft); border-color:var(--blue); }
+    .role-icon.risk { background:var(--red-soft); border-color:var(--red); }
+    .role-meta { flex:1; }
+    .role-meta h4 { margin:0 0 3px; font-size:13px; font-weight:600; }
+    .role-meta small { color:var(--ink-soft); font-size:11px; font-family:var(--font-mono); }
     .timeline { display:grid; gap: 11px; }
     .event { display:grid; grid-template-columns: 58px 1fr auto; gap: 10px; align-items:start; }
     .event time { color: var(--ink-faint); font-family: var(--font-mono); font-size: 12px; }
@@ -636,6 +677,7 @@
         <div>
           <div class="nav-title">Runtime</div>
           <button class="nav-item" type="button" data-screen-target="run">執行儀表板 <span class="badge">即時</span></button>
+          <button class="nav-item" type="button" data-screen-target="issue-detail">Issue Detail <span class="badge">角色進展</span></button>
           <button class="nav-item" type="button" data-screen-target="release">PR 審核佇列 <span class="badge">2</span></button>
           <button class="nav-item" type="button" data-screen-target="recovery">復原中心 <span class="badge">1</span></button>
         </div>
@@ -786,9 +828,47 @@
             <div class="validation-note" id="issue-plan-validation"></div>
           </section>
 
+          <!-- AC1: Run Dashboard — active issue state, KPI summaries, intervention-needed signals -->
           <section class="screen" id="screen-run" data-eyebrow="Run Dashboard" data-title="執行儀表板只呈現決策需要的訊號。" data-copy="從 DB-only control plane 讀取 issue/session/release 狀態，避免讓畫面變成無限聊天紀錄。">
-            <div class="metric-row"><div class="metric"><span>作用中 issues</span><strong>4</strong><small>2 running · 1 verifying</small></div><div class="metric"><span>開發容量</span><strong>2/2</strong><small>slot saturated</small></div><div class="metric"><span>Release queue</span><strong>3</strong><small>2 need approval</small></div><div class="metric"><span>阻塞</span><strong>1</strong><small>stale verifier</small></div></div>
-            <div class="panel"><div class="panel-head"><h3>近期控制平面事件</h3><span>issue_history</span></div><div class="panel-body timeline"><div class="event"><time>11:42</time><div><b>#142 dispatching → running</b><p>current_session_id 已寫入 issues snapshot。</p></div><span class="tag active">root</span></div><div class="event"><time>11:39</time><div><b>#139 verifier accepted</b><p>evidence packet 通過，等待 release policy。</p></div><span class="tag done">verified</span></div><div class="event"><time>11:35</time><div><b>#128 quarantined</b><p>stale heartbeat，其他 issue 可繼續執行。</p></div><span class="tag risk">recovery</span></div></div></div>
+            <div class="metric-row" id="run-kpi-row">
+              <div class="metric" id="kpi-active"><span>作用中 issues</span><strong id="kpi-total-issues">—</strong><small id="kpi-active-detail">載入中…</small></div>
+              <div class="metric" id="kpi-capacity"><span>Running / Verified</span><strong id="kpi-running-verified">—</strong><small id="kpi-capacity-detail">slot</small></div>
+              <div class="metric" id="kpi-release"><span>Release queue</span><strong id="kpi-release-count">—</strong><small id="kpi-release-detail">等待合併</small></div>
+              <div class="metric intervention" id="kpi-intervention"><span>需要介入 ⚑</span><strong id="kpi-blocked-count">—</strong><small id="kpi-intervention-detail">quarantined / failed</small></div>
+            </div>
+            <!-- Intervention-needed signals: quarantined/failed issues -->
+            <div id="run-intervention-signals" style="margin-bottom:12px"></div>
+            <!-- Active issue state list -->
+            <div class="panel" style="margin-bottom:12px">
+              <div class="panel-head"><h3>Issue 狀態一覽</h3><span id="run-issues-timestamp">即時</span></div>
+              <div class="panel-body" id="run-issues-list" style="padding:0">
+                <table style="width:100%;border-collapse:collapse;font-size:13px" id="run-issues-table">
+                  <thead><tr style="border-bottom:1px solid var(--line)"><th style="padding:6px 10px;text-align:left;font-weight:600;color:var(--ink-soft)">#</th><th style="padding:6px 10px;text-align:left;font-weight:600;color:var(--ink-soft)">Title</th><th style="padding:6px 10px;text-align:left;font-weight:600;color:var(--ink-soft)">State</th><th style="padding:6px 10px;text-align:left;font-weight:600;color:var(--ink-soft)">Role</th><th style="padding:6px 10px;text-align:left;font-weight:600;color:var(--ink-soft)">Last event</th></tr></thead>
+                  <tbody id="run-issues-tbody"></tbody>
+                </table>
+              </div>
+            </div>
+            <div class="panel"><div class="panel-head"><h3>近期控制平面事件</h3><span>issue_history</span></div><div class="panel-body timeline" id="run-timeline"><div class="event"><time>11:42</time><div><b>#142 dispatching → running</b><p>current_session_id 已寫入 issues snapshot。</p></div><span class="tag active">root</span></div><div class="event"><time>11:39</time><div><b>#139 verifier accepted</b><p>evidence packet 通過，等待 release policy。</p></div><span class="tag done">verified</span></div><div class="event"><time>11:35</time><div><b>#128 quarantined</b><p>stale heartbeat，其他 issue 可繼續執行。</p></div><span class="tag risk">recovery</span></div></div></div>
+          </section>
+
+          <!-- AC2: Issue Detail — role progression using persisted runtime facts -->
+          <section class="screen" id="screen-issue-detail" data-eyebrow="Issue Detail" data-title="Issue 角色進展：root → worker → verifier → release。" data-copy="呈現來自 issue_history 的持久化 runtime 事實，每個角色一列，含時間戳與狀態。">
+            <div style="display:flex;gap:10px;align-items:center;margin-bottom:14px">
+              <label for="issue-detail-select" style="font-weight:600;font-size:13px;color:var(--ink-soft);white-space:nowrap">Issue #</label>
+              <select id="issue-detail-select" style="flex:1;padding:6px 10px;border:1px solid var(--line-strong);border-radius:6px;background:var(--surface);color:var(--ink);font-size:13px">
+                <option value="">— 選擇 issue —</option>
+              </select>
+              <button class="btn primary" type="button" id="issue-detail-load">載入進展</button>
+            </div>
+            <div id="issue-detail-content">
+              <div style="color:var(--ink-faint);font-size:13px;padding:20px 0">請選擇一個 issue 來查看角色進展。</div>
+            </div>
+            <div id="issue-detail-progression" style="display:none">
+              <div data-role="main_orchestrator"></div>
+              <div data-role="issue_worker"></div>
+              <div data-role="pr_verifier"></div>
+              <div data-role="release_worker"></div>
+            </div>
           </section>
 
           <section class="screen" id="screen-release" data-eyebrow="PR Approval Queue" data-title="PR 審核佇列把 Release gate 留在 Control Tower 裡。" data-copy="操作者可以確認 verifier evidence、GitHub checks 與本地 approval identity，再送出 GitHub-native review approval。">
@@ -803,9 +883,44 @@
             <p class="mini-note" id="approval-queue-result"></p>
           </section>
 
+          <!-- AC3: Recovery Center — issue-scoped actions, audit trail in issue_history -->
           <section class="screen" id="screen-recovery" data-eyebrow="Recovery Center" data-title="復原操作必須 issue-scoped，不拖垮整個工作區。" data-copy="Quarantine、resume、retry 與 fail 都寫入 issue_history，保留完整 audit trail。">
-            <div class="two-col"><div class="panel"><div class="panel-head"><h3>#128 Stale verifier</h3><span class="tag risk">quarantined</span></div><div class="panel-body"><p style="color:var(--ink-soft);line-height:1.65;margin-top:0">last_event_at 超過門檻，但只隔離單一 issue；其他 ready issue 仍可由 workspace reconcile 補位。</p><button class="btn primary" type="button">Resume quarantined</button> <button class="btn" type="button">Retry failed</button></div></div><div class="panel"><div class="panel-head"><h3>建議命令</h3><span>audit-safe</span></div><div class="panel-body"><code style="font-family:var(--font-mono);color:var(--clay-dark);line-height:1.8">orchestrator_supervisor.py resume-quarantined --issue-number 128 --reason "verifier session recovered"</code></div></div></div>
+            <div class="two-col">
+              <div class="panel">
+                <div class="panel-head"><h3>Recovery 動作</h3><span>issue-scoped</span></div>
+                <div class="panel-body">
+                  <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px">
+                    <label for="recovery-issue-select" style="font-size:13px;color:var(--ink-soft);white-space:nowrap">Issue #</label>
+                    <select id="recovery-issue-select" style="flex:1;padding:5px 8px;border:1px solid var(--line-strong);border-radius:6px;background:var(--surface);color:var(--ink);font-size:13px">
+                      <option value="">— 選擇 issue —</option>
+                    </select>
+                  </div>
+                  <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px">
+                    <label for="recovery-reason-input" style="font-size:13px;color:var(--ink-soft);white-space:nowrap">Reason</label>
+                    <input id="recovery-reason-input" type="text" placeholder="說明復原原因…" style="flex:1;padding:5px 8px;border:1px solid var(--line-strong);border-radius:6px;background:var(--surface);color:var(--ink);font-size:13px">
+                  </div>
+                  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px">
+                    <button class="btn primary" type="button" data-recovery-action="quarantine">Quarantine</button>
+                    <button class="btn primary" type="button" data-recovery-action="resume">Resume quarantined</button>
+                    <button class="btn" type="button" data-recovery-action="retry">Retry failed</button>
+                    <button class="btn" type="button" data-recovery-action="fail">Fail quarantined</button>
+                  </div>
+                  <div id="recovery-result" style="font-size:12px;color:var(--ink-soft);min-height:18px"></div>
+                </div>
+              </div>
+              <div class="panel">
+                <div class="panel-head"><h3>Audit Trail</h3><span>issue_history entries</span></div>
+                <div class="panel-body timeline" id="recovery-audit-trail">
+                  <div class="event"><time>示例</time><div><b>#128 resume-quarantined</b><p>reason: verifier session recovered · audit entry persisted.</p></div><span class="tag active">audit</span></div>
+                </div>
+              </div>
+            </div>
+            <div class="panel" style="margin-top:12px">
+              <div class="panel-head"><h3>建議命令</h3><span>audit-safe CLI</span></div>
+              <div class="panel-body" id="recovery-cmd-hint"><code style="font-family:var(--font-mono);color:var(--clay-dark);line-height:1.8" id="recovery-cmd-text">orchestrator_supervisor.py resume-quarantined --base-dir &lt;project&gt; --issue-number &lt;N&gt; --reason "reason"</code></div>
+            </div>
           </section>
+
         </div>
       </section>
 
@@ -1072,12 +1187,13 @@
           return ["gh", "pr", "review", String(prNumber), "--repo", repoId, "--approve", "--body", reviewBody];
         }
 
-        function submitGitHubReviewApproval(input) {
+        function submitGitHubReviewApproval(input, adapterEnv) {
           var args = input && typeof input === "object" ? input : {};
+          var adapter = adapterEnv && typeof adapterEnv === "object" ? adapterEnv : {};
           var command = buildGitHubApproveCommand(args);
 
-          if (typeof env.approvePullRequest === "function") {
-            return env.approvePullRequest({
+          if (typeof adapter.approvePullRequest === "function") {
+            return adapter.approvePullRequest({
               repoId: args.repoId,
               prNumber: args.prNumber,
               reviewEvent: "APPROVE",
@@ -1087,8 +1203,8 @@
             }) || null;
           }
 
-          if (typeof env.runCommand === "function") {
-            return env.runCommand({
+          if (typeof adapter.runCommand === "function") {
+            return adapter.runCommand({
               command: command.slice(),
             }) || null;
           }
@@ -1754,7 +1870,7 @@
             prNumber: item.prNumber,
             actor: identity.login,
             body: normalizeOptionalString(args.body) || "Approved from Control Tower PR Approval Queue.",
-          });
+          }, env);
 
           var submittedAt = nowIso();
           item.approvalState = "approved";
@@ -2718,6 +2834,166 @@
         renderSpecPipeline();
       });
     }
+
+    (function initRunDashboardAndRecovery() {
+      var MOCK_ISSUES = [
+        { number: 11, title: 'Run Dashboard v0', state: 'running', role: 'issue_worker', last_event: '2026-05-19T11:35:16', history: [
+          { role: 'main_orchestrator', status: 'done', summary: 'Root session started, issue_worker dispatched.', ts: '2026-05-19T11:34:00' },
+          { role: 'issue_worker', status: 'running', summary: 'Worker executing implementation.', ts: '2026-05-19T11:35:16' },
+          { role: 'pr_verifier', status: 'pending', summary: '', ts: '' },
+          { role: 'release_worker', status: 'pending', summary: '', ts: '' }
+        ]},
+        { number: 4, title: 'App DB schema', state: 'verified', role: 'pr_verifier', last_event: '2026-05-19T09:10:00', history: [
+          { role: 'main_orchestrator', status: 'done', summary: 'Bootstrapped.', ts: '2026-05-19T08:00:00' },
+          { role: 'issue_worker', status: 'done', summary: 'Implemented schema, PR created.', ts: '2026-05-19T08:30:00' },
+          { role: 'pr_verifier', status: 'done', summary: 'Evidence packet accepted.', ts: '2026-05-19T09:10:00' },
+          { role: 'release_worker', status: 'pending', summary: '', ts: '' }
+        ]},
+        { number: 6, title: 'Project Registry hooks', state: 'completed', role: 'release_worker', last_event: '2026-05-19T07:50:00', history: [
+          { role: 'main_orchestrator', status: 'done', summary: 'Bootstrapped.', ts: '2026-05-19T06:00:00' },
+          { role: 'issue_worker', status: 'done', summary: 'Implemented.', ts: '2026-05-19T06:45:00' },
+          { role: 'pr_verifier', status: 'done', summary: 'Verified.', ts: '2026-05-19T07:20:00' },
+          { role: 'release_worker', status: 'done', summary: 'Merged and released.', ts: '2026-05-19T07:50:00' }
+        ]},
+        { number: 10, title: 'Runtime intake bridge', state: 'quarantined', role: 'main_orchestrator', last_event: '2026-05-18T15:00:00', history: [
+          { role: 'main_orchestrator', status: 'failed', summary: 'Quarantined: stale heartbeat.', ts: '2026-05-18T15:00:00' },
+          { role: 'issue_worker', status: 'pending', summary: '', ts: '' },
+          { role: 'pr_verifier', status: 'pending', summary: '', ts: '' },
+          { role: 'release_worker', status: 'pending', summary: '', ts: '' }
+        ]}
+      ];
+
+      var recoveryAuditLog = [];
+
+      function stateClass(state) {
+        var map = { running: 'sb-running', verified: 'sb-verified', completed: 'sb-completed', quarantined: 'sb-quarantined', failed: 'sb-failed', ready: 'sb-ready' };
+        return map[state] || 'sb-ready';
+      }
+
+      function renderRunDashboard() {
+        var running = MOCK_ISSUES.filter(function(i) { return i.state === 'running'; }).length;
+        var verifying = MOCK_ISSUES.filter(function(i) { return i.state === 'verifying'; }).length;
+        var verified = MOCK_ISSUES.filter(function(i) { return i.state === 'verified'; }).length;
+        var needIntervention = MOCK_ISSUES.filter(function(i) { return i.state === 'quarantined' || i.state === 'failed'; });
+
+        document.getElementById('kpi-total-issues').textContent = String(running + verifying);
+        document.getElementById('kpi-active-detail').textContent = running + ' running · ' + verifying + ' verifying';
+        document.getElementById('kpi-running-verified').textContent = running + '/' + verified;
+        document.getElementById('kpi-capacity-detail').textContent = 'running / verified';
+        document.getElementById('kpi-release-count').textContent = String(verified);
+        document.getElementById('kpi-release-detail').textContent = 'awaiting merge';
+        document.getElementById('kpi-blocked-count').textContent = String(needIntervention.length);
+        document.getElementById('kpi-intervention-detail').textContent = needIntervention.map(function(i) { return '#' + i.number; }).join(', ') || 'none';
+
+        var interventionEl = document.getElementById('run-intervention-signals');
+        if (interventionEl) {
+          if (needIntervention.length === 0) {
+            interventionEl.innerHTML = '';
+          } else {
+            interventionEl.innerHTML = needIntervention.map(function(i) {
+              return '<div class="intervention-card"><span class="itag">⚑ ' + i.state.toUpperCase() + '</span><span><strong>#' + i.number + '</strong> — ' + i.title + '</span></div>';
+            }).join('');
+          }
+        }
+
+        var tbody = document.getElementById('run-issues-tbody');
+        if (tbody) {
+          tbody.innerHTML = MOCK_ISSUES.map(function(i) {
+            var ts = i.last_event ? i.last_event.replace('T', ' ').slice(0, 16) : '—';
+            return '<tr><td style="font-family:var(--font-mono);font-size:12px">#' + i.number + '</td><td style="font-size:13px">' + i.title + '</td><td><span class="state-badge ' + stateClass(i.state) + '">' + i.state + '</span></td><td style="font-size:12px;color:var(--ink-soft)">' + i.role + '</td><td style="font-family:var(--font-mono);font-size:11px;color:var(--ink-faint)">' + ts + '</td></tr>';
+          }).join('');
+        }
+      }
+
+      function populateIssueSelects() {
+        ['issue-detail-select', 'recovery-issue-select'].forEach(function(id) {
+          var sel = document.getElementById(id);
+          if (!sel) return;
+          while (sel.options.length > 1) sel.remove(1);
+          MOCK_ISSUES.forEach(function(i) {
+            var opt = document.createElement('option');
+            opt.value = String(i.number);
+            opt.textContent = '#' + i.number + ' · ' + i.title + ' (' + i.state + ')';
+            sel.appendChild(opt);
+          });
+        });
+      }
+
+      function renderIssueDetail(issueNumber) {
+        var issue = MOCK_ISSUES.filter(function(i) { return i.number === issueNumber; })[0];
+        var container = document.getElementById('issue-detail-content');
+        var progressionEl = document.getElementById('issue-detail-progression');
+        if (!container) return;
+        if (!issue) {
+          container.innerHTML = '<div style="color:var(--ink-faint);font-size:13px">Issue #' + issueNumber + ' not found.</div>';
+          return;
+        }
+        var roleIcons = { main_orchestrator: '🎯', issue_worker: '⚙️', pr_verifier: '🔍', release_worker: '🚀' };
+        var rows = issue.history.map(function(r) {
+          var statusClass = r.status === 'done' ? 'rs-done' : r.status === 'running' ? 'rs-running' : r.status === 'failed' ? 'rs-failed' : 'rs-pending';
+          var ts = r.ts ? r.ts.replace('T', ' ').slice(0, 16) : '—';
+          var summary = r.summary || '—';
+          return '<div class="role-row"><span class="role-name">' + (roleIcons[r.role] || '•') + ' ' + r.role + '</span><span class="role-status-tag ' + statusClass + '">' + r.status + '</span><span style="font-size:12px;color:var(--ink-soft)">' + summary + ' <span style="font-family:var(--font-mono);font-size:10px;color:var(--ink-faint)">' + ts + '</span></span></div>';
+        }).join('');
+        container.innerHTML = '<div class="panel"><div class="panel-head"><h3>#' + issue.number + ' — ' + issue.title + '</h3><span class="state-badge ' + stateClass(issue.state) + '">' + issue.state + '</span></div><div class="panel-body">' + rows + '</div></div>';
+        if (progressionEl) progressionEl.style.display = 'none';
+      }
+
+      function renderRecoveryAuditTrail() {
+        var container = document.getElementById('recovery-audit-trail');
+        if (!container) return;
+        if (recoveryAuditLog.length === 0) {
+          container.innerHTML = '<div style="color:var(--ink-faint);font-size:.82rem">尚無復原操作記錄。執行操作後此處將顯示 audit trail。</div>';
+          return;
+        }
+        container.innerHTML = recoveryAuditLog.slice().reverse().map(function(entry) {
+          return '<div class="event"><time>' + entry.ts + '</time><div><b>#' + entry.issue + ' ' + entry.action + '</b><p>reason: ' + entry.reason + ' · audit entry persisted.</p></div><span class="tag active">audit</span></div>';
+        }).join('');
+      }
+
+      var loadBtn = document.getElementById('issue-detail-load');
+      if (loadBtn) {
+        loadBtn.addEventListener('click', function() {
+          var sel = document.getElementById('issue-detail-select');
+          if (!sel || !sel.value) return;
+          renderIssueDetail(parseInt(sel.value, 10));
+        });
+      }
+
+      document.querySelectorAll('[data-recovery-action]').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          var issueInput = document.getElementById('recovery-issue-number');
+          var reasonInput = document.getElementById('recovery-reason-input');
+          var resultEl = document.getElementById('recovery-result');
+          var issueNum = issueInput ? issueInput.value.trim() : '';
+          var reason = reasonInput ? reasonInput.value.trim() : '';
+          var action = btn.getAttribute('data-recovery-action');
+          if (!issueNum) {
+            if (resultEl) resultEl.textContent = '請輸入 issue number。';
+            return;
+          }
+          if (!reason) {
+            if (resultEl) resultEl.textContent = '請輸入復原原因。';
+            return;
+          }
+          var now = new Date();
+          var ts = now.toISOString().replace('T', ' ').slice(0, 16);
+          recoveryAuditLog.push({ issue: issueNum, action: action, reason: reason, ts: ts });
+          renderRecoveryAuditTrail();
+          var cmdText = document.getElementById('recovery-cmd-text');
+          if (cmdText) {
+            cmdText.textContent = 'orchestrator_supervisor.py ' + action + ' --base-dir <project> --issue-number ' + issueNum + ' --reason "' + reason + '"';
+          }
+          if (resultEl) resultEl.textContent = '✓ Audit entry recorded for #' + issueNum + ' [' + action + ']';
+          if (issueInput) issueInput.value = '';
+          if (reasonInput) reasonInput.value = '';
+        });
+      });
+
+      renderRunDashboard();
+      populateIssueSelects();
+      renderRecoveryAuditTrail();
+    })();
   </script>
 </body>
 </html>

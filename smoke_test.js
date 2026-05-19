@@ -185,7 +185,7 @@ function runTests() {
       body: "Ship it",
     });
 
-    assert.deepEqual(command, [
+    assert.deepEqual(Array.from(command), [
       "gh",
       "pr",
       "review",
@@ -227,7 +227,7 @@ function runTests() {
     });
 
     assert.equal(recorded.length, 1);
-    assert.deepEqual(recorded[0], [
+    assert.deepEqual(Array.from(recorded[0]), [
       "gh",
       "pr",
       "review",
@@ -238,7 +238,7 @@ function runTests() {
       "--body",
       "Approved by operator",
     ]);
-    assert.deepEqual(result.reviewCommand, recorded[0]);
+    assert.deepEqual(Array.from(result.reviewCommand), Array.from(recorded[0]));
     assert.equal(result.releasePathState, "ready");
     assert.equal(result.releaseBlocked, false);
   });
