@@ -669,6 +669,41 @@
         };
       }
 
+      function normalizeOptionalString(value) {
+        if (value === null || value === undefined) {
+          return null;
+        }
+        var text = String(value).trim();
+        return text.length > 0 ? text : null;
+      }
+
+      function normalizeFlowRun(flowRun) {
+        var run = flowRun && typeof flowRun === "object" ? flowRun : {};
+        var uiScope = Boolean(run.ui_scope || run.uiScope);
+        var prototypeApproved = Boolean(run.prototype_approved);
+        var prototypeArtifactRef = normalizeOptionalString(run.prototype_artifact_ref);
+        var prototypeApprover = normalizeOptionalString(run.prototype_approver);
+        var prototypeApprovedAt = normalizeOptionalString(run.prototype_approved_at);
+        var prototypeGateDecision = run.prototype_gate_decision === "approved" ? "approved" : "blocked";
+
+        if (!uiScope || (prototypeApproved && prototypeArtifactRef)) {
+          prototypeGateDecision = "approved";
+        }
+
+        return {
+          flowRunId: normalizeOptionalString(run.flowRunId) || makeId("flow"),
+          repoId: normalizeOptionalString(run.repoId),
+          stage: normalizeOptionalString(run.stage) || "spec_pipeline",
+          createdAt: normalizeOptionalString(run.createdAt) || nowIso(),
+          ui_scope: uiScope,
+          prototype_approved: prototypeApproved,
+          prototype_artifact_ref: prototypeArtifactRef,
+          prototype_gate_decision: prototypeGateDecision,
+          prototype_approver: prototypeApprover,
+          prototype_approved_at: prototypeApprovedAt,
+        };
+      }
+
       function normalizeDb(raw) {
         if (!raw || typeof raw !== "object") {
           return { projects: [], activeRepoId: null, flowRuns: [] };
@@ -681,7 +716,7 @@
                 .map(normalizeProject)
             : [],
           activeRepoId: raw.activeRepoId ? String(raw.activeRepoId) : null,
-          flowRuns: Array.isArray(raw.flowRuns) ? raw.flowRuns : [],
+          flowRuns: Array.isArray(raw.flowRuns) ? raw.flowRuns.map(normalizeFlowRun) : [],
         };
       }
 
@@ -800,7 +835,7 @@
           return { checks: checks, canStartFlowRun: canStartFlowRun };
         }
 
-        function startFlowRun() {
+        function startFlowRun(options) {
           var gate = evaluateReadiness();
           if (!gate.canStartFlowRun) {
             throw new Error("Readiness gate failed. Fix checks before starting Flow Run.");
@@ -808,16 +843,141 @@
 
           var activeProject = getActiveProject();
           var db = readDb();
+          var opts = options && typeof options === "object" ? options : {};
+          var uiScope = Boolean(opts.ui_scope || opts.uiScope);
+          var prototypeApproved = Boolean(opts.prototype_approved);
+          var prototypeArtifactRef = normalizeOptionalString(opts.prototype_artifact_ref);
+          var prototypeApprover = normalizeOptionalString(opts.prototype_approver);
+          var prototypeApprovedAt = normalizeOptionalString(opts.prototype_approved_at);
+          var prototypeGateDecision = "approved";
+
+          if (uiScope && !(prototypeApproved && prototypeArtifactRef)) {
+            prototypeGateDecision = "blocked";
+          }
+
           var flowRun = {
             flowRunId: makeId("flow"),
             repoId: activeProject.repoId,
             stage: "spec_pipeline",
             createdAt: nowIso(),
+            ui_scope: uiScope,
+            prototype_approved: prototypeApproved,
+            prototype_artifact_ref: prototypeArtifactRef,
+            prototype_gate_decision: prototypeGateDecision,
+            prototype_approver: prototypeApprover,
+            prototype_approved_at: prototypeApprovedAt,
           };
 
-          db.flowRuns.push(flowRun);
+          db.flowRuns.push(normalizeFlowRun(flowRun));
+          writeDb(db);
+          return db.flowRuns[db.flowRuns.length - 1];
+        }
+
+        function getFlowRun(flowRunId) {
+          var db = readDb();
+          return db.flowRuns.find(function (flowRun) {
+            return flowRun.flowRunId === flowRunId;
+          }) || null;
+        }
+
+        function updatePrototypeGate(flowRun, updates) {
+          var next = normalizeFlowRun(flowRun);
+          var patch = updates && typeof updates === "object" ? updates : {};
+
+          if (Object.prototype.hasOwnProperty.call(patch, "ui_scope") || Object.prototype.hasOwnProperty.call(patch, "uiScope")) {
+            next.ui_scope = Boolean(patch.ui_scope || patch.uiScope);
+          }
+          if (Object.prototype.hasOwnProperty.call(patch, "prototype_approved")) {
+            next.prototype_approved = Boolean(patch.prototype_approved);
+          }
+          if (Object.prototype.hasOwnProperty.call(patch, "prototype_artifact_ref")) {
+            next.prototype_artifact_ref = normalizeOptionalString(patch.prototype_artifact_ref);
+          }
+          if (Object.prototype.hasOwnProperty.call(patch, "prototype_approver")) {
+            next.prototype_approver = normalizeOptionalString(patch.prototype_approver);
+          }
+          if (Object.prototype.hasOwnProperty.call(patch, "prototype_approved_at")) {
+            next.prototype_approved_at = normalizeOptionalString(patch.prototype_approved_at);
+          }
+
+          if (!next.ui_scope || (next.prototype_approved && next.prototype_artifact_ref)) {
+            next.prototype_gate_decision = "approved";
+          } else {
+            next.prototype_gate_decision = "blocked";
+          }
+
+          return next;
+        }
+
+        function advanceFlowRunStage(flowRunId, nextStage, updates) {
+          var targetStage = String(nextStage || "").trim();
+          if (!targetStage) {
+            throw new Error("nextStage is required.");
+          }
+
+          var db = readDb();
+          var runIndex = db.flowRuns.findIndex(function (flowRun) {
+            return flowRun.flowRunId === flowRunId;
+          });
+
+          if (runIndex < 0) {
+            throw new Error("Flow Run not found: " + flowRunId);
+          }
+
+          var flowRun = updatePrototypeGate(db.flowRuns[runIndex], updates);
+
+          if (targetStage === "issue-plan" && flowRun.ui_scope) {
+            if (!(flowRun.prototype_approved && flowRun.prototype_artifact_ref)) {
+              db.flowRuns[runIndex] = flowRun;
+              writeDb(db);
+              throw new Error("Prototype gate blocked. UI-scoped Flow Runs require prototype_approved=true and prototype_artifact_ref before issue-plan stage.");
+            }
+
+            flowRun.prototype_gate_decision = "approved";
+            if (!flowRun.prototype_approved_at) {
+              flowRun.prototype_approved_at = nowIso();
+            }
+          }
+
+          flowRun.stage = targetStage;
+          db.flowRuns[runIndex] = flowRun;
           writeDb(db);
           return flowRun;
+        }
+
+        function emitIssuePlanAcceptanceCriteria(flowRunId, criteria) {
+          var flowRun = getFlowRun(flowRunId);
+          if (!flowRun) {
+            throw new Error("Flow Run not found: " + flowRunId);
+          }
+
+          var list = Array.isArray(criteria) ? criteria : [];
+          var prototypeRef = normalizeOptionalString(flowRun.prototype_artifact_ref);
+
+          if (flowRun.ui_scope && !prototypeRef) {
+            throw new Error("UI-scoped Flow Run requires prototype_artifact_ref for issue acceptance criteria emission.");
+          }
+
+          return list.map(function (criterion, index) {
+            var item = criterion && typeof criterion === "object"
+              ? {
+                  id: normalizeOptionalString(criterion.id) || "AC-" + String(index + 1),
+                  text: normalizeOptionalString(criterion.text) || "",
+                }
+              : {
+                  id: "AC-" + String(index + 1),
+                  text: normalizeOptionalString(criterion) || "",
+                };
+
+            if (flowRun.ui_scope) {
+              item.prototype_ref = prototypeRef;
+              item.prototype_gate_decision = flowRun.prototype_gate_decision;
+              item.prototype_approver = flowRun.prototype_approver;
+              item.prototype_approved_at = flowRun.prototype_approved_at;
+            }
+
+            return item;
+          });
         }
 
         function getAllProjectsView() {
@@ -855,6 +1015,9 @@
           getActiveProject: getActiveProject,
           evaluateReadiness: evaluateReadiness,
           startFlowRun: startFlowRun,
+          getFlowRun: getFlowRun,
+          advanceFlowRunStage: advanceFlowRunStage,
+          emitIssuePlanAcceptanceCriteria: emitIssuePlanAcceptanceCriteria,
           getAllProjectsView: getAllProjectsView,
           triggerAllProjectsLifecycleAction: triggerAllProjectsLifecycleAction,
           getLifecycleEvents: getLifecycleEvents,
