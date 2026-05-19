@@ -1096,6 +1096,75 @@ def transition_issue_state(
     return updated or {}
 
 
+def claim_issue_if_ready(
+    base_dir: Path,
+    *,
+    issue_number: str,
+    command_id: str,
+    scheduler_id: str,
+    reason: str,
+    updated_at: str,
+) -> dict[str, Any]:
+    """Atomically claim an issue only when it is ready and unfenced.
+
+    This helper closes the read-then-write race by using a conditional UPDATE
+    (`state='ready' AND current_session_id=''`) inside a single transaction.
+    """
+
+    ensure_control_plane_db(base_dir)
+    with _connection(base_dir) as connection:
+        _ensure_issue_exists(connection, issue_number=issue_number, state="ready", updated_at=updated_at)
+        history_id = _append_history_entry(
+            connection,
+            issue_number=issue_number,
+            entry_type="state_transition",
+            created_at=updated_at,
+            command_id=command_id,
+            from_state="ready",
+            to_state="claimed",
+            summary=reason,
+            status="claimed",
+            payload={"decision_type": "state_transition", "scheduler_id": scheduler_id},
+            unique_key=f"state-transition:{command_id}",
+        )
+        cursor = connection.execute(
+            """
+            UPDATE issues
+               SET state = 'claimed',
+                   claimed_at = ?,
+                   last_command_id = ?,
+                   last_event_at = ?,
+                   updated_at = ?
+             WHERE issue_number = ?
+               AND state = 'ready'
+               AND current_session_id = ''
+            """,
+            (updated_at, command_id, updated_at, updated_at, issue_number),
+        )
+        if cursor.rowcount != 1:
+            current = _read_issue_row(connection, issue_number) or {}
+            actual_state = str(current.get("state") or "ready")
+            current_session_id = str(current.get("current_session_id") or "")
+            if current_session_id:
+                raise ValueError(
+                    f"issue #{issue_number} still has an active current session fence; refusing duplicate start."
+                )
+            raise ValueError(
+                f"issue #{issue_number} expected state 'ready', found {actual_state!r}; refusing duplicate start."
+            )
+        _record_latest_ref(
+            connection,
+            issue_number=issue_number,
+            entry_type="state_transition",
+            history_id=history_id,
+            created_at=updated_at,
+            command_id=command_id,
+            status="claimed",
+        )
+        claimed = _read_issue_row(connection, issue_number)
+    return claimed or {}
+
+
 def upsert_issue_state(
     base_dir: Path,
     *,

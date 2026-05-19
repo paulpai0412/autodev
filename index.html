@@ -676,6 +676,7 @@
         </div>
         <div>
           <div class="nav-title">Runtime</div>
+          <button class="nav-item" type="button" data-screen-target="policy">Run Policy <span class="badge">preset</span></button>
           <button class="nav-item" type="button" data-screen-target="run">執行儀表板 <span class="badge">即時</span></button>
           <button class="nav-item" type="button" data-screen-target="issue-detail">Issue Detail <span class="badge">角色進展</span></button>
           <button class="nav-item active" type="button" data-screen-target="release">PR 審核佇列 <span class="badge">2</span></button>
@@ -828,6 +829,51 @@
             <div class="validation-note" id="issue-plan-validation"></div>
           </section>
 
+          <section class="screen" id="screen-policy" data-eyebrow="Run Policy" data-title="Run Policy 決定容量與審核行為，且可被稽核。" data-copy="先選 preset，再用 advanced overrides 微調。每次儲存都會寫入審計紀錄，且只作用於目前 Flow Run。">
+            <div class="two-col">
+              <div class="panel">
+                <div class="panel-head"><h3>Preset Selection</h3><span>policy baseline</span></div>
+                <div class="panel-body">
+                  <div class="field-row" style="grid-template-columns: 1fr auto;">
+                    <select id="policy-preset-select" aria-label="Run policy preset"></select>
+                    <button class="btn" id="policy-apply-preset" type="button">套用 preset</button>
+                  </div>
+                  <p class="mini-note" id="policy-current-preset-note">尚未啟動 Flow Run。</p>
+                </div>
+              </div>
+              <div class="panel">
+                <div class="panel-head"><h3>Advanced Overrides</h3><span>capacity + approval</span></div>
+                <div class="panel-body">
+                  <div class="field-row" style="grid-template-columns: 1fr 120px;">
+                    <label for="policy-max-concurrency">max_concurrency</label>
+                    <input id="policy-max-concurrency" type="number" min="1" step="1" aria-label="Max concurrency">
+                  </div>
+                  <div class="field-row" style="grid-template-columns: 1fr 120px;">
+                    <label for="policy-approval-required">approval_required</label>
+                    <select id="policy-approval-required" aria-label="Approval required">
+                      <option value="true">true</option>
+                      <option value="false">false</option>
+                    </select>
+                  </div>
+                  <div class="field-row" style="grid-template-columns: 1fr auto;">
+                    <input id="policy-save-reason" placeholder="儲存原因（選填）" aria-label="Policy save reason">
+                    <button class="btn primary" id="policy-save" type="button">儲存 policy</button>
+                  </div>
+                  <p class="mini-note" id="policy-save-result"></p>
+                </div>
+              </div>
+            </div>
+
+            <div class="panel" style="margin-top:14px">
+              <div class="panel-head"><h3>Runtime Env Mapping</h3><span>deterministic</span></div>
+              <div class="panel-body" id="policy-runtime-env"></div>
+            </div>
+
+            <div class="panel" style="margin-top:14px">
+              <div class="panel-head"><h3>Policy Audit Log</h3><span>flow-run scoped</span></div>
+              <div class="panel-body" id="policy-audit-log"></div>
+            </div>
+          </section>
           <!-- AC1: Run Dashboard — active issue state, KPI summaries, intervention-needed signals -->
           <section class="screen" id="screen-run" data-eyebrow="Run Dashboard" data-title="執行儀表板只呈現決策需要的訊號。" data-copy="從 DB-only control plane 讀取 issue/session/release 狀態，避免讓畫面變成無限聊天紀錄。">
             <div class="metric-row" id="run-kpi-row">
@@ -938,6 +984,39 @@
     (function () {
       var APP_DB_KEY = "control-tower-registry.v1";
       var SPEC_PIPELINE_STAGES = ["clarify", "prd", "issue-plan"];
+      var RUN_POLICY_PRESETS = [
+        {
+          id: "sequential",
+          label: "Sequential",
+          defaults: {
+            max_concurrency: 1,
+            release_capacity: 1,
+            release_backfill_mode: "manual",
+            approval_required: true,
+          },
+        },
+        {
+          id: "parallel",
+          label: "Parallel",
+          defaults: {
+            max_concurrency: 3,
+            release_capacity: 2,
+            release_backfill_mode: "auto",
+            approval_required: false,
+          },
+        },
+        {
+          id: "capped",
+          label: "Capped",
+          defaults: {
+            max_concurrency: 2,
+            release_capacity: 1,
+            release_backfill_mode: "auto",
+            approval_required: true,
+          },
+        },
+      ];
+      var DEFAULT_RUN_POLICY_PRESET_ID = "capped";
 
       function nowIso() {
         return new Date().toISOString();
@@ -952,6 +1031,130 @@
           return null;
         }
         return String(value);
+      }
+
+      function clonePlain(value) {
+        return JSON.parse(JSON.stringify(value));
+      }
+
+      function getRunPolicyPresetById(presetId) {
+        var targetId = String(presetId || "").trim();
+        var found = RUN_POLICY_PRESETS.find(function (preset) {
+          return preset.id === targetId;
+        });
+        return found || RUN_POLICY_PRESETS.find(function (preset) {
+          return preset.id === DEFAULT_RUN_POLICY_PRESET_ID;
+        }) || RUN_POLICY_PRESETS[0];
+      }
+
+      function parsePositiveInteger(value, fallback) {
+        var parsed = Number(value);
+        if (!Number.isFinite(parsed)) {
+          return fallback;
+        }
+        var rounded = Math.floor(parsed);
+        if (rounded < 1) {
+          return fallback;
+        }
+        return rounded;
+      }
+
+      function parseBooleanOrNull(value) {
+        var normalized;
+        if (value === true || value === false) {
+          return value;
+        }
+        if (typeof value === "string") {
+          normalized = value.trim().toLowerCase();
+          if (normalized === "true") {
+            return true;
+          }
+          if (normalized === "false") {
+            return false;
+          }
+        }
+        return null;
+      }
+
+      function normalizeRunPolicyOverrides(rawOverrides) {
+        var source = rawOverrides && typeof rawOverrides === "object" ? rawOverrides : {};
+        var overrides = {};
+        var parsedApproval;
+
+        if (Object.prototype.hasOwnProperty.call(source, "max_concurrency")) {
+          overrides.max_concurrency = parsePositiveInteger(source.max_concurrency, null);
+        }
+        if (Object.prototype.hasOwnProperty.call(source, "approval_required")) {
+          parsedApproval = parseBooleanOrNull(source.approval_required);
+          if (parsedApproval !== null) {
+            overrides.approval_required = parsedApproval;
+          }
+        }
+
+        return overrides;
+      }
+
+      function normalizeRunPolicyState(raw) {
+        var source = raw && typeof raw === "object" ? raw : {};
+        var preset = getRunPolicyPresetById(source.preset_id);
+        return {
+          preset_id: preset.id,
+          overrides: normalizeRunPolicyOverrides(source.overrides),
+        };
+      }
+
+      function resolveRunPolicy(runPolicy) {
+        var normalized = normalizeRunPolicyState(runPolicy);
+        var preset = getRunPolicyPresetById(normalized.preset_id);
+        var resolved = {
+          max_concurrency: preset.defaults.max_concurrency,
+          release_capacity: preset.defaults.release_capacity,
+          release_backfill_mode: preset.defaults.release_backfill_mode,
+          approval_required: preset.defaults.approval_required,
+        };
+        var parsedApproval;
+
+        if (Object.prototype.hasOwnProperty.call(normalized.overrides, "max_concurrency")) {
+          resolved.max_concurrency = parsePositiveInteger(
+            normalized.overrides.max_concurrency,
+            resolved.max_concurrency,
+          );
+        }
+        if (Object.prototype.hasOwnProperty.call(normalized.overrides, "approval_required")) {
+          parsedApproval = parseBooleanOrNull(normalized.overrides.approval_required);
+          if (parsedApproval !== null) {
+            resolved.approval_required = parsedApproval;
+          }
+        }
+
+        return resolved;
+      }
+
+      function mapRunPolicyToRuntimeEnv(runPolicy) {
+        var resolved = resolveRunPolicy(runPolicy);
+        return {
+          AUTODEV_DEVELOPMENT_CAPACITY: String(resolved.max_concurrency),
+          AUTODEV_RELEASE_CAPACITY: String(resolved.release_capacity),
+          AUTODEV_RELEASE_BACKFILL_MODE: resolved.release_backfill_mode,
+          AUTODEV_AUTO_RELEASE_APPROVAL_MODE: resolved.approval_required ? "human_required" : "bypass_approval",
+          MAX_CONCURRENCY: String(resolved.max_concurrency),
+          APPROVAL_REQUIRED: String(resolved.approval_required),
+        };
+      }
+
+      function diffRuntimeEnv(previous, next) {
+        var before = previous && typeof previous === "object" ? previous : {};
+        var after = next && typeof next === "object" ? next : {};
+        var keys = Object.keys(after);
+        var changedKeys = keys.filter(function (key) {
+          return before[key] !== after[key];
+        });
+
+        return {
+          changed_keys: changedKeys,
+          before: before,
+          after: after,
+        };
       }
 
       function normalizeProject(project) {
@@ -1015,6 +1218,44 @@
                      prototype_approved_at: prototypeApprovedAt,
                      approval_queue: approvalQueue,
                      approving_identity: approvingIdentity,
+                     run_policy: normalizeRunPolicyState(flowRun.run_policy),
+                     run_policy_last_saved_env:
+                       flowRun.run_policy_last_saved_env && typeof flowRun.run_policy_last_saved_env === "object"
+                        ? clonePlain(flowRun.run_policy_last_saved_env)
+                        : mapRunPolicyToRuntimeEnv(normalizeRunPolicyState(flowRun.run_policy)),
+                    run_policy_audit: Array.isArray(flowRun.run_policy_audit)
+                      ? flowRun.run_policy_audit
+                          .filter(function (entry) { return entry && entry.audit_id; })
+                          .map(function (entry) {
+                            return {
+                              audit_id: String(entry.audit_id),
+                              flowRunId: String(entry.flowRunId || flowRun.flowRunId),
+                              saved_at: String(entry.saved_at || nowIso()),
+                              actor: normalizeOptionalString(entry.actor),
+                              reason: normalizeOptionalString(entry.reason),
+                              runtime_env:
+                                entry.runtime_env && typeof entry.runtime_env === "object"
+                                  ? clonePlain(entry.runtime_env)
+                                  : {},
+                              diff:
+                                entry.diff && typeof entry.diff === "object"
+                                  ? {
+                                      changed_keys: Array.isArray(entry.diff.changed_keys)
+                                        ? entry.diff.changed_keys.map(function (key) { return String(key); })
+                                        : [],
+                                      before:
+                                        entry.diff.before && typeof entry.diff.before === "object"
+                                          ? clonePlain(entry.diff.before)
+                                          : {},
+                                      after:
+                                        entry.diff.after && typeof entry.diff.after === "object"
+                                          ? clonePlain(entry.diff.after)
+                                          : {},
+                                     }
+                                   : { changed_keys: [], before: {}, after: {} },
+                             };
+                           })
+                       : [],
                    };
                  })
             : [],
@@ -1793,11 +2034,112 @@
             prototype_approved_at: prototypeApprovedAt,
             approval_queue: approvalQueue,
             approving_identity: approvingIdentity,
+            run_policy: normalizeRunPolicyState({ preset_id: DEFAULT_RUN_POLICY_PRESET_ID }),
+            run_policy_last_saved_env: mapRunPolicyToRuntimeEnv(
+              normalizeRunPolicyState({ preset_id: DEFAULT_RUN_POLICY_PRESET_ID }),
+            ),
+            run_policy_audit: [],
           };
 
           db.flowRuns.push(flowRun);
           writeDb(db);
           return db.flowRuns[db.flowRuns.length - 1];
+        }
+
+        function getRunPolicyPresets() {
+          return RUN_POLICY_PRESETS.map(function (preset) {
+            return {
+              id: preset.id,
+              label: preset.label,
+              defaults: clonePlain(preset.defaults),
+            };
+          });
+        }
+
+        function getRunPolicy(flowRunId) {
+          var found = findFlowRun(flowRunId);
+          var flowRun = found.flowRun;
+          var runPolicy = normalizeRunPolicyState(flowRun.run_policy);
+          return {
+            flowRunId: flowRun.flowRunId,
+            preset_id: runPolicy.preset_id,
+            overrides: clonePlain(runPolicy.overrides),
+            resolved: resolveRunPolicy(runPolicy),
+            runtime_env: mapRunPolicyToRuntimeEnv(runPolicy),
+          };
+        }
+
+        function selectRunPolicyPreset(flowRunId, presetId) {
+          var found = findFlowRun(flowRunId);
+          var db = found.db;
+          var flowRun = found.flowRun;
+          var preset = getRunPolicyPresetById(presetId);
+          flowRun.run_policy = normalizeRunPolicyState({
+            preset_id: preset.id,
+            overrides: flowRun.run_policy ? flowRun.run_policy.overrides : {},
+          });
+          saveFlowRun(db, flowRun);
+          return getRunPolicy(flowRunId);
+        }
+
+        function updateRunPolicyOverrides(flowRunId, overrides) {
+          var found = findFlowRun(flowRunId);
+          var db = found.db;
+          var flowRun = found.flowRun;
+          var runPolicy = normalizeRunPolicyState(flowRun.run_policy);
+          var incoming = normalizeRunPolicyOverrides(overrides);
+          runPolicy.overrides = Object.assign({}, runPolicy.overrides, incoming);
+          flowRun.run_policy = runPolicy;
+          saveFlowRun(db, flowRun);
+          return getRunPolicy(flowRunId);
+        }
+
+        function listRunPolicyAudit(flowRunId) {
+          var found = findFlowRun(flowRunId);
+          var flowRun = found.flowRun;
+          var audit = Array.isArray(flowRun.run_policy_audit) ? flowRun.run_policy_audit : [];
+          return audit
+            .slice()
+            .sort(function (a, b) {
+              return String(a.saved_at).localeCompare(String(b.saved_at));
+            })
+            .map(function (entry) { return clonePlain(entry); });
+        }
+
+        function saveRunPolicy(flowRunId, metadata) {
+          var found = findFlowRun(flowRunId);
+          var db = found.db;
+          var flowRun = found.flowRun;
+          var meta = metadata && typeof metadata === "object" ? metadata : {};
+          var runPolicy = normalizeRunPolicyState(flowRun.run_policy);
+          var runtimeEnv = mapRunPolicyToRuntimeEnv(runPolicy);
+          var previousEnv = flowRun.run_policy_last_saved_env || {};
+          var auditEntry = {
+            audit_id: makeId("policy-audit"),
+            flowRunId: flowRun.flowRunId,
+            saved_at: nowIso(),
+            actor: normalizeOptionalString(meta.actor),
+            reason: normalizeOptionalString(meta.reason),
+            runtime_env: clonePlain(runtimeEnv),
+            diff: diffRuntimeEnv(previousEnv, runtimeEnv),
+          };
+
+          if (!Array.isArray(flowRun.run_policy_audit)) {
+            flowRun.run_policy_audit = [];
+          }
+          flowRun.run_policy_audit.push(auditEntry);
+          flowRun.run_policy_last_saved_env = clonePlain(runtimeEnv);
+          flowRun.run_policy = runPolicy;
+          saveFlowRun(db, flowRun);
+
+          return {
+            flowRunId: flowRun.flowRunId,
+            preset_id: runPolicy.preset_id,
+            overrides: clonePlain(runPolicy.overrides),
+            resolved: resolveRunPolicy(runPolicy),
+            runtime_env: runtimeEnv,
+            audit_entry: clonePlain(auditEntry),
+          };
         }
 
         function getFlowRun(flowRunId) {
@@ -2301,6 +2643,12 @@
           appendFlowRunEvent: appendFlowRunEvent,
           openFlowRunSocket: openFlowRunSocket,
           createFlowRunFromOrchestration: createFlowRunFromOrchestration,
+          getRunPolicyPresets: getRunPolicyPresets,
+          getRunPolicy: getRunPolicy,
+          selectRunPolicyPreset: selectRunPolicyPreset,
+          updateRunPolicyOverrides: updateRunPolicyOverrides,
+          saveRunPolicy: saveRunPolicy,
+          listRunPolicyAudit: listRunPolicyAudit,
           getSpecPipelineStatus: getSpecPipelineStatus,
           addBlockingQuestion: addBlockingQuestion,
           resolveBlockingQuestion: resolveBlockingQuestion,
@@ -2317,6 +2665,7 @@
       var exportsObject = {
         APP_DB_KEY: APP_DB_KEY,
         createControlTowerApp: createControlTowerApp,
+        mapRunPolicyToRuntimeEnv: mapRunPolicyToRuntimeEnv,
       };
 
       if (typeof module !== "undefined" && module.exports) {
@@ -2402,6 +2751,16 @@
       const issuePlanLaneSummary = document.getElementById('issue-plan-lane-summary');
       const issuePlanLanes = document.getElementById('issue-plan-lanes');
       const issuePlanValidation = document.getElementById('issue-plan-validation');
+      const policyPresetSelect = document.getElementById('policy-preset-select');
+      const policyApplyPreset = document.getElementById('policy-apply-preset');
+      const policyCurrentPresetNote = document.getElementById('policy-current-preset-note');
+      const policyMaxConcurrency = document.getElementById('policy-max-concurrency');
+      const policyApprovalRequired = document.getElementById('policy-approval-required');
+      const policySaveReason = document.getElementById('policy-save-reason');
+      const policySave = document.getElementById('policy-save');
+      const policySaveResult = document.getElementById('policy-save-result');
+      const policyRuntimeEnv = document.getElementById('policy-runtime-env');
+      const policyAuditLog = document.getElementById('policy-audit-log');
       let activeFlowRunId = null;
 
       const issuePlanSource = [
@@ -2695,6 +3054,77 @@
         renderSpecPipeline();
         renderApprovalQueue();
         renderIssuePlan();
+        renderRunPolicy();
+      };
+
+      const renderRunPolicy = () => {
+        const presets = app.getRunPolicyPresets();
+        policyPresetSelect.innerHTML = '';
+
+        presets.forEach((preset) => {
+          const option = document.createElement('option');
+          option.value = preset.id;
+          option.textContent = `${preset.label} (${preset.id})`;
+          policyPresetSelect.appendChild(option);
+        });
+
+        if (!activeFlowRunId) {
+          policyCurrentPresetNote.textContent = '尚未啟動 Flow Run。';
+          policyRuntimeEnv.innerHTML = '<div class="mini-note">啟動 Flow Run 後會顯示 env mapping。</div>';
+          policyAuditLog.innerHTML = '<div class="mini-note">尚無審計紀錄。</div>';
+          [
+            policyPresetSelect,
+            policyApplyPreset,
+            policyMaxConcurrency,
+            policyApprovalRequired,
+            policySaveReason,
+            policySave,
+          ].forEach((element) => {
+            element.disabled = true;
+          });
+          return;
+        }
+
+        const policy = app.getRunPolicy(activeFlowRunId);
+        policyPresetSelect.value = policy.preset_id;
+        policyMaxConcurrency.value = String(policy.resolved.max_concurrency);
+        policyApprovalRequired.value = String(policy.resolved.approval_required);
+        policyCurrentPresetNote.textContent = `preset: ${policy.preset_id} · 目前 Flow Run: ${activeFlowRunId}`;
+
+        policyRuntimeEnv.innerHTML = '';
+        Object.entries(policy.runtime_env).forEach(([key, value]) => {
+          const row = document.createElement('div');
+          row.className = 'check-item';
+          row.innerHTML = `<strong>${key}</strong><span class="tag info">${String(value)}</span>`;
+          policyRuntimeEnv.appendChild(row);
+        });
+
+        const audits = app.listRunPolicyAudit(activeFlowRunId);
+        policyAuditLog.innerHTML = '';
+        if (audits.length === 0) {
+          policyAuditLog.innerHTML = '<div class="mini-note">尚無審計紀錄。</div>';
+        } else {
+          audits.slice().reverse().forEach((entry) => {
+            const row = document.createElement('div');
+            row.className = 'check-item';
+            const changed = entry.diff.changed_keys.length > 0
+              ? entry.diff.changed_keys.join(', ')
+              : 'none';
+            row.innerHTML = `<div><strong>${entry.saved_at}</strong><div class="project-meta">actor: ${entry.actor || 'unknown'} · changed: ${changed}</div></div><span class="tag active">${entry.flowRunId}</span>`;
+            policyAuditLog.appendChild(row);
+          });
+        }
+
+        [
+          policyPresetSelect,
+          policyApplyPreset,
+          policyMaxConcurrency,
+          policyApprovalRequired,
+          policySaveReason,
+          policySave,
+        ].forEach((element) => {
+          element.disabled = false;
+        });
       };
 
       const renderIssuePlan = () => {
@@ -2870,6 +3300,35 @@
         }
 
         renderSpecPipeline();
+      });
+
+      policyApplyPreset.addEventListener('click', () => {
+        if (!activeFlowRunId) {
+          return;
+        }
+
+        app.selectRunPolicyPreset(activeFlowRunId, policyPresetSelect.value);
+        policySaveResult.textContent = 'preset 已套用，尚未寫入 audit。';
+        renderRunPolicy();
+      });
+
+      policySave.addEventListener('click', () => {
+        if (!activeFlowRunId) {
+          return;
+        }
+
+        const parsedConcurrency = Number(policyMaxConcurrency.value);
+        app.updateRunPolicyOverrides(activeFlowRunId, {
+          max_concurrency: Number.isFinite(parsedConcurrency) ? parsedConcurrency : null,
+          approval_required: policyApprovalRequired.value === 'true',
+        });
+        app.saveRunPolicy(activeFlowRunId, {
+          actor: 'ui-operator',
+          reason: policySaveReason.value.trim() || null,
+        });
+        policySaveReason.value = '';
+        policySaveResult.textContent = 'policy 已儲存並寫入 audit。';
+        renderRunPolicy();
       });
     }
 

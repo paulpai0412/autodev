@@ -572,6 +572,114 @@ function runTests() {
     });
   });
 
+  test("AC3: run policy supports preset selection and advanced overrides", () => {
+    const app = createControlTowerApp({
+      storage: createMemoryStorage(),
+      env: {
+        githubToken: "ghp_demo",
+        runtimePathExists: true,
+        runtimeConfigExists: true,
+      },
+    });
+
+    app.registerProject({ repoId: "acme/alpha", displayName: "Alpha" });
+    app.switchActiveProject("acme/alpha");
+    const flowRun = app.startFlowRun();
+
+    const presets = app.getRunPolicyPresets();
+    assert.equal(Array.isArray(presets), true);
+    assert.equal(presets.length >= 3, true);
+
+    app.selectRunPolicyPreset(flowRun.flowRunId, "capped");
+    app.updateRunPolicyOverrides(flowRun.flowRunId, {
+      max_concurrency: 5,
+      approval_required: true,
+    });
+
+    const policy = app.getRunPolicy(flowRun.flowRunId);
+    assert.equal(policy.preset_id, "capped");
+    assert.equal(policy.resolved.max_concurrency, 5);
+    assert.equal(policy.resolved.approval_required, true);
+  });
+
+  test("AC4: saved run policy maps deterministically to runtime env/config inputs", () => {
+    const app = createControlTowerApp({
+      storage: createMemoryStorage(),
+      env: {
+        githubToken: "ghp_demo",
+        runtimePathExists: true,
+        runtimeConfigExists: true,
+      },
+    });
+
+    app.registerProject({ repoId: "acme/alpha", displayName: "Alpha" });
+    app.switchActiveProject("acme/alpha");
+    const flowRun = app.startFlowRun();
+
+    app.selectRunPolicyPreset(flowRun.flowRunId, "parallel");
+    app.updateRunPolicyOverrides(flowRun.flowRunId, {
+      max_concurrency: 4,
+      approval_required: false,
+    });
+
+    const saved = app.saveRunPolicy(flowRun.flowRunId, {
+      actor: "operator-1",
+      reason: "Need faster throughput",
+    });
+
+    assert.deepEqual(toPlain(saved.runtime_env), {
+      AUTODEV_DEVELOPMENT_CAPACITY: "4",
+      AUTODEV_RELEASE_CAPACITY: "2",
+      AUTODEV_RELEASE_BACKFILL_MODE: "auto",
+      AUTODEV_AUTO_RELEASE_APPROVAL_MODE: "bypass_approval",
+      MAX_CONCURRENCY: "4",
+      APPROVAL_REQUIRED: "false",
+    });
+  });
+
+  test("AC5: policy saves append audit entries and remain scoped to target flow run", () => {
+    const app = createControlTowerApp({
+      storage: createMemoryStorage(),
+      env: {
+        githubToken: "ghp_demo",
+        runtimePathExists: true,
+        runtimeConfigExists: true,
+      },
+    });
+
+    app.registerProject({ repoId: "acme/alpha", displayName: "Alpha" });
+    app.switchActiveProject("acme/alpha");
+
+    const flowRunA = app.startFlowRun();
+    const flowRunB = app.startFlowRun();
+
+    app.selectRunPolicyPreset(flowRunA.flowRunId, "sequential");
+    app.updateRunPolicyOverrides(flowRunA.flowRunId, {
+      max_concurrency: 1,
+      approval_required: true,
+    });
+    const saveA = app.saveRunPolicy(flowRunA.flowRunId, { actor: "operator-1" });
+
+    app.selectRunPolicyPreset(flowRunB.flowRunId, "parallel");
+    app.updateRunPolicyOverrides(flowRunB.flowRunId, {
+      max_concurrency: 3,
+      approval_required: false,
+    });
+    app.saveRunPolicy(flowRunB.flowRunId, { actor: "operator-2" });
+
+    const auditA = app.listRunPolicyAudit(flowRunA.flowRunId);
+    const auditB = app.listRunPolicyAudit(flowRunB.flowRunId);
+
+    assert.equal(auditA.length, 1);
+    assert.equal(auditB.length, 1);
+    assert.equal(auditA[0].flowRunId, flowRunA.flowRunId);
+    assert.equal(auditB[0].flowRunId, flowRunB.flowRunId);
+    assert.equal(typeof auditA[0].saved_at, "string");
+    assert.equal(Array.isArray(auditA[0].diff.changed_keys), true);
+    assert.equal(auditA[0].diff.changed_keys.includes("MAX_CONCURRENCY"), true);
+    assert.equal(saveA.audit_entry.flowRunId, flowRunA.flowRunId);
+  });
+
   test("existing behavior: all-projects view remains read-only", () => {
     const app = createControlTowerApp({
       storage: createMemoryStorage(),

@@ -38,6 +38,7 @@ from scripts.control_plane_db import (
     transition_issue_state,
     upsert_issue_state,
     upsert_issue_ranking,
+    claim_issue_if_ready,
 )
 
 
@@ -114,6 +115,43 @@ def test_transition_issue_state_records_issue_and_history(tmp_path: Path):
     assert decision["to_state"] == "claimed"
     assert latest_history is not None
     assert latest_history["command_id"] == "cmd-1"
+
+
+def test_claim_issue_if_ready_is_atomic_and_rejects_second_claim(tmp_path: Path):
+    ensure_control_plane_db(tmp_path)
+
+    first = claim_issue_if_ready(
+        tmp_path,
+        issue_number="42",
+        command_id="cmd-claim-1",
+        scheduler_id="scheduler:test",
+        reason="claim once",
+        updated_at="2026-05-11T10:00:00+08:00",
+    )
+
+    assert first["state"] == "claimed"
+
+    try:
+        _ = claim_issue_if_ready(
+            tmp_path,
+            issue_number="42",
+            command_id="cmd-claim-2",
+            scheduler_id="scheduler:test",
+            reason="claim twice",
+            updated_at="2026-05-11T10:00:01+08:00",
+        )
+    except ValueError as error:
+        assert "expected state 'ready'" in str(error)
+    else:
+        raise AssertionError("expected second claim to fail")
+
+    issue = read_issue(tmp_path, "42")
+    latest_history = read_latest_issue_history(tmp_path, "42", entry_type="state_transition")
+    assert issue is not None
+    assert issue["state"] == "claimed"
+    assert issue["last_command_id"] == "cmd-claim-1"
+    assert latest_history is not None
+    assert latest_history["command_id"] == "cmd-claim-1"
 
 
 def test_append_issue_event_is_deduplicated_by_event_id_and_session_seq(tmp_path: Path):
