@@ -669,7 +669,7 @@
       <aside class="sidebar">
         <div>
           <div class="nav-title">Plan</div>
-          <button class="nav-item active" type="button" data-screen-target="flow">一條龍總覽 <span class="badge">首頁</span></button>
+          <button class="nav-item" type="button" data-screen-target="flow">一條龍總覽 <span class="badge">首頁</span></button>
           <button class="nav-item" type="button" data-screen-target="prd">PRD × Issue <span class="badge">14</span></button>
           <button class="nav-item" type="button" data-screen-target="gate">準備度關卡 <span class="badge">通過</span></button>
           <button class="nav-item" type="button" data-screen-target="issues">Issue Plan <span class="badge">DAG</span></button>
@@ -678,7 +678,7 @@
           <div class="nav-title">Runtime</div>
           <button class="nav-item" type="button" data-screen-target="run">執行儀表板 <span class="badge">即時</span></button>
           <button class="nav-item" type="button" data-screen-target="issue-detail">Issue Detail <span class="badge">角色進展</span></button>
-          <button class="nav-item" type="button" data-screen-target="release">PR 審核佇列 <span class="badge">2</span></button>
+          <button class="nav-item active" type="button" data-screen-target="release">PR 審核佇列 <span class="badge">2</span></button>
           <button class="nav-item" type="button" data-screen-target="recovery">復原中心 <span class="badge">1</span></button>
         </div>
         <div class="policy-note"><h3>Balanced Auto</h3><p>開發容量 2、Release 容量 1。PR 合併前仍需要人工確認 GitHub Review 身份。</p></div>
@@ -687,7 +687,7 @@
       <section class="stage">
         <div class="stage-header"><div><div class="eyebrow" id="screen-eyebrow">Flow Overview</div><h2 id="screen-title">從需求到 Release 的一條龍開發控制塔。</h2><p id="screen-copy">把 PRD 需求、Issue todo、執行狀態與審核關卡放在同一個畫面，讓技術操作者可以同時掌握功能範圍與交付進度。</p></div><div class="top-actions"><button class="btn" type="button">重新整理 DB</button><button class="btn clay" type="button">Reconcile</button></div></div>
         <div class="screen-wrap">
-          <section class="screen active" id="screen-flow" data-eyebrow="Flow Overview" data-title="從需求到 Release 的一條龍開發控制塔。" data-copy="把 PRD 需求、Issue todo、執行狀態與審核關卡放在同一個畫面，讓技術操作者可以同時掌握功能範圍與交付進度。">
+          <section class="screen" id="screen-flow" data-eyebrow="Flow Overview" data-title="從需求到 Release 的一條龍開發控制塔。" data-copy="把 PRD 需求、Issue todo、執行狀態與審核關卡放在同一個畫面，讓技術操作者可以同時掌握功能範圍與交付進度。">
             <div class="flow-rail">
               <div class="flow-step"><span class="step-no">01</span><h3>專案初始化</h3><p>綁定 repo、GitHub、runtime DB 與 host adapter。</p></div>
               <div class="flow-step"><span class="step-no">02</span><h3>需求釐清</h3><p>透過對話收斂 domain language 與問題邊界。</p></div>
@@ -871,7 +871,7 @@
             </div>
           </section>
 
-          <section class="screen" id="screen-release" data-eyebrow="PR Approval Queue" data-title="PR 審核佇列把 Release gate 留在 Control Tower 裡。" data-copy="操作者可以確認 verifier evidence、GitHub checks 與本地 approval identity，再送出 GitHub-native review approval。">
+          <section class="screen active" id="screen-release" data-eyebrow="PR Approval Queue" data-title="PR 審核佇列把 Release gate 留在 Control Tower 裡。" data-copy="操作者可以確認 verifier evidence、GitHub checks 與本地 approval identity，再送出 GitHub-native review approval。">
             <div class="approval-identity">
               <img class="approval-avatar" id="approval-identity-avatar" alt="GitHub avatar" src="">
               <div>
@@ -2336,22 +2336,31 @@
     const title = document.getElementById('screen-title');
     const copy = document.getElementById('screen-copy');
 
+    const setActiveScreen = (target) => {
+      const screen = document.getElementById(`screen-${target}`);
+      if (!screen) return;
+
+      document.querySelectorAll('.nav-item').forEach((item) => {
+        item.classList.toggle('active', item.dataset.screenTarget === target);
+      });
+      screens.forEach((item) => {
+        item.classList.toggle('active', item.id === `screen-${target}`);
+      });
+      eyebrow.textContent = screen.dataset.eyebrow;
+      title.textContent = screen.dataset.title;
+      copy.textContent = screen.dataset.copy;
+    };
+
     buttons.forEach((button) => {
       button.addEventListener('click', () => {
-        const target = button.dataset.screenTarget;
-        const screen = document.getElementById(`screen-${target}`);
-        if (!screen) return;
-        document.querySelectorAll('.nav-item').forEach((item) => {
-          item.classList.toggle('active', item.dataset.screenTarget === target);
-        });
-        screens.forEach((item) => {
-          item.classList.toggle('active', item.id === `screen-${target}`);
-        });
-        eyebrow.textContent = screen.dataset.eyebrow;
-        title.textContent = screen.dataset.title;
-        copy.textContent = screen.dataset.copy;
+        setActiveScreen(button.dataset.screenTarget);
       });
     });
+
+    const initiallyActive = document.querySelector('.screen.active');
+    if (initiallyActive && initiallyActive.id.startsWith('screen-')) {
+      setActiveScreen(initiallyActive.id.replace('screen-', ''));
+    }
 
     document.getElementById('tweak-toggle').addEventListener('click', () => document.getElementById('tweaks').classList.toggle('open'));
     document.getElementById('tone').addEventListener('change', (event) => document.body.classList.toggle('deep', event.target.value === 'deep'));
@@ -2415,6 +2424,34 @@
         app.registerProject({ repoId: 'paulpai0412/autodev', displayName: 'Autodev' });
         app.registerProject({ repoId: 'paulpai0412/wferp', displayName: 'WFERP' });
         app.registerProject({ repoId: 'acme/demo-app', displayName: 'Demo App' });
+      };
+
+      const ensureDemoFlowRun = () => {
+        const projects = app.listRegisteredProjects();
+        if (projects.length === 0) {
+          return;
+        }
+
+        if (!app.getActiveProject()) {
+          app.switchActiveProject(projects[0].repoId);
+        }
+
+        const db = app.readDb();
+        if (db.flowRuns.length > 0) {
+          activeFlowRunId = db.flowRuns[db.flowRuns.length - 1].flowRunId;
+          return;
+        }
+
+        const active = app.getActiveProject();
+        const demoFlowRun = app.createFlowRunFromOrchestration({
+          repoId: active.repoId,
+          readinessPassed: true,
+          approving_identity: {
+            login: 'paulpai0412',
+            avatarUrl: 'https://avatars.githubusercontent.com/u/19721435?v=4',
+          },
+        });
+        activeFlowRunId = demoFlowRun.flowRunId;
       };
 
       const applyEnvFromInputs = () => {
@@ -2575,7 +2612,7 @@
         }
 
         const identity = app.getApprovingIdentity(activeFlowRunId);
-        const queue = app.listReleaseBlockedApprovalQueue(activeFlowRunId);
+        const queue = app.listApprovalQueue(activeFlowRunId);
         approvalIdentityLogin.textContent = identity.login;
         if (identity.avatarUrl) {
           approvalIdentityAvatar.src = identity.avatarUrl;
@@ -2587,7 +2624,7 @@
         if (queue.length === 0) {
           const empty = document.createElement('div');
           empty.className = 'approval-card';
-          empty.innerHTML = '<h4>目前沒有待審核 PR</h4><p>release-blocked 佇列為空。</p>';
+          empty.innerHTML = '<h4>目前沒有 PR 審核項目</h4><p>approval queue 目前為空。</p>';
           approvalQueueList.appendChild(empty);
           return;
         }
@@ -2740,6 +2777,7 @@
       };
 
       bootstrapProjects();
+      ensureDemoFlowRun();
       renderEverything();
 
       switchProjectButton.addEventListener('click', () => {
