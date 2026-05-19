@@ -2295,11 +2295,19 @@
           }
 
           var flowRun = updatePrototypeGate(db.flowRuns[runIndex], updates);
+          var pipeline = normalizeSpecPipeline(flowRun.specPipeline);
+          var isSpecPipelineReadyForIssuePlan = pipeline.currentStage === "issue-plan";
 
           if (flowRun.ui_scope && flowRun.prototype_gate_decision === "blocked" && targetStage === "issue-plan") {
             db.flowRuns[runIndex] = flowRun;
             writeDb(db);
             throw new Error("Prototype gate blocked: UI-scoped Flow Run requires approved prototype before advancing to issue-plan.");
+          }
+
+          if (!flowRun.ui_scope && targetStage === "issue-plan" && !isSpecPipelineReadyForIssuePlan) {
+            db.flowRuns[runIndex] = flowRun;
+            writeDb(db);
+            throw new Error("Cannot bypass spec pipeline: advance clarify -> prd -> issue-plan first.");
           }
 
           if (flowRun.ui_scope && targetStage === "issue-plan" && flowRun.prototype_artifact_ref) {
@@ -2310,6 +2318,66 @@
           db.flowRuns[runIndex] = flowRun;
           writeDb(db);
           return flowRun;
+        }
+
+        function inspectFlowRunContinuity(flowRunId, lastEventId) {
+          var replayed = replayFlowRunEvents(flowRunId, lastEventId);
+          var fromSequence = replayed.length > 0 ? replayed[0].sequence : null;
+          var toSequence = replayed.length > 0 ? replayed[replayed.length - 1].sequence : null;
+          var gapDetected = false;
+
+          for (var index = 1; index < replayed.length; index += 1) {
+            if (replayed[index].sequence !== replayed[index - 1].sequence + 1) {
+              gapDetected = true;
+              break;
+            }
+          }
+
+          return {
+            flowRunId: String(flowRunId || ""),
+            lastEventId: lastEventId ? String(lastEventId) : null,
+            replayedCount: replayed.length,
+            replayedEventIds: replayed.map(function (item) { return item.eventId; }),
+            fromSequence: fromSequence,
+            toSequence: toSequence,
+            gapDetected: gapDetected,
+          };
+        }
+
+        function planIssueIntakeSchedule(rawIssues) {
+          var plan = generateIssuePlan(rawIssues);
+          var doneSet = new Set(
+            plan.issues
+              .filter(function (issue) { return issue.state === "done"; })
+              .map(function (issue) { return issue.id; }),
+          );
+
+          var readyQueue = plan.executionLanes.ready.map(function (issue) {
+            return {
+              id: issue.id,
+              title: issue.title,
+              blockedBy: [],
+            };
+          });
+
+          var blockedQueue = plan.executionLanes.blocked.map(function (issue) {
+            var blockedBy = issue.deps.filter(function (depId) {
+              return !doneSet.has(depId);
+            });
+
+            return {
+              id: issue.id,
+              title: issue.title,
+              blockedBy: blockedBy,
+            };
+          });
+
+          return {
+            valid: plan.valid,
+            readyQueue: readyQueue,
+            blockedQueue: blockedQueue,
+            runnableOrder: plan.runnableOrder.slice(),
+          };
         }
 
         function emitIssuePlanAcceptanceCriteria(flowRunId, criteria) {
@@ -2642,6 +2710,7 @@
           replayFlowRunEvents: replayFlowRunEvents,
           appendFlowRunEvent: appendFlowRunEvent,
           openFlowRunSocket: openFlowRunSocket,
+          inspectFlowRunContinuity: inspectFlowRunContinuity,
           createFlowRunFromOrchestration: createFlowRunFromOrchestration,
           getRunPolicyPresets: getRunPolicyPresets,
           getRunPolicy: getRunPolicy,
@@ -2653,6 +2722,7 @@
           addBlockingQuestion: addBlockingQuestion,
           resolveBlockingQuestion: resolveBlockingQuestion,
           advanceSpecPipeline: advanceSpecPipeline,
+          planIssueIntakeSchedule: planIssueIntakeSchedule,
           getAllProjectsView: getAllProjectsView,
           triggerAllProjectsLifecycleAction: triggerAllProjectsLifecycleAction,
           getLifecycleEvents: getLifecycleEvents,

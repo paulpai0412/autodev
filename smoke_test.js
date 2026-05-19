@@ -313,6 +313,28 @@ function runTests() {
     );
   });
 
+  test("AC3: flow run cannot bypass spec pipeline directly to issue-plan", () => {
+    const app = createControlTowerApp({
+      storage: createMemoryStorage(),
+      env: {
+        githubToken: "ghp_demo",
+        runtimePathExists: true,
+        runtimeConfigExists: true,
+      },
+    });
+
+    app.registerProject({ repoId: "acme/alpha", displayName: "Alpha" });
+    app.switchActiveProject("acme/alpha");
+    const flowRun = app.startFlowRun();
+
+    assert.throws(
+      () => {
+        app.advanceFlowRunStage(flowRun.flowRunId, "issue-plan");
+      },
+      /spec pipeline/i,
+    );
+  });
+
   test("AC3: flow event channel emits ordered events with stable event IDs", () => {
     const app = createControlTowerApp({
       storage: createMemoryStorage(),
@@ -417,6 +439,33 @@ function runTests() {
     const missedAtConnect = reconnectSocket.drain();
     assert.equal(missedAtConnect.length, 1);
     assert.equal(missedAtConnect[0].eventId, event3.eventId);
+  });
+
+  test("AC5: reconnect continuity metadata is verifiable from replay window", () => {
+    const app = createControlTowerApp({
+      storage: createMemoryStorage(),
+      env: {
+        githubToken: "ghp_demo",
+        runtimePathExists: true,
+        runtimeConfigExists: true,
+      },
+    });
+
+    app.registerProject({ repoId: "acme/alpha", displayName: "Alpha" });
+    app.switchActiveProject("acme/alpha");
+    const flowRun = app.startFlowRun();
+
+    const event1 = app.appendFlowRunEvent({ flowRunId: flowRun.flowRunId, kind: "one" });
+    app.appendFlowRunEvent({ flowRunId: flowRun.flowRunId, kind: "two" });
+    app.appendFlowRunEvent({ flowRunId: flowRun.flowRunId, kind: "three" });
+
+    const continuity = app.inspectFlowRunContinuity(flowRun.flowRunId, event1.eventId);
+    assert.equal(continuity.lastEventId, event1.eventId);
+    assert.equal(continuity.replayedCount, 2);
+    assert.equal(continuity.fromSequence, 2);
+    assert.equal(continuity.toSequence, 3);
+    assert.equal(continuity.gapDetected, false);
+    assert.deepEqual(continuity.replayedEventIds.length, 2);
   });
 
   test("AC5: UI-facing event contract carries progress prompts and gate outcomes", () => {
@@ -880,6 +929,27 @@ function runTests() {
     assert.match(
       createdPayloads[0].body,
       /- \[ \] publisher creates issues in dependency order/,
+    );
+  });
+
+  test("AC4: intake scheduler respects dependency order and ready-only selection", () => {
+    const app = createControlTowerApp({ storage: createMemoryStorage() });
+
+    const schedule = app.planIssueIntakeSchedule([
+      { id: "I-001", title: "Foundation", deps: [], state: "done" },
+      { id: "I-002", title: "Registry", deps: ["I-001"], state: "todo" },
+      { id: "I-003", title: "Stream", deps: ["I-002"], state: "todo" },
+      { id: "I-004", title: "Release", deps: ["I-003"], state: "todo" },
+    ]);
+
+    assert.deepEqual(toPlain(schedule.readyQueue.map((issue) => issue.id)), ["I-002"]);
+    assert.deepEqual(
+      toPlain(schedule.blockedQueue.map((issue) => issue.id)),
+      ["I-003", "I-004"],
+    );
+    assert.deepEqual(
+      toPlain(schedule.blockedQueue[0].blockedBy),
+      ["I-002"],
     );
   });
 
