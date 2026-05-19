@@ -280,6 +280,29 @@ def test_open_code_host_adapter_start_root_session_success_omits_build_agent(mon
     assert captured["command"] == ["/fake/opencode", "run", "--format", "json", "--title", "Issue 42 root", "Do work."]
 
 
+def test_open_code_host_adapter_start_child_role_marks_foreground_child_mode(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    process = _FakeProcess(stdout=io.StringIO(), stderr=io.StringIO(), poll_result=0)
+
+    monkeypatch.setattr(adapter, "spawn_detached_opencode_run", lambda command, workdir: process)
+    monkeypatch.setattr(adapter, "read_initial_session_id", lambda *args, **kwargs: ("ses-child", "stdout", "stderr"))
+    monkeypatch.setattr(adapter, "probe_same_repo_session_readability", lambda *args, **kwargs: (True, "Session: ses-child"))
+    monkeypatch.setattr(
+        adapter,
+        "wait_for_child_session_summary",
+        lambda *args, **kwargs: {"session_id": "ses-grandchild", "latest_assistant_status": "stop"},
+    )
+
+    host = adapter.OpenCodeHostAdapter(cli_resolver=lambda: "/fake/opencode")
+    result = host.start_child_role("release_worker", _session_context(tmp_path, agent="build"))
+
+    assert result.status == "success"
+    assert result.session_id == "ses-child"
+    assert result.metadata["executionMode"] == "foreground_child_role"
+    assert result.metadata["childRole"] == "release_worker"
+    assert result.metadata["childSessionID"] == "ses-grandchild"
+    assert result.metadata["childSessionStatus"] == "stop"
+
+
 def test_open_code_host_adapter_read_session_outcome_extracts_error_payload(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         adapter,

@@ -43,9 +43,12 @@ from scripts.control_plane_db import (
     read_github_sync_attempt_by_command_id,
     read_artifact_fact,
     read_issue,
+    read_latest_ref,
     read_runtime_context,
+    read_release_child_session,
     record_artifact_fact,
     record_github_sync_attempt,
+    record_latest_ref_snapshot,
     record_pr_opened,
     sync_issue_runtime_context,
     transition_issue_state,
@@ -504,6 +507,10 @@ class SessionResult(TypedDict, total=False):
     issueNumber: str
     branch: str
     recordedAt: str
+    executionMode: str
+    childRole: str
+    childSessionID: str
+    childSessionStatus: str
 
 
 def _session_request_body(request: SessionRequest) -> str:
@@ -660,7 +667,7 @@ def _read_latest_session_payload(base_dir: Path, *, issue_number: str) -> Sessio
 
 
 def _runtime_requires_role_stage_dispatch(*, role: str, stage: str) -> bool:
-    return role == "release_worker" and stage == "release_worker_execution"
+    return role == "main_orchestrator" and stage == "release_root_execution"
 
 
 def _has_role_stage_dispatch_evidence(*, base_dir: Path, issue_number: str, role: str, stage: str) -> bool:
@@ -720,21 +727,21 @@ def _repair_stale_release_pending_fences(*, base_dir: Path, updated_at: str) -> 
         current_stage = str(issue.get("current_stage") or "")
         current_status = str(issue.get("current_status") or "")
         current_session_id = str(issue.get("current_session_id") or "")
-        if current_role != "release_worker" or (not current_status and not current_session_id):
+        if current_role != "main_orchestrator" or current_stage != "release_root_execution" or (not current_status and not current_session_id):
             continue
         if _has_role_stage_dispatch_evidence(
             base_dir=base_dir,
             issue_number=issue_number,
-            role="release_worker",
-            stage="release_worker_execution",
+            role="main_orchestrator",
+            stage="release_root_execution",
         ):
             continue
         _ = sync_issue_runtime_context(
             base_dir,
             issue_number=issue_number,
             updated_at=updated_at,
-            current_role="release_worker",
-            current_stage="release_worker_execution",
+            current_role="main_orchestrator",
+            current_stage="release_root_execution",
             current_status="",
         )
         _ = upsert_issue_state(
@@ -1342,7 +1349,9 @@ def _quarantine_stale_queued_subagent_with_stale_root(
 ) -> bool:
     if current.get("status") != "queued":
         return False
-    if current.get("role") not in {"issue_worker", "pr_verifier", "release_worker"}:
+    if current.get("role") not in {"issue_worker", "pr_verifier"} and not (
+        current.get("role") == "main_orchestrator" and current.get("stage") == "release_root_execution"
+    ):
         return False
     if str(runtime_issue.get("state") or "") not in {"running", "verifying", "release_pending"}:
         return False
@@ -1576,7 +1585,7 @@ def _sync_runtime_phase_to_control_plane_state(
         desired_state = "running"
     elif current["role"] == "pr_verifier":
         desired_state = "verifying"
-    elif current["role"] == "release_worker":
+    elif current["role"] == "main_orchestrator" and current["stage"] == "release_root_execution":
         desired_state = "release_pending"
 
     if not desired_state:
@@ -1887,7 +1896,7 @@ def start_release(
     )
     if pr_opened is None:
         raise RuntimeError(f"issue #{selected_issue_number} has no verifier-owned pr_opened fact; release command refuses to merge")
-    release_reason = start_reason or f"Independent release command claimed issue #{selected_issue_number} for PR merge/release."
+    release_reason = start_reason or f"Independent release command claimed issue #{selected_issue_number} for a dedicated release root session."
     release_command_id = f"release:{selected_issue_number}:claim"
     record_admin_decision(
         base_dir,
@@ -1954,9 +1963,12 @@ def start_release(
     automation.setdefault("supervisorDocPath", DEFAULT_SUPERVISOR_DOC_PATH)
     attempts = cast(dict[str, int], ledger.get("attempts", {}))
     attempts["release_worker"] = int(attempts.get("release_worker", 0)) + 1
-    current = {"role": "release_worker", "stage": "release_worker_execution", "status": "queued"}
+    current = {"role": "main_orchestrator", "stage": "release_root_execution", "status": "queued"}
     ledger["current"] = current
-    summary = f"Release flow is launching release_worker to merge/release issue #{selected_issue_number}."
+    summary = (
+        f"Release flow is launching an independent release root session for issue #{selected_issue_number}; "
+        "that root session must run release_worker as a foreground subagent before returning."
+    )
     _sync_runtime_phase_metadata(
         base_dir=base_dir,
         issue_number=selected_issue_number,
@@ -1972,9 +1984,9 @@ def start_release(
     )
     request = build_session_request(
         ledger,
-        role="release_worker",
-        stage="release_worker_execution",
-        reason=f"independent release_worker dispatch for issue #{selected_issue_number}",
+        role="main_orchestrator",
+        stage="release_root_execution",
+        reason=f"independent release root-session dispatch for issue #{selected_issue_number}",
         title=f"Release issue #{selected_issue_number} on {str(refreshed_issue.get('branch') or '')}",
         decision_summary=summary,
     )
@@ -2569,7 +2581,7 @@ def _dispatch_request_via_db(
                     f"Resume the active root session with {resume_link}. "
                     f"GitHub running-label sync failed and may need retry: {sync_error}"
                 )
-        if isinstance(root_session_id, str) and root_session_id and request.get("role") == "release_worker":
+        if isinstance(root_session_id, str) and root_session_id and request.get("role") == "main_orchestrator" and request.get("stage") == "release_root_execution":
             recorded_at = str(session_result.get("recordedAt") or dispatch_timestamp)
             _ = upsert_issue_state(
                 base_dir,
@@ -2583,8 +2595,8 @@ def _dispatch_request_via_db(
                 base_dir,
                 issue_number=request["issueNumber"],
                 updated_at=recorded_at,
-                current_role="release_worker",
-                current_stage=str(request.get("stage") or "release_worker_execution"),
+                current_role="main_orchestrator",
+                current_stage=str(request.get("stage") or "release_root_execution"),
                 current_status="running",
             )
     if session_result.get("status") != "success":
@@ -2627,8 +2639,8 @@ def _dispatch_request_via_db(
                     base_dir,
                     issue_number=request["issueNumber"],
                     updated_at=failure_updated_at,
-                    current_role="release_worker",
-                    current_stage=str(request.get("stage") or "release_worker_execution"),
+                    current_role="main_orchestrator",
+                    current_stage=str(request.get("stage") or "release_root_execution"),
                     current_status="",
                 )
             else:
@@ -2685,7 +2697,11 @@ def dispatch_session_request(
         branch=request["branch"],
         started_at_iso=timestamp,
     )
-    start_result = adapter.start_root_session(start_context)
+    is_release_root_execution = request.get("role") == "main_orchestrator" and request.get("stage") == "release_root_execution"
+    if is_release_root_execution:
+        start_result = adapter.start_child_role("release_worker", start_context)
+    else:
+        start_result = adapter.start_root_session(start_context)
 
     # Host-level prefill continuation errors can be recovered by launching a
     # fresh root session without source-session affinity once.
@@ -2702,7 +2718,10 @@ def dispatch_session_request(
             branch=start_context.branch,
             started_at_iso=start_context.started_at_iso,
         )
-        start_result = adapter.start_root_session(retry_context)
+        if is_release_root_execution:
+            start_result = adapter.start_child_role("release_worker", retry_context)
+        else:
+            start_result = adapter.start_root_session(retry_context)
     stop_attempts_raw = start_result.metadata.get("stopContinuationAttempts")
     stop_attempts = (
         int(stop_attempts_raw)
@@ -2723,6 +2742,10 @@ def dispatch_session_request(
             "error": start_result.error,
             "rootSessionID": start_result.session_id,
             "sessionReadabilityStatus": start_result.readability_status,
+            "executionMode": str(start_result.metadata.get("executionMode") or "root_session"),
+            "childRole": str(start_result.metadata.get("childRole") or ""),
+            "childSessionID": str(start_result.metadata.get("childSessionID") or ""),
+            "childSessionStatus": str(start_result.metadata.get("childSessionStatus") or ""),
             "recordedAt": timestamp,
         }
     root_session_id = start_result.session_id
@@ -2743,6 +2766,10 @@ def dispatch_session_request(
         "sessionReadabilityStatus": start_result.readability_status,
         "stopContinuationStatus": str(start_result.metadata.get("stopContinuationStatus") or "root_session_detached"),
         "stopContinuationAttempts": stop_attempts,
+        "executionMode": str(start_result.metadata.get("executionMode") or "root_session"),
+        "childRole": str(start_result.metadata.get("childRole") or ""),
+        "childSessionID": str(start_result.metadata.get("childSessionID") or ""),
+        "childSessionStatus": str(start_result.metadata.get("childSessionStatus") or ""),
         "recordedAt": timestamp,
     }
 
@@ -2797,7 +2824,7 @@ def _record_session_result_history(base_dir: Path, ledger: JsonObject, session_r
     request_id = str(session_result.get("sourceSessionID") or "")
     root_session_id = str(session_result.get("rootSessionID") or "")
     status = str(session_result.get("status") or "")
-    _ = append_issue_history(
+    history_id = append_issue_history(
         base_dir,
         issue_number=issue_number,
         entry_type="session_result",
@@ -2811,6 +2838,40 @@ def _record_session_result_history(base_dir: Path, ledger: JsonObject, session_r
         summary=str(session_result.get("reason") or status),
         payload=dict(session_result),
         unique_key=f"session-result:{request_id}:{recorded_at}",
+    )
+    if (
+        str(session_result.get("role") or "") != "main_orchestrator"
+        or str(session_result.get("stage") or "") != "release_root_execution"
+    ):
+        return
+    child_role = str(session_result.get("childRole") or "")
+    child_session_id = str(session_result.get("childSessionID") or "")
+    child_session_status = str(session_result.get("childSessionStatus") or "")
+    if not any((child_role, child_session_id, child_session_status)):
+        return
+    release_child_session = {
+        "childRole": child_role,
+        "childSessionID": child_session_id,
+        "childSessionStatus": child_session_status,
+        "rootSessionID": root_session_id,
+        "recordedAt": recorded_at,
+    }
+    _ = sync_issue_runtime_context(
+        base_dir,
+        issue_number=issue_number,
+        updated_at=recorded_at,
+        runtime_context={"release_child_session": release_child_session},
+    )
+    record_latest_ref_snapshot(
+        base_dir,
+        issue_number=issue_number,
+        entry_type="release_child_session",
+        history_id=history_id,
+        created_at=recorded_at,
+        command_id=request_id,
+        session_id=root_session_id,
+        status=child_session_status or status,
+        extra=release_child_session,
     )
 
 
@@ -2834,6 +2895,8 @@ def inspect_control_plane(
         "issue": read_issue(base_dir, issue_number) or {},
         "latestDecision": read_latest_decision(base_dir, issue_number) or {},
         "latestGitHubSyncAttempt": read_latest_github_sync_attempt(base_dir, issue_number) or {},
+        "releaseChildSession": read_release_child_session(base_dir, issue_number),
+        "latestReleaseChildSession": read_latest_ref(base_dir, issue_number, "release_child_session"),
         "releaseBackfill": {
             "mode": release_backfill_mode,
             "releaseCapacity": release_capacity,
@@ -3513,7 +3576,7 @@ def reconcile_ledger(
             _sync_runtime_phase_metadata(base_dir=base_dir, issue_number=_ledger_issue_number(next_ledger, issue["number"]), current=cast(dict[str, str], next_ledger["current"]), attempts=cast(dict[str, int], next_ledger.get("attempts", {})), limits=cast(dict[str, int], next_ledger.get("limits", {})), last_failure=cast(dict[str, object], next_ledger.get("lastFailure", {})), workflow=cast(dict[str, object], next_ledger.get("workflow", {})), automation=cast(dict[str, object], next_ledger.get("automation", {})), artifacts=cast(dict[str, object], next_ledger.get("artifacts", {})), queued_next_issue=cast(dict[str, object], next_ledger.get("queuedNextIssue", {})), updated_at=timestamp)
             return next_ledger, cast(SupervisorDecision, cast(object, decision)), cast(SessionRequest | None, cast(object, request))
 
-        if current["role"] == "release_worker":
+        if current["role"] == "main_orchestrator" and current["stage"] == "release_root_execution":
             reconcile_release_worker = cast(Callable[..., tuple[JsonObject, JsonObject, JsonObject | None]], _reconcile_helpers.reconcile_release_worker)
             next_ledger, decision, request = reconcile_release_worker(
                 ledger,

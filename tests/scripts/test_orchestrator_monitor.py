@@ -222,7 +222,7 @@ def test_happy_path_release_hands_off_to_next_issue_worker_cycle(tmp_path: Path)
         primary_workspace_root=str(tmp_path),
         updated_at="2026-05-07T17:00:00+08:00",
     )
-    cast(dict[str, object], ledger["current"]).update({"role": "release_worker", "stage": "release_worker_execution", "status": "queued"})
+    cast(dict[str, object], ledger["current"]).update({"role": "main_orchestrator", "stage": "release_root_execution", "status": "queued"})
     cast(dict[str, object], ledger["artifacts"]).update({
         "release_result_ref": "docs/agents/release-results/issue-31-pr-88.yaml",
     })
@@ -278,7 +278,7 @@ def test_release_handoff_uses_sqlite_packet_when_packet_file_is_missing(tmp_path
         primary_workspace_root=str(tmp_path),
         updated_at="2026-05-07T17:00:00+08:00",
     )
-    cast(dict[str, object], ledger["current"]).update({"role": "release_worker", "stage": "release_worker_execution", "status": "queued"})
+    cast(dict[str, object], ledger["current"]).update({"role": "main_orchestrator", "stage": "release_root_execution", "status": "queued"})
     cast(dict[str, object], ledger["artifacts"]).update({
         "release_result_ref": "docs/agents/release-results/issue-31-pr-88.yaml",
     })
@@ -604,6 +604,55 @@ def test_collect_monitor_events_reports_selection_stall_and_missing_artifact(tmp
     assert missing_artifacts == {"evidence_packet"}
     assert evidence["development_slot_occupancy"] == 0
     assert evidence["release_slot_occupancy"] == 0
+
+
+def test_collect_monitor_events_surfaces_release_child_session_trace(tmp_path: Path):
+    _ = upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="release_pending",
+        command_id="cmd-release-pending",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_session_id="ses-release-root-42",
+    )
+    _sync_runtime_phase(
+        tmp_path,
+        "42",
+        role="main_orchestrator",
+        stage="release_root_execution",
+        status="running",
+        updated_at="2026-05-07T17:00:00+08:00",
+        artifact_status={
+            "worker_result": {"parse_ok": True},
+            "evidence_packet": {"parse_ok": True},
+            "release_result": {"parse_ok": True},
+        },
+    )
+    _ = sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:00:00+08:00",
+        runtime_context={
+            "release_child_session": {
+                "childRole": "release_worker",
+                "childSessionID": "ses-release-worker-42",
+                "childSessionStatus": "stop",
+                "rootSessionID": "ses-release-root-42",
+                "recordedAt": "2026-05-07T17:00:00+08:00",
+            }
+        },
+    )
+
+    events = collect_monitor_events(
+        base_dir=tmp_path,
+        issue_number="42",
+        now="2026-05-07T17:00:30+08:00",
+    )
+
+    tracked = next(event for event in events if event["rule_id"] == "RELEASE_CHILD_SESSION_TRACKED")
+    evidence = cast(dict[str, object], tracked["evidence"])
+    assert evidence["childRole"] == "release_worker"
+    assert evidence["childSessionID"] == "ses-release-worker-42"
 
 
 def test_monitor_cli_writes_jsonl_log_and_returns_non_zero_for_critical_issue(

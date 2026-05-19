@@ -185,9 +185,12 @@ def build_prompt(
             "Final acceptance belongs to this verifier role; keep raw logs outside repo docs.",
             "After submit-artifact succeeds, return control to the main_orchestrator root session; do not launch a root session.",
         ]
-    elif role == "release_worker":
+    elif role == "main_orchestrator" and stage == "release_root_execution":
         lines = common + [
-            f"You are the release_worker subagent for issue #{issue['number']}.",
+            f"You are the independent release root session for issue #{issue['number']}.",
+            'Run the actual release_worker steps as a foreground subagent from this session with task(subagent_type="general", ..., run_in_background=false). Wait for that child call to finish before you return.',
+            "Do not perform the merge/close workflow directly from the release root shell without first delegating that foreground release_worker subagent.",
+            'When launching the foreground release_worker subagent, choose task-appropriate load_skills for the release work. Pass [] only when no skill matches the task domain.',
             "Read the persisted evidence_packet context from SQLite before evaluating merge or release decisions.",
             (
                 "This issue is local-seeded. Skip GitHub issue operations such as `gh issue close` unless a real GitHub issue is explicitly materialized."
@@ -205,7 +208,7 @@ def build_prompt(
             "Persist release outcome as release_result via submit-artifact instead of writing YAML files.",
             "If release is blocked or fails, include blocked_reason, failure_kind, retryable, and next_recommended_step in the submitted payload.",
             "Respect required checks, mergeability, approval policy, and workspace hygiene.",
-            "After submit-artifact succeeds, return control to the supervisor/release command result; do not launch another root session.",
+            "After the foreground release_worker subagent stores release_result in SQLite, return control to the supervisor/release command result; do not launch another root session.",
         ]
     else:
         lines = common + [

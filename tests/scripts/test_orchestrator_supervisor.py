@@ -11,7 +11,7 @@ from contextlib import redirect_stdout
 from unittest.mock import patch
 
 import scripts.orchestrator_supervisor as orchestrator_supervisor
-from scripts.control_plane_db import read_github_sync_attempt, read_issue, read_latest_github_sync_attempt, read_latest_issue_history
+from scripts.control_plane_db import read_github_sync_attempt, read_issue, read_latest_github_sync_attempt, read_latest_issue_history, read_latest_ref
 from scripts.host_adapter import SessionOutcome, SessionStartContext, SessionStartResult
 
 
@@ -127,15 +127,27 @@ class FakeHostAdapter:
     def __init__(self, start_result: SessionStartResult):
         self.start_result = start_result
         self.start_calls: list[SessionStartContext] = []
+        self.child_calls: list[tuple[str, SessionStartContext]] = []
 
     def start_root_session(self, context: SessionStartContext):
         self.start_calls.append(context)
         return self.start_result
 
     def start_child_role(self, role: str, context: SessionStartContext):
-        del role
-        self.start_calls.append(context)
-        return self.start_result
+        self.child_calls.append((role, context))
+        metadata = dict(self.start_result.metadata)
+        metadata.setdefault("executionMode", "foreground_child_role")
+        metadata.setdefault("childRole", role)
+        return SessionStartResult(
+            status=self.start_result.status,
+            session_id=self.start_result.session_id,
+            launch_title=self.start_result.launch_title,
+            error=self.start_result.error,
+            resume_hint=self.start_result.resume_hint,
+            resume_command=self.start_result.resume_command,
+            readability_status=self.start_result.readability_status,
+            metadata=metadata,
+        )
 
     def read_session_outcome(self, runtime_session_id: str) -> SessionOutcome | None:
         del runtime_session_id
@@ -1187,7 +1199,7 @@ def test_show_latest_session_returns_host_neutral_db_state_when_issue_is_running
     assert "recommendedAction" not in payload
 
 
-def test_show_latest_session_hides_stale_root_dispatch_when_runtime_is_release_worker(tmp_path: Path) -> None:
+def test_show_latest_session_hides_stale_root_dispatch_when_runtime_is_release_root_session(tmp_path: Path) -> None:
     _ingest_issue_packet_text(tmp_path, "42", SAMPLE_ISSUE_PACKET)
     orchestrator_supervisor.upsert_issue_state(
         tmp_path,
@@ -1201,8 +1213,8 @@ def test_show_latest_session_hides_stale_root_dispatch_when_runtime_is_release_w
         tmp_path,
         issue_number="42",
         updated_at="2026-05-07T17:00:00+08:00",
-        current_role="release_worker",
-        current_stage="release_worker_execution",
+        current_role="main_orchestrator",
+        current_stage="release_root_execution",
         current_status="queued",
     )
     orchestrator_supervisor.append_issue_history(
@@ -1230,7 +1242,7 @@ def test_show_latest_session_hides_stale_root_dispatch_when_runtime_is_release_w
     assert payload is None
 
 
-def test_show_latest_session_prefers_latest_session_result_for_release_worker(tmp_path: Path) -> None:
+def test_show_latest_session_prefers_latest_session_result_for_release_root_session(tmp_path: Path) -> None:
     _ingest_issue_packet_text(tmp_path, "42", SAMPLE_ISSUE_PACKET)
     orchestrator_supervisor.upsert_issue_state(
         tmp_path,
@@ -1244,8 +1256,8 @@ def test_show_latest_session_prefers_latest_session_result_for_release_worker(tm
         tmp_path,
         issue_number="42",
         updated_at="2026-05-07T17:10:00+08:00",
-        current_role="release_worker",
-        current_stage="release_worker_execution",
+        current_role="main_orchestrator",
+        current_stage="release_root_execution",
         current_status="running",
     )
     orchestrator_supervisor.append_issue_history(
@@ -1272,16 +1284,16 @@ def test_show_latest_session_prefers_latest_session_result_for_release_worker(tm
         issue_number="42",
         entry_type="session_result",
         created_at="2026-05-07T17:09:00+08:00",
-        role="release_worker",
-        stage="release_worker_execution",
+        role="main_orchestrator",
+        stage="release_root_execution",
         status="success",
         session_id="ses-release-42",
         payload={
             "status": "success",
             "rootSessionID": "ses-release-42",
             "issueNumber": "42",
-            "role": "release_worker",
-            "stage": "release_worker_execution",
+            "role": "main_orchestrator",
+            "stage": "release_root_execution",
             "recordedAt": "2026-05-07T17:09:00+08:00",
             "sourceSessionID": "ses-trigger-42",
         },
@@ -1292,8 +1304,8 @@ def test_show_latest_session_prefers_latest_session_result_for_release_worker(tm
 
     assert payload is not None
     assert payload.get("rootSessionID") == "ses-release-42"
-    assert payload.get("role") == "release_worker"
-    assert payload.get("stage") == "release_worker_execution"
+    assert payload.get("role") == "main_orchestrator"
+    assert payload.get("stage") == "release_root_execution"
 
 
 def test_show_latest_session_workspace_fallback_prefers_newer_session_result(tmp_path: Path) -> None:
@@ -1667,8 +1679,10 @@ def test_reconcile_workspace_auto_release_bypass_approval_injects_override(tmp_p
         "override_source": "workspace_reconcile_auto_release",
         "human_approval_skipped": True,
     }
-    assert "Current release override: approval_override_mode=bypass_approval" in adapter.start_calls[0].prompt
-    assert "override_source=workspace_reconcile_auto_release" in adapter.start_calls[0].prompt
+    assert len(adapter.child_calls) == 1
+    _, child_context = adapter.child_calls[0]
+    assert "Current release override: approval_override_mode=bypass_approval" in child_context.prompt
+    assert "override_source=workspace_reconcile_auto_release" in child_context.prompt
 
 
 def test_auto_release_backfill_bypass_approval_can_complete_end_to_end(tmp_path: Path, monkeypatch) -> None:
@@ -1778,7 +1792,7 @@ def test_reconcile_workspace_reports_intake_exception_without_blocking_scheduler
     assert payload["intake_error"] == "gh unavailable"
 
 
-def test_start_release_claims_verified_issue_and_launches_independent_release_worker(tmp_path: Path) -> None:
+def test_start_release_claims_verified_issue_and_launches_independent_release_root_session(tmp_path: Path) -> None:
     _ingest_issue_packet_text(tmp_path, "42", SAMPLE_ISSUE_PACKET)
     orchestrator_supervisor.upsert_issue_state(
         tmp_path,
@@ -1815,11 +1829,11 @@ def test_start_release_claims_verified_issue_and_launches_independent_release_wo
     admin_action = read_latest_issue_history(tmp_path, "42", entry_type="admin_action")
 
     assert result.get("status") == "success"
-    assert result.get("role") == "release_worker"
+    assert result.get("role") == "main_orchestrator"
     assert issue is not None
     assert issue["state"] == "release_pending"
     assert issue["current_session_id"] == "ses-release-42"
-    assert issue["current_role"] == "release_worker"
+    assert issue["current_role"] == "main_orchestrator"
     assert issue["current_status"] == "running"
     runtime_context = json.loads(str(issue["runtime_context_json"]))
     assert runtime_context["release_runtime_controls"] == {
@@ -1829,13 +1843,116 @@ def test_start_release_claims_verified_issue_and_launches_independent_release_wo
         "human_approval_skipped": True,
     }
     assert request is not None
-    assert request["role"] == "release_worker"
+    assert request["role"] == "main_orchestrator"
     assert admin_action is not None
     assert admin_action["status"] == ""
     assert admin_action["to_state"] == "release_pending"
-    assert adapter.start_calls[0].role == "release_worker"
-    assert "release_worker" in adapter.start_calls[0].prompt
-    assert "Current release override: approval_override_mode=bypass_approval" in adapter.start_calls[0].prompt
+    assert result.get("executionMode") == "foreground_child_role"
+    assert result.get("childRole") == "release_worker"
+    assert result.get("childSessionID") == ""
+    assert len(adapter.child_calls) == 1
+    child_role, child_context = adapter.child_calls[0]
+    assert child_role == "release_worker"
+    assert child_context.role == "main_orchestrator"
+    assert "independent release root session" in child_context.prompt
+    assert "foreground release_worker subagent" in child_context.prompt
+    assert "Current release override: approval_override_mode=bypass_approval" in child_context.prompt
+
+
+def test_dispatch_session_request_surfaces_child_session_tracking_for_release_root_execution() -> None:
+    request: orchestrator_supervisor.SessionRequest = {
+        "requestGeneration": 1,
+        "nonce": "nonce-release-42",
+        "requestID": "request-release-42",
+        "createdAt": "2026-05-07T17:00:00+08:00",
+        "createdForLedgerRevision": "2026-05-07T17:00:00+08:00",
+        "reason": "independent release root-session dispatch for issue #42",
+        "title": "Release issue #42 on agent/issue-42-demo",
+        "agent": "build",
+        "prompt": "Run release root execution.",
+        "role": "main_orchestrator",
+        "stage": "release_root_execution",
+        "issueNumber": "42",
+        "branch": "agent/issue-42-demo",
+    }
+
+    adapter = successful_host_adapter(
+        session_id="ses-release-root-42",
+        resume_command="opencode --session ses-release-root-42",
+        metadata={
+            "tuiResumeCommand": "/sessions",
+            "stopContinuationStatus": "root_session_detached",
+            "stopContinuationAttempts": 0,
+            "executionMode": "foreground_child_role",
+            "childRole": "release_worker",
+            "childSessionID": "ses-release-worker-42",
+            "childSessionStatus": "stop",
+        },
+    )
+
+    with patch("scripts.orchestrator_supervisor._default_host_adapter", return_value=adapter):
+        result = orchestrator_supervisor.dispatch_session_request(
+            request,
+            workdir=Path("/tmp/demo"),
+            source_session_id="manual-release",
+            updated_at="2026-05-07T17:10:00+08:00",
+        )
+
+    assert result.get("status") == "success"
+    assert result.get("executionMode") == "foreground_child_role"
+    assert result.get("childRole") == "release_worker"
+    assert result.get("childSessionID") == "ses-release-worker-42"
+    assert result.get("childSessionStatus") == "stop"
+
+
+def test_dispatch_request_from_db_persists_release_child_session_trace_in_history_payload(tmp_path: Path) -> None:
+    _ingest_issue_packet_text(tmp_path, "42", SAMPLE_ISSUE_PACKET)
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    request = build_session_request(
+        ledger,
+        role="main_orchestrator",
+        stage="release_root_execution",
+        reason="independent release root-session dispatch for issue #42",
+        title="Release issue #42 on agent/issue-42-demo",
+        decision_summary="Launch release root now.",
+    )
+
+    adapter = successful_host_adapter(
+        session_id="ses-release-root-42",
+        resume_command="opencode --session ses-release-root-42",
+        metadata={
+            "tuiResumeCommand": "/sessions",
+            "stopContinuationStatus": "root_session_detached",
+            "stopContinuationAttempts": 0,
+            "executionMode": "foreground_child_role",
+            "childRole": "release_worker",
+            "childSessionID": "ses-release-worker-42",
+            "childSessionStatus": "stop",
+        },
+    )
+
+    with patch("scripts.orchestrator_supervisor._default_host_adapter", return_value=adapter):
+        result = orchestrator_supervisor.dispatch_request_from_db(
+            request,
+            base_dir=tmp_path,
+            source_session_id="manual-release",
+            updated_at="2026-05-07T17:10:00+08:00",
+            failure_restore_state="release_pending",
+        )
+
+    session_result = read_latest_issue_history(tmp_path, "42", entry_type="session_result")
+    runtime_context = orchestrator_supervisor.read_runtime_context(tmp_path, "42")
+    latest_release_child_session = read_latest_ref(tmp_path, "42", "release_child_session")
+
+    assert result.get("childSessionID") == "ses-release-worker-42"
+    assert session_result is not None
+    session_payload = json.loads(str(session_result["payload_json"]))
+    assert session_payload["childSessionID"] == "ses-release-worker-42"
+    assert session_payload["childSessionStatus"] == "stop"
+    assert session_payload["childRole"] == "release_worker"
+    assert runtime_context["release_child_session"]["childSessionID"] == "ses-release-worker-42"
+    assert latest_release_child_session["childRole"] == "release_worker"
 
 
 def test_start_release_refuses_verified_issue_without_pr_opened_fact(tmp_path: Path) -> None:
@@ -1946,8 +2063,8 @@ def test_start_release_repairs_stale_release_pending_fence_without_dispatch_evid
         tmp_path,
         issue_number="42",
         updated_at="2026-05-07T17:00:00+08:00",
-        current_role="release_worker",
-        current_stage="release_worker_execution",
+        current_role="main_orchestrator",
+        current_stage="release_root_execution",
         current_status="queued",
     )
     adapter = successful_host_adapter(session_id="ses-release-41", resume_command="opencode --session ses-release-41")
@@ -1965,7 +2082,7 @@ def test_start_release_repairs_stale_release_pending_fence_without_dispatch_evid
     repair_event = read_latest_issue_history(tmp_path, "42", entry_type="runtime_transition")
 
     assert result.get("status") == "success"
-    assert result.get("role") == "release_worker"
+    assert result.get("role") == "main_orchestrator"
     assert issue_41 is not None
     assert issue_41["state"] == "release_pending"
     assert issue_42 is not None
@@ -2209,7 +2326,7 @@ def test_reconcile_release_success_selects_next_ready_issue(tmp_path: Path):
     issue_packet = parse_issue_packet_text(issue_31.read_text(encoding="utf-8"), "docs/agents/issue-packets/issue-31.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, root_session_agent="build",
     updated_at="2026-05-07T17:00:00+08:00",)
-    ledger["current"] = {"role": "release_worker", "stage": "release_worker_execution", "status": "queued"}
+    ledger["current"] = {"role": "main_orchestrator", "stage": "release_root_execution", "status": "queued"}
     cast(dict[str, str], ledger["artifacts"])["release_result_ref"] = "docs/agents/release-results/issue-31-pr-88.yaml"
 
     release_path = tmp_path / "docs/agents/release-results/issue-31-pr-88.yaml"
@@ -2343,7 +2460,7 @@ def test_reconcile_release_success_syncs_control_plane_runtime_phase_after_hando
     issue_packet = parse_issue_packet_text(issue_31.read_text(encoding="utf-8"), "docs/agents/issue-packets/issue-31.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, root_session_agent="build",
     updated_at="2026-05-07T17:00:00+08:00",)
-    ledger["current"] = {"role": "release_worker", "stage": "release_worker_execution", "status": "queued"}
+    ledger["current"] = {"role": "main_orchestrator", "stage": "release_root_execution", "status": "queued"}
     cast(dict[str, str], ledger["artifacts"])["release_result_ref"] = "docs/agents/release-results/issue-31-pr-88.yaml"
 
     release_path = tmp_path / "docs/agents/release-results/issue-31-pr-88.yaml"
@@ -2409,7 +2526,7 @@ def test_reconcile_recovery_waits_for_db_packet_when_next_issue_is_not_recorded(
 
     issue_packet = parse_issue_packet_text(current_packet.read_text(encoding="utf-8"), "docs/agents/issue-packets/issue-31.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00",)
-    ledger["current"] = {"role": "release_worker", "stage": "release_worker_execution", "status": "queued"}
+    ledger["current"] = {"role": "main_orchestrator", "stage": "release_root_execution", "status": "queued"}
     cast(dict[str, str], ledger["artifacts"])["release_result_ref"] = "docs/agents/release-results/issue-31-pr-88.yaml"
 
     release_path = tmp_path / "docs/agents/release-results/issue-31-pr-88.yaml"
@@ -2457,7 +2574,7 @@ def test_queue_orchestrator_recovery_updates_control_plane_for_recovery_stage(tm
         issue_packet=issue_packet,
         updated_at="2026-05-07T17:00:00+08:00",
     )
-    ledger["current"] = {"role": "release_worker", "stage": "release_worker_execution", "status": "queued"}
+    ledger["current"] = {"role": "main_orchestrator", "stage": "release_root_execution", "status": "queued"}
     cast(dict[str, str], ledger["artifacts"])["release_result_ref"] = "docs/agents/release-results/issue-31-pr-88.yaml"
 
     release_path = tmp_path / "docs/agents/release-results/issue-31-pr-88.yaml"
@@ -2915,8 +3032,8 @@ def test_select_issue_packets_for_capacity_does_not_count_release_pending_agains
         tmp_path,
         issue_number="31",
         updated_at="2026-05-07T17:00:30+08:00",
-        current_role="release_worker",
-        current_stage="release_worker_execution",
+        current_role="main_orchestrator",
+        current_stage="release_root_execution",
         current_status="queued",
     )
 
@@ -4799,7 +4916,7 @@ verifier_manual_qa:
 def test_reconcile_release_worker_running_without_release_result_stays_no_change(tmp_path: Path):
     issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
-    ledger["current"] = {"role": "release_worker", "stage": "release_worker_execution", "status": "running"}
+    ledger["current"] = {"role": "main_orchestrator", "stage": "release_root_execution", "status": "running"}
     cast(dict[str, str], ledger["artifacts"])["release_result_ref"] = "docs/agents/release-results/issue-42-pr-88.yaml"
     orchestrator_supervisor.upsert_issue_state(
         tmp_path,
@@ -4821,8 +4938,8 @@ def test_reconcile_release_worker_running_without_release_result_stays_no_change
 
     assert updated_ledger is not None
     assert decision["action"] == "no_change"
-    assert decision["next_role"] == "release_worker"
-    assert decision["next_stage"] == "release_worker_execution"
+    assert decision["next_role"] == "main_orchestrator"
+    assert decision["next_stage"] == "release_root_execution"
     assert "Keep the queued/running dispatch state unchanged" in cast(str, decision["summary"])
     assert request is None
     assert issue is not None
@@ -4832,7 +4949,7 @@ def test_reconcile_release_worker_running_without_release_result_stays_no_change
 def test_reconcile_release_worker_terminal_without_release_result_redispatches_subagent(tmp_path: Path):
     issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
-    ledger["current"] = {"role": "release_worker", "stage": "release_worker_execution", "status": "running"}
+    ledger["current"] = {"role": "main_orchestrator", "stage": "release_root_execution", "status": "running"}
     cast(dict[str, str], ledger["artifacts"])["release_result_ref"] = "docs/agents/release-results/issue-42-pr-88.yaml"
     attempts = cast(dict[str, int], ledger["attempts"])
     initial_attempts = attempts["release_worker"]
@@ -4863,8 +4980,8 @@ def test_reconcile_release_worker_terminal_without_release_result_redispatches_s
 
     assert updated_ledger is not None
     assert decision["action"] == "delegate_subagent"
-    assert decision["next_role"] == "release_worker"
-    assert decision["next_stage"] == "release_worker_execution"
+    assert decision["next_role"] == "main_orchestrator"
+    assert decision["next_stage"] == "release_root_execution"
     assert "without recording release_result" in cast(str, decision["summary"])
     assert request is None
     assert attempts["release_worker"] == initial_attempts + 1
@@ -5502,7 +5619,7 @@ def test_reconcile_quarantines_stale_queued_pr_verifier_with_stale_root_heartbea
 def test_reconcile_quarantines_stale_queued_release_worker_with_stale_root_heartbeat(tmp_path: Path):
     issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
-    ledger["current"] = {"role": "release_worker", "stage": "release_worker_execution", "status": "queued"}
+    ledger["current"] = {"role": "main_orchestrator", "stage": "release_root_execution", "status": "queued"}
     cast(dict[str, str], ledger["artifacts"])["release_result_ref"] = "docs/agents/release-results/issue-42-pr-77.yaml"
     orchestrator_supervisor.upsert_issue_state(tmp_path,
     issue_number="42",
@@ -5549,7 +5666,7 @@ def test_reconcile_release_success_keeps_issue_completed(tmp_path: Path):
 
     issue_packet = parse_issue_packet_text(issue_31.read_text(encoding="utf-8"), "docs/agents/issue-packets/issue-31.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00",)
-    ledger["current"] = {"role": "release_worker", "stage": "release_worker_execution", "status": "queued"}
+    ledger["current"] = {"role": "main_orchestrator", "stage": "release_root_execution", "status": "queued"}
     cast(dict[str, str], ledger["artifacts"])["release_result_ref"] = "docs/agents/release-results/issue-31-pr-88.yaml"
     release_path = tmp_path / "docs/agents/release-results/issue-31-pr-88.yaml"
     release_path.parent.mkdir(parents=True, exist_ok=True)
@@ -5670,7 +5787,7 @@ def test_reconcile_ignores_stale_session_result_for_different_issue_after_queue_
 
     issue_packet = parse_issue_packet_text(issue_31.read_text(encoding="utf-8"), "docs/agents/issue-packets/issue-31.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00",)
-    ledger["current"] = {"role": "release_worker", "stage": "release_worker_execution", "status": "queued"}
+    ledger["current"] = {"role": "main_orchestrator", "stage": "release_root_execution", "status": "queued"}
     cast(dict[str, str], ledger["artifacts"])["release_result_ref"] = "docs/agents/release-results/issue-31-pr-88.yaml"
     release_path = tmp_path / "docs/agents/release-results/issue-31-pr-88.yaml"
     release_path.parent.mkdir(parents=True, exist_ok=True)
@@ -5984,7 +6101,7 @@ failure_classification: {kind: "none", retryable: true, routed_to: "none", root_
 def test_reconcile_release_blocked_exhaustion_marks_issue_failed(tmp_path: Path):
     issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
-    ledger["current"] = {"role": "release_worker", "stage": "release_worker_execution", "status": "queued"}
+    ledger["current"] = {"role": "main_orchestrator", "stage": "release_root_execution", "status": "queued"}
     attempts = cast(dict[str, int], ledger["attempts"])
     limits = cast(dict[str, int], ledger["limits"])
     attempts["release_worker"] = limits["release_worker"]
@@ -6017,7 +6134,7 @@ def test_reconcile_release_blocked_exhaustion_marks_issue_failed(tmp_path: Path)
 def test_reconcile_release_human_approval_block_returns_issue_to_verified(tmp_path: Path):
     issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
-    ledger["current"] = {"role": "release_worker", "stage": "release_worker_execution", "status": "queued"}
+    ledger["current"] = {"role": "main_orchestrator", "stage": "release_root_execution", "status": "queued"}
     attempts = cast(dict[str, int], ledger["attempts"])
     attempts["release_worker"] = 1
     cast(dict[str, str], ledger["artifacts"])["release_result_ref"] = "docs/agents/release-results/issue-42-pr-88.yaml"
@@ -6422,6 +6539,37 @@ def test_inspect_command_prints_control_plane_snapshot(tmp_path: Path, monkeypat
         updated_at="2026-05-07T17:02:00+08:00",
         last_error="sync failed",
     )
+    _ = orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:03:00+08:00",
+        runtime_context={
+            "release_child_session": {
+                "childRole": "release_worker",
+                "childSessionID": "ses-release-worker-42",
+                "childSessionStatus": "stop",
+                "rootSessionID": "ses-release-root-42",
+                "recordedAt": "2026-05-07T17:03:00+08:00",
+            }
+        },
+    )
+    orchestrator_supervisor.record_latest_ref_snapshot(
+        tmp_path,
+        issue_number="42",
+        entry_type="release_child_session",
+        history_id=999,
+        created_at="2026-05-07T17:03:00+08:00",
+        command_id="cmd-release-child",
+        session_id="ses-release-root-42",
+        status="stop",
+        extra={
+            "childRole": "release_worker",
+            "childSessionID": "ses-release-worker-42",
+            "childSessionStatus": "stop",
+            "rootSessionID": "ses-release-root-42",
+            "recordedAt": "2026-05-07T17:03:00+08:00",
+        },
+    )
     output = io.StringIO()
     with redirect_stdout(output):
         exit_code = orchestrator_supervisor.main([
@@ -6440,7 +6588,7 @@ def test_inspect_command_prints_control_plane_snapshot(tmp_path: Path, monkeypat
     issue_column_names = [str(column["name"]) for column in issue_columns]
 
     assert exit_code == 0
-    assert set(payload) == {"schema", "issue", "latestDecision", "latestGitHubSyncAttempt", "releaseBackfill"}
+    assert set(payload) == {"schema", "issue", "latestDecision", "latestGitHubSyncAttempt", "releaseChildSession", "latestReleaseChildSession", "releaseBackfill"}
     assert schema["dbPath"] == str(tmp_path / ".opencode/runtime/control-plane.sqlite3")
     assert "artifact_refs_json" in issue_column_names
     assert "artifact_status_json" in issue_column_names
@@ -6448,6 +6596,8 @@ def test_inspect_command_prints_control_plane_snapshot(tmp_path: Path, monkeypat
     assert cast(dict[str, object], payload["issue"])["issue_number"] == "42"
     assert cast(dict[str, object], payload["latestDecision"])["command_id"] == "cmd-claim"
     assert cast(dict[str, object], payload["latestGitHubSyncAttempt"])["command_id"] == "cmd-gh"
+    assert cast(dict[str, object], payload["releaseChildSession"])["childSessionID"] == "ses-release-worker-42"
+    assert cast(dict[str, object], payload["latestReleaseChildSession"])["command_id"] == "cmd-release-child"
     release_backfill = cast(dict[str, object], payload["releaseBackfill"])
     assert release_backfill["mode"] == "manual"
     assert release_backfill["releaseCapacity"] == 3
