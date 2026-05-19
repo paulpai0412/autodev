@@ -10,20 +10,15 @@ import shutil
 import sqlite3
 import subprocess
 import time
-from contextlib import closing
 from pathlib import Path
 from typing import IO, Any, Callable, Protocol, cast
 
+from scripts import opencode_db_path, read_session_summary
 from scripts.host_adapter import HostAdapter, SessionOutcome, SessionStartContext, SessionStartResult
 
 
 class FindSessionID(Protocol):
     def __call__(self, *, title: str, workdir: Path, created_after_ms: int) -> str | None: ...
-
-
-def opencode_db_path() -> Path:
-    data_home = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
-    return data_home / "opencode" / "opencode.db"
 
 
 def resolve_opencode_cli() -> str | None:
@@ -126,6 +121,27 @@ def wait_for_session_id_in_db(
     return None
 
 
+def wait_for_child_session_summary(
+    parent_session_id: str,
+    *,
+    directory: str,
+    timeout_seconds: float = 5.0,
+    poll_interval_seconds: float = 0.25,
+) -> dict[str, object] | None:
+    from scripts.opencode_session_trace import find_latest_child_session_summary
+
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        summary = find_latest_child_session_summary(
+            parent_session_id,
+            directory=directory,
+        )
+        if summary is not None:
+            return summary
+        time.sleep(poll_interval_seconds)
+    return None
+
+
 def read_initial_session_id(
     process: subprocess.Popen[str],
     *,
@@ -174,95 +190,6 @@ def read_initial_session_id(
     finally:
         selector.close()
     return None, "".join(stdout_lines), "".join(stderr_lines)
-
-
-def _parse_json(text: str | None) -> dict[str, Any]:
-    if not text:
-        return {}
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
-
-
-def _load_messages(connection: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]:
-    rows = connection.execute(
-        "SELECT data FROM message WHERE session_id = ? ORDER BY time_created",
-        (session_id,),
-    ).fetchall()
-    return [_parse_json(str(row[0])) for row in rows]
-
-
-def _load_parts(connection: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]:
-    rows = connection.execute(
-        "SELECT data FROM part WHERE session_id = ? ORDER BY time_created",
-        (session_id,),
-    ).fetchall()
-    return [_parse_json(str(row[0])) for row in rows]
-
-
-def read_session_summary(session_id: str, *, db_path: Path | None = None) -> dict[str, object] | None:
-    database_path = db_path or opencode_db_path()
-    if not database_path.exists():
-        return None
-    with closing(sqlite3.connect(database_path)) as connection:
-        connection.row_factory = sqlite3.Row
-        row = connection.execute("SELECT * FROM session WHERE id = ?", (session_id,)).fetchone()
-        if row is None:
-            return None
-        session_row = dict(row)
-        messages = _load_messages(connection, session_id)
-        parts = _load_parts(connection, session_id)
-    latest_assistant: dict[str, Any] | None = None
-    first_user_text = ""
-    for message in messages:
-        role = message.get("role")
-        if role == "user" and not first_user_text:
-            first_user_text = str(message.get("text") or "")
-        if role == "assistant":
-            latest_assistant = message
-    latest_assistant_status = "no_assistant_message"
-    latest_assistant_error: dict[str, object] = {}
-    latest_assistant_finish = ""
-    latest_assistant_tools: list[str] = []
-    if latest_assistant is not None:
-        latest_assistant_finish = str(latest_assistant.get("finish") or "")
-        error_payload = latest_assistant.get("error")
-        if isinstance(error_payload, dict):
-            latest_assistant_error = dict(error_payload)
-        if latest_assistant_error:
-            latest_assistant_status = str(latest_assistant_error.get("name") or "error")
-        elif latest_assistant_finish:
-            latest_assistant_status = latest_assistant_finish
-        else:
-            latest_assistant_status = "unknown"
-    for part in parts:
-        if part.get("type") == "tool":
-            tool_name = str(part.get("tool") or "")
-            if tool_name:
-                latest_assistant_tools.append(tool_name)
-    model_payload = _parse_json(str(session_row.get("model") or ""))
-    created_at = int(session_row.get("time_created") or 0)
-    updated_at = int(session_row.get("time_updated") or 0)
-    return {
-        "session_id": str(session_row.get("id") or ""),
-        "parent_id": str(session_row.get("parent_id") or ""),
-        "title": str(session_row.get("title") or ""),
-        "directory": str(session_row.get("directory") or ""),
-        "agent": str(session_row.get("agent") or ""),
-        "model": model_payload,
-        "time_created": created_at,
-        "time_updated": updated_at,
-        "duration_ms": max(0, updated_at - created_at),
-        "message_count": len(messages),
-        "part_count": len(parts),
-        "first_user_text": first_user_text,
-        "latest_assistant_status": latest_assistant_status,
-        "latest_assistant_finish": latest_assistant_finish,
-        "latest_assistant_error": latest_assistant_error,
-        "tool_sequence": latest_assistant_tools,
-    }
 
 
 def _extract_same_repo_session_read_probe_result(stdout_text: str) -> tuple[bool | None, str]:
@@ -428,19 +355,29 @@ class OpenCodeHostAdapter(HostAdapter):
         return "assistant message prefill" in lowered or "conversation must end with a user message" in lowered
 
     def start_child_role(self, role: str, context: SessionStartContext) -> SessionStartResult:
-        child_context = SessionStartContext(
-            title=context.title,
-            prompt=context.prompt,
-            agent=context.agent,
-            workdir=context.workdir,
-            source_session_id=context.source_session_id,
-            role=role,
-            stage=context.stage,
-            issue_number=context.issue_number,
-            branch=context.branch,
-            started_at_iso=context.started_at_iso,
+        result = self.start_root_session(context)
+        metadata = dict(result.metadata)
+        metadata["executionMode"] = "foreground_child_role"
+        metadata["childRole"] = role
+        if result.status == "success" and result.session_id:
+            child_summary = wait_for_child_session_summary(
+                result.session_id,
+                directory=str(context.workdir),
+            )
+            if child_summary is not None:
+                metadata["childSessionID"] = str(child_summary.get("session_id") or "")
+                metadata["childSessionStatus"] = str(child_summary.get("latest_assistant_status") or "")
+                metadata["childSessionSummary"] = child_summary
+        return SessionStartResult(
+            status=result.status,
+            session_id=result.session_id,
+            launch_title=result.launch_title,
+            error=result.error,
+            resume_hint=result.resume_hint,
+            resume_command=result.resume_command,
+            readability_status=result.readability_status,
+            metadata=metadata,
         )
-        return self.start_root_session(child_context)
 
     def read_session_outcome(self, runtime_session_id: str) -> SessionOutcome | None:
         summary = read_session_summary(runtime_session_id)

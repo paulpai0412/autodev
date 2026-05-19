@@ -267,12 +267,12 @@ def request_for_transition(
             title=f"Verify issue #{issue['number']} from DB-backed evidence",
             decision_summary=summary,
         )
-    if next_role == "release_worker":
+    if next_role == "main_orchestrator" and next_stage == "release_root_execution":
         return build_session_request(
             ledger,
-            role="release_worker",
+            role="main_orchestrator",
             stage=next_stage,
-            reason=f"release_worker dispatch for issue #{issue['number']}",
+            reason=f"release root-session dispatch for issue #{issue['number']}",
             title=f"Release issue #{issue['number']} on {issue['branch']}",
             decision_summary=summary,
         )
@@ -958,8 +958,8 @@ def reconcile_release_worker(
                 ledger,
                 {
                     "action": "no_change",
-                    "next_role": current.get("role") or "release_worker",
-                    "next_stage": current.get("stage") or "release_worker_execution",
+                    "next_role": current.get("role") or "main_orchestrator",
+                    "next_stage": current.get("stage") or "release_root_execution",
                     "summary": summary,
                     "request_title": "",
                 },
@@ -983,15 +983,15 @@ def reconcile_release_worker(
             )
             queue_transition_func(
                 ledger,
-                next_role="release_worker",
-                next_stage="release_worker_execution",
+                next_role="main_orchestrator",
+                next_stage="release_root_execution",
                 summary=summary,
                 updated_at=updated_at,
             )
             return ledger, subagent_decision_func(
                 ledger,
-                next_role="release_worker",
-                next_stage="release_worker_execution",
+                next_role="main_orchestrator",
+                next_stage="release_root_execution",
                 summary=summary,
             ), None
         return queue_orchestrator_recovery_func(
@@ -1052,15 +1052,15 @@ def reconcile_release_worker(
         )
         queue_transition_func(
             ledger,
-            next_role="release_worker",
-            next_stage="release_worker_execution",
+            next_role="main_orchestrator",
+            next_stage="release_root_execution",
             summary=retry_summary,
             updated_at=updated_at,
         )
         return ledger, subagent_decision_func(
             ledger,
-            next_role="release_worker",
-            next_stage="release_worker_execution",
+            next_role="main_orchestrator",
+            next_stage="release_root_execution",
             summary=retry_summary,
         ), None
     if failure_kind in non_terminal_release_failure_kinds:

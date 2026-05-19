@@ -131,14 +131,15 @@ Field responsibilities:
 - `current_role/current_stage/current_status` are the current workflow cursor.
 - `current_session_id` is the host-neutral operator resume target for the issue's current owner.
 - `attempts_json`, `limits_json`, and `last_failure_json` drive retry and recovery.
-- `runtime_context_json` stores compact runtime context that used to be split across ledger, checkpoint, request, and result files.
+- `runtime_context_json` stores compact runtime context that used to be split across ledger, checkpoint, request, and result files. It may also carry compact snapshot projections derived from auditable history, such as `release_child_session` for the latest foreground `release_worker` child trace under a release root session.
 - `issue_packet_json` stores the canonical compact issue input.
-- `latest_refs_json` stores pointers to the latest relevant history rows, such as the latest handoff, checkpoint, dispatch request, dispatch result, worker result, evidence packet, or release result.
+- `latest_refs_json` stores pointers to the latest relevant history rows, such as the latest handoff, checkpoint, dispatch request, dispatch result, worker result, evidence packet, or release result. It may also expose compact operator-facing refs such as `release_child_session` when the supervisor projects the latest release child trace from `issue_history` into the issue snapshot.
 
 There is intentionally no `current_root_session_id` and no `current_verifier_session_id`.
 
 - The current resumable owner lives in `current_session_id`.
 - Child session ids are kept only in `issue_history.payload_json`.
+- Snapshot projections may mirror the latest child-session trace into `runtime_context_json` or `latest_refs_json` for operator observability, but those projections do not replace `issue_history.payload_json` as the auditable source of truth.
 
 ### `issue_history`
 
@@ -269,6 +270,8 @@ Selection rules:
 - Release handling is separated from the main development loop and may run through a dedicated release coordinator or merge worker launched by an explicit release command.
 - The issue snapshot tracks only one resumable `current_session_id`.
 - Child task session ids are recorded in `issue_history` so they stay auditable without expanding the `issues` schema.
+- In the shipped OpenCode flow, release handling runs as a dedicated `main_orchestrator/release_root_execution` root session that launches `release_worker` as a foreground child role.
+- When that release-root child trace is recorded, the supervisor may project the latest `childRole`, `childSessionID`, `childSessionStatus`, `rootSessionID`, and `recordedAt` into `issues.runtime_context_json.release_child_session` plus `issues.latest_refs_json.release_child_session` so `inspect` and monitor can read it without rescanning history.
 
 ## Per-issue development loop
 
@@ -328,6 +331,8 @@ A verifier pass always moves the issue into `verified` first.
 - Release is not part of the required per-issue development loop.
 - The runtime may hand verified issues to a dedicated release coordinator, merge worker, or scheduled release sweep.
 - A release handler claims work from `verified` and then moves the issue into `release_pending` when release ownership actually begins; the shipped OpenCode command surface exposes this as `/autodev-release [issue-number]`.
+- The shipped OpenCode release path uses an independent release root session whose role/stage is `main_orchestrator/release_root_execution`; inside that root session, `release_worker` runs as a foreground child role.
+- The supervisor must preserve the full child-session fact in `issue_history.payload_json` and may additionally project the latest release child trace into the issue snapshot for operator visibility.
 - Human approval requirements, merge windows, and deployment policy belong to the release mechanism, not to the development loop.
 - When approval is missing, the issue remains releasable without blocking development on the next issue.
 - Post-merge cleanup and tracker closure remain release responsibilities.
@@ -344,11 +349,14 @@ Required operator actions remain:
 
 - inspect current issue state and latest history
 - inspect current development-slot occupancy and release-slot occupancy
+- inspect the latest projected release child-session trace when a release root session is active or recently recorded
 - quarantine an issue
 - resume a quarantined issue
 - fail a quarantined issue
 - retry a failed GitHub sync operation
 - launch independent release/merge handling for a verified issue
+
+`inspect` may therefore expose both raw issue snapshot data and compact projection fields such as `releaseChildSession` / `latestReleaseChildSession`, while monitor may emit release-child tracking events derived from the same snapshot projection.
 
 All operator actions append auditable `admin_action` rows.
 

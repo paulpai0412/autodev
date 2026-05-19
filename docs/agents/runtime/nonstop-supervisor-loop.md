@@ -49,8 +49,11 @@ If a child artifact is missing at a checkpoint, reconcile decides retry/recovery
 
 ### release_worker
 
-- Launched independently via release command (not from the main issue root loop).
+- Launched from an independent release root session created by the release command (not from the main issue root loop).
+- Inside that release root session, the actual `release_worker` must run as a foreground subagent.
 - Must submit: `release_result` via `submit-artifact`.
+- The release root session remains the only resumable owner in `issues.current_session_id`; child-session trace stays auditable in `issue_history.payload_json`.
+- The supervisor may additionally project the latest release child trace into `issues.runtime_context_json.release_child_session` and `issues.latest_refs_json.release_child_session` so `inspect` and monitor can surface it directly.
 
 ## Artifact submission contract
 
@@ -70,8 +73,10 @@ Reconcile must treat SQLite artifact facts as authoritative and avoid runtime YA
 ## Dispatch policy
 
 - Child subagents run from the same root orchestrator session in foreground (`run_in_background=false`) when executing issue_worker/pr_verifier steps.
+- The independent release root session likewise runs `release_worker` as a foreground subagent before returning to the release command result.
 - The main orchestrator waits for each child call to finish before deciding next stage.
 - Only next-issue handoff or explicit recovery may create a new root session.
+- For release-root execution, monitor/inspect should be able to observe the latest foreground child trace through the projected `release_child_session` snapshot, without treating that projection as a new lifecycle owner.
 
 ## Stop conditions for this loop
 
@@ -82,3 +87,9 @@ For one selected issue, the nonstop loop is complete when:
 3. reconcile returns release wait / release command handoff.
 
 At that point, merge/release proceeds through independent release flow.
+
+## Observability notes
+
+- `inspect` may expose `releaseChildSession` and `latestReleaseChildSession` when the release root has already recorded a foreground `release_worker` child trace.
+- Monitor may emit a `RELEASE_CHILD_SESSION_TRACKED` info event when issue state/cursor indicates `main_orchestrator/release_root_execution` and the release-child projection is present.
+- These observability projections exist for operator ergonomics only; the canonical child-session fact still lives in `issue_history.payload_json`.

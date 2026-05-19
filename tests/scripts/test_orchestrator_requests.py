@@ -100,8 +100,8 @@ def test_build_prompt_uses_primary_workspace_absolute_artifact_paths() -> None:
     )
     release_prompt = orchestrator_requests.build_prompt(
         ledger,
-        role="release_worker",
-        stage="release_worker_execution",
+        role="main_orchestrator",
+        stage="release_root_execution",
         decision_summary="release now",
         default_supervisor_doc_path="docs/agents/runtime/nonstop-supervisor-loop.md",
         default_release_result_template_path="docs/agents/release-result-template.yaml",
@@ -136,13 +136,16 @@ def test_build_prompt_for_release_worker_mentions_release_approval_override() ->
 
     prompt = orchestrator_requests.build_prompt(
         ledger,
-        role="release_worker",
-        stage="release_worker_execution",
+        role="main_orchestrator",
+        stage="release_root_execution",
         decision_summary="release now",
         default_supervisor_doc_path="docs/agents/runtime/nonstop-supervisor-loop.md",
         default_release_result_template_path="docs/agents/release-result-template.yaml",
     )
 
+    assert "You are the independent release root session" in prompt
+    assert 'task(subagent_type="general", ..., run_in_background=false)' in prompt
+    assert "foreground release_worker subagent" in prompt
     assert "Read the release runtime controls from the DB-backed control-plane context" in prompt
     assert "approval_override_mode" in prompt
     assert "bypass_approval" in prompt
@@ -150,6 +153,7 @@ def test_build_prompt_for_release_worker_mentions_release_approval_override() ->
     assert "merge_approval_mode" in prompt
     assert "override_scope" in prompt
     assert "return control to the supervisor/release command result" in prompt
+    assert "Do not perform the merge/close workflow directly from the release root shell" in prompt
     assert "return control to the main_orchestrator root session" not in prompt
 
 
@@ -279,8 +283,8 @@ def test_build_prompt_for_local_seeded_issue_avoids_github_issue_assumptions() -
     )
     release_prompt = orchestrator_requests.build_prompt(
         ledger,
-        role="release_worker",
-        stage="release_worker_execution",
+        role="main_orchestrator",
+        stage="release_root_execution",
         decision_summary="release now",
         default_supervisor_doc_path="docs/agents/runtime/nonstop-supervisor-loop.md",
         default_release_result_template_path="docs/agents/release-result-template.yaml",
@@ -310,8 +314,8 @@ def test_build_prompt_for_github_backed_issue_keeps_github_issue_language() -> N
 
     prompt = orchestrator_requests.build_prompt(
         ledger,
-        role="release_worker",
-        stage="release_worker_execution",
+        role="main_orchestrator",
+        stage="release_root_execution",
         decision_summary="release now",
         default_supervisor_doc_path="docs/agents/runtime/nonstop-supervisor-loop.md",
         default_release_result_template_path="docs/agents/release-result-template.yaml",

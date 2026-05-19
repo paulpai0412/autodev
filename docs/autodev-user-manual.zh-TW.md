@@ -99,6 +99,7 @@
 - issue ranking / selection 結果
 - runtime context、artifact refs、issue packet 內容與歷史 payload
 - verifier-owned PR facts 與 release 決策
+- release root session 的最新 foreground `release_worker` child trace 投影（供 inspect / monitor 直接觀察）
 
 #### 歷史 artifact 與 payload 投影（非 runtime 真相）
 
@@ -520,7 +521,15 @@ PYTHONPATH=. python3 scripts/orchestrator_supervisor.py inspect --base-dir <proj
 - `issue`
 - `latestDecision`
 - `latestGitHubSyncAttempt`
+- `releaseChildSession`：最新 release root foreground child trace 的 compact snapshot（若目前或最近一次 release root execution 有記錄）
+- `latestReleaseChildSession`：對應 `issue_history` 最新 release child trace 的 ref 與 compact 欄位
 - `releaseBackfill`（`mode`、`releaseCapacity`、`availableReleaseSlots`、`verifiedWaitingCount`）
+
+其中：
+
+- `releaseChildSession` 來自 `issues.runtime_context_json.release_child_session`
+- `latestReleaseChildSession` 來自 `issues.latest_refs_json.release_child_session`
+- 兩者都是為了 operator/monitor 可讀性而做的 snapshot projection；真正可稽核的 child session 事實仍以 `issue_history.payload_json` 為準
 
 ### 6.4 quarantine：人工隔離 issue
 
@@ -587,7 +596,14 @@ PYTHONPATH=. python3 scripts/orchestrator_supervisor.py retry-failed --base-dir 
 - `limits_json`
 - `last_failure_json`
 - `runtime_context_json`
+- `latest_refs_json`
 - `issue_packet_json`
+
+補充：
+
+- `runtime_context_json` 可保存 compact runtime context 與最新投影，例如 `release_child_session`
+- `latest_refs_json` 可保存最新 history pointer，例如 `release_result`、`pr_opened`，以及 `release_child_session`
+- `release_child_session` 這類 projection 只是為了讓 `inspect` / monitor 不必每次都掃整段 `issue_history`
 
 #### `issue_history`
 

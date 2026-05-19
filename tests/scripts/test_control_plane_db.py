@@ -22,11 +22,13 @@ from scripts.control_plane_db import (
     read_github_sync_attempt_by_command_id,
     read_issue,
     read_issue_packet,
+    read_release_child_session,
     read_latest_ref,
     read_latest_decision,
     read_latest_github_sync_attempt,
     read_latest_issue_history,
     read_runtime_context,
+    record_latest_ref_snapshot,
     release_slot_occupancy,
     record_pr_opened,
     ready_issues_for_selection,
@@ -433,8 +435,8 @@ def test_slot_occupancy_counts_development_and_release_pools_separately(tmp_path
         tmp_path,
         issue_number="45",
         updated_at="2026-05-11T10:01:00+08:00",
-        current_role="release_worker",
-        current_stage="release_worker_execution",
+        current_role="main_orchestrator",
+        current_stage="release_root_execution",
         current_status="queued",
     )
     _ = sync_issue_runtime_context(
@@ -760,3 +762,62 @@ def test_transition_issue_state_records_latest_ref_after_history_append(tmp_path
     assert issue["last_history_id"] == latest_history["history_id"]
     assert latest_ref["history_id"] == latest_history["history_id"]
     assert latest_ref["command_id"] == "cmd-claim"
+
+
+def test_release_child_session_projection_round_trips_through_snapshot_helpers(tmp_path: Path):
+    ensure_control_plane_db(tmp_path)
+
+    history_id = append_issue_history(
+        tmp_path,
+        issue_number="42",
+        entry_type="session_result",
+        created_at="2026-05-11T10:00:00+08:00",
+        role="main_orchestrator",
+        stage="release_root_execution",
+        status="success",
+        session_id="ses-release-root-42",
+        request_id="req-release-42",
+        command_id="req-release-42",
+        summary="release root recorded child trace",
+        payload={"childSessionID": "ses-release-worker-42"},
+        unique_key="session-result:42:release-child",
+    )
+    _ = sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-11T10:00:00+08:00",
+        runtime_context={
+            "release_child_session": {
+                "childRole": "release_worker",
+                "childSessionID": "ses-release-worker-42",
+                "childSessionStatus": "stop",
+                "rootSessionID": "ses-release-root-42",
+                "recordedAt": "2026-05-11T10:00:00+08:00",
+            }
+        },
+    )
+    record_latest_ref_snapshot(
+        tmp_path,
+        issue_number="42",
+        entry_type="release_child_session",
+        history_id=history_id,
+        created_at="2026-05-11T10:00:00+08:00",
+        command_id="req-release-42",
+        session_id="ses-release-root-42",
+        status="stop",
+        extra={
+            "childRole": "release_worker",
+            "childSessionID": "ses-release-worker-42",
+            "childSessionStatus": "stop",
+            "rootSessionID": "ses-release-root-42",
+            "recordedAt": "2026-05-11T10:00:00+08:00",
+        },
+    )
+
+    release_child_session = read_release_child_session(tmp_path, "42")
+    latest_ref = read_latest_ref(tmp_path, "42", "release_child_session")
+
+    assert release_child_session["childRole"] == "release_worker"
+    assert release_child_session["childSessionID"] == "ses-release-worker-42"
+    assert latest_ref["history_id"] == history_id
+    assert latest_ref["childSessionStatus"] == "stop"

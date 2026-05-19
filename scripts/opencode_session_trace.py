@@ -7,7 +7,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import cast
 
-from scripts.opencode_host_adapter import opencode_db_path, read_session_summary
+from scripts import opencode_db_path, read_session_summary
 
 
 JsonObject = dict[str, object]

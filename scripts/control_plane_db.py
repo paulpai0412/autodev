@@ -153,16 +153,20 @@ def _record_latest_ref(
     command_id: str = "",
     session_id: str = "",
     status: str = "",
+    extra: dict[str, Any] | None = None,
 ) -> None:
     issue = _read_issue_row(connection, issue_number) or {}
     latest_refs = _json_loads_dict(issue.get("latest_refs_json"))
-    latest_refs[entry_type] = {
+    ref_payload: dict[str, Any] = {
         "history_id": history_id,
         "created_at": created_at,
         "command_id": command_id,
         "session_id": session_id,
         "status": status,
     }
+    if extra:
+        ref_payload.update(extra)
+    latest_refs[entry_type] = ref_payload
     _update_issue_snapshot(
         connection,
         issue_number=issue_number,
@@ -571,7 +575,8 @@ def release_slot_occupancy(base_dir: Path) -> int:
             """
             SELECT * FROM issues
             WHERE state = 'release_pending'
-              AND current_role = 'release_worker'
+              AND current_role = 'main_orchestrator'
+              AND current_stage = 'release_root_execution'
               AND (current_status != '' OR current_session_id != '')
             ORDER BY issue_number ASC
             """
@@ -847,6 +852,39 @@ def read_artifact_fact(base_dir: Path, issue_number: str, entry_type: str) -> di
 def read_runtime_context(base_dir: Path, issue_number: str) -> dict[str, Any]:
     issue = read_issue(base_dir, issue_number) or {}
     return _json_loads_dict(issue.get("runtime_context_json"))
+
+
+def read_release_child_session(base_dir: Path, issue_number: str) -> dict[str, Any]:
+    runtime_context = read_runtime_context(base_dir, issue_number)
+    release_child_session = runtime_context.get("release_child_session")
+    return dict(release_child_session) if isinstance(release_child_session, dict) else {}
+
+
+def record_latest_ref_snapshot(
+    base_dir: Path,
+    *,
+    issue_number: str,
+    entry_type: str,
+    history_id: int,
+    created_at: str,
+    command_id: str = "",
+    session_id: str = "",
+    status: str = "",
+    extra: dict[str, Any] | None = None,
+) -> None:
+    ensure_control_plane_db(base_dir)
+    with _connection(base_dir) as connection:
+        _record_latest_ref(
+            connection,
+            issue_number=issue_number,
+            entry_type=entry_type,
+            history_id=history_id,
+            created_at=created_at,
+            command_id=command_id,
+            session_id=session_id,
+            status=status,
+            extra=extra,
+        )
 
 
 def record_artifact_fact(

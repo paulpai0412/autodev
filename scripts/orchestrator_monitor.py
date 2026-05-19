@@ -52,6 +52,12 @@ def _load_issue_json(issue: dict[str, Any] | None, key: str) -> JsonObject:
     return cast(JsonObject, payload) if isinstance(payload, dict) else {}
 
 
+def _release_child_session(issue: dict[str, Any] | None) -> JsonObject:
+    runtime_context = _load_issue_json(issue, "runtime_context_json")
+    payload = runtime_context.get("release_child_session")
+    return _json_object(payload)
+
+
 def _select_monitored_issue(*, base_dir: Path, issue_number: str | None) -> dict[str, Any] | None:
     if issue_number:
         return read_issue(base_dir, issue_number)
@@ -76,23 +82,23 @@ def _select_monitored_issue(*, base_dir: Path, issue_number: str | None) -> dict
 
 def _required_artifact_keys(*, current_role: str, current_stage: str, runtime_state: str) -> list[str]:
     required: list[str] = []
-    if current_role in {"pr_verifier", "release_worker"} or runtime_state in {"verifying"}:
+    if current_role in {"pr_verifier"} or (current_role == "main_orchestrator" and current_stage == "release_root_execution") or runtime_state in {"verifying"}:
         required.append("worker_result")
-    if current_role == "release_worker" or runtime_state in {"completed", "failed", "quarantined"}:
+    if (current_role == "main_orchestrator" and current_stage == "release_root_execution") or runtime_state in {"completed", "failed", "quarantined"}:
         required.append("evidence_packet")
     if current_role == "main_orchestrator" and current_stage == "issue_selection_or_recovery":
         required.append("release_result")
-    elif current_role == "release_worker" or runtime_state == "completed":
+    elif (current_role == "main_orchestrator" and current_stage == "release_root_execution") or runtime_state == "completed":
         required.append("release_result")
     return required
 
 
-def _current_role_artifact_key(current_role: str) -> str:
+def _current_role_artifact_key(current_role: str, current_stage: str) -> str:
     if current_role == "issue_worker":
         return "worker_result"
     if current_role == "pr_verifier":
         return "evidence_packet"
-    if current_role == "release_worker":
+    if current_role == "main_orchestrator" and current_stage == "release_root_execution":
         return "release_result"
     return ""
 
@@ -186,6 +192,7 @@ def collect_monitor_events(
     current_stage = str(current.get("stage") or "")
     current_status = str(current.get("status") or "")
     runtime_state = str(runtime_issue.get("state") or "")
+    release_child_session = _release_child_session(runtime_issue)
     effective_now = now or datetime.now().astimezone().isoformat(timespec="seconds")
     now_time = _parse_timestamp(effective_now)
     last_event_time = _parse_timestamp(str(runtime_issue.get("last_event_at") or ""))
@@ -216,7 +223,7 @@ def collect_monitor_events(
         and not str(runtime_issue.get("current_session_id") or "")
         and now_time
         and dispatching_time
-        and _artifact_fact_missing(issue=runtime_issue, artifact_key=_current_role_artifact_key(current_role))
+    and _artifact_fact_missing(issue=runtime_issue, artifact_key=_current_role_artifact_key(current_role, current_stage))
     ):
         if now_time - dispatching_time > timedelta(seconds=heartbeat_timeout_seconds):
             events.append(
@@ -283,6 +290,16 @@ def collect_monitor_events(
                 severity="info",
                 summary=f"No monitor anomalies detected for issue #{monitored_issue_number}.",
                 evidence={"issue_number": monitored_issue_number},
+            )
+        )
+
+    if current_role == "main_orchestrator" and current_stage == "release_root_execution" and release_child_session:
+        events.append(
+            _build_event(
+                rule_id="RELEASE_CHILD_SESSION_TRACKED",
+                severity="info",
+                summary=f"Issue #{monitored_issue_number} release root session is tracking a foreground release_worker child session.",
+                evidence={"issue_number": monitored_issue_number, **release_child_session},
             )
         )
 
