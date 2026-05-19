@@ -226,3 +226,70 @@ def test_main_blocks_when_runtime_db_is_tracked(tmp_path: Path, capsys):
     assert exit_code == 1
     assert f"[issue-packet-intake] project-root={tmp_path}" in captured.out
     assert "BLOCKED: tracked autodev runtime files must be removed from git index" in captured.out
+
+
+def test_infer_dependencies_publisher_blocked_by_issue_number_format():
+    from scripts.issue_packet_intake import infer_dependencies
+
+    issue = GitHubIssue(
+        number="10",
+        title="Runtime intake bridge",
+        body="## Blocked by\n- Blocked by issue #9\n",
+        url="https://github.com/paulpai0412/autodev/issues/10",
+        labels=["ready-for-agent"],
+    )
+
+    deps = infer_dependencies(issue)
+
+    assert "- Blocked by issue #9" in deps
+    assert "## Blocked by" not in deps
+
+
+def test_infer_dependencies_publisher_blocked_by_hash_only_format():
+    from scripts.issue_packet_intake import infer_dependencies
+
+    issue = GitHubIssue(
+        number="10",
+        title="Runtime intake bridge",
+        body="## Blocked by\n- Blocked by #9\n",
+        url="https://github.com/paulpai0412/autodev/issues/10",
+        labels=["ready-for-agent"],
+    )
+
+    deps = infer_dependencies(issue)
+
+    assert "- Blocked by #9" in deps
+    assert "## Blocked by" not in deps
+
+
+def test_infer_dependencies_no_deps_returns_none_sentinel():
+    from scripts.issue_packet_intake import infer_dependencies
+
+    issue = GitHubIssue(
+        number="10",
+        title="Runtime intake bridge",
+        body="Some description without dependency lines.\n",
+        url="https://github.com/paulpai0412/autodev/issues/10",
+        labels=["ready-for-agent"],
+    )
+
+    deps = infer_dependencies(issue)
+
+    assert deps == ["none"]
+
+
+def test_issue_packet_payload_dependencies_ingested_from_publisher_format(tmp_path: Path):
+    issue = GitHubIssue(
+        number="10",
+        title="Runtime intake bridge",
+        body="## Blocked by\n- Blocked by issue #9\n",
+        url="https://github.com/paulpai0412/autodev/issues/10",
+        labels=["ready-for-agent"],
+    )
+
+    payload = issue_packet_payload(issue, prepared_at="2026-05-19T10:00:00+08:00")
+
+    deps = payload["dependencies"]
+    assert isinstance(deps, list)
+    assert any("Blocked by issue #9" in str(d) for d in deps)
+    assert all("## Blocked by" not in str(d) for d in deps)

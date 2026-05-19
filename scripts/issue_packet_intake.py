@@ -58,8 +58,10 @@ def infer_parent_reference(issue: GitHubIssue) -> str:
 def infer_dependencies(issue: GitHubIssue) -> list[str]:
     dependencies: list[str] = []
     for line in issue.body.splitlines():
-        if re.search(r"(?i)depends on|blocked by|requires issue", line):
-            dependencies.append(line.strip())
+        stripped = line.strip()
+        if re.search(r"(?i)depends on|blocked by|requires issue", stripped):
+            if not re.match(r"^#{1,6}\s", stripped):
+                dependencies.append(stripped)
     return dependencies or ["none"]
 
 
