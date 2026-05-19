@@ -5533,6 +5533,141 @@ def test_reconcile_bootstrap_rebuilds_running_state_from_db_dispatch_result_root
     assert issue["current_session_id"] == "ses-root-42"
 
 
+def test_record_dispatch_result_history_does_not_collide_on_shared_source_session_id(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    orchestrator_supervisor._sync_issue_packet_to_db(tmp_path, issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    issue_43_packet = parse_issue_packet_text(
+        SAMPLE_ISSUE_PACKET.replace('number: "42"', 'number: "43"').replace("issue-42-demo", "issue-43-demo"),
+        "docs/agents/issue-packets/issue-43.yaml",
+    )
+    orchestrator_supervisor._sync_issue_packet_to_db(tmp_path, issue_43_packet, updated_at="2026-05-07T17:00:00+08:00")
+
+    orchestrator_supervisor._record_dispatch_result_history(
+        base_dir=tmp_path,
+        session_result={
+            "status": "error",
+            "error": "dispatch failed for 42",
+            "recordedAt": "2026-05-07T17:04:30+08:00",
+            "issueNumber": "42",
+            "branch": "agent/issue-42-demo",
+            "sourceSessionID": "workspace_reconcile",
+            "role": "main_orchestrator",
+            "stage": "orchestrator_bootstrap",
+            "reason": "orchestrator bootstrap continuation for issue #42",
+            "title": "Continue issue #42 on agent/issue-42-demo",
+        },
+    )
+    orchestrator_supervisor._record_dispatch_result_history(
+        base_dir=tmp_path,
+        session_result={
+            "status": "error",
+            "error": "dispatch failed for 43",
+            "recordedAt": "2026-05-07T17:04:31+08:00",
+            "issueNumber": "43",
+            "branch": "agent/issue-43-demo",
+            "sourceSessionID": "workspace_reconcile",
+            "role": "main_orchestrator",
+            "stage": "orchestrator_bootstrap",
+            "reason": "orchestrator bootstrap continuation for issue #43",
+            "title": "Continue issue #43 on agent/issue-43-demo",
+        },
+    )
+
+    latest_42 = orchestrator_supervisor.read_latest_dispatch_result(tmp_path, issue_number="42")
+    latest_43 = orchestrator_supervisor.read_latest_dispatch_result(tmp_path, issue_number="43")
+
+    assert latest_42 is not None
+    assert latest_43 is not None
+    assert latest_42["issueNumber"] == "42"
+    assert latest_42["error"] == "dispatch failed for 42"
+    assert latest_43["issueNumber"] == "43"
+    assert latest_43["error"] == "dispatch failed for 43"
+
+
+def test_start_issue_records_ready_rollback_reason_on_dispatch_error(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    orchestrator_supervisor._sync_issue_packet_to_db(tmp_path, issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+
+    with patch(
+        "scripts.orchestrator_supervisor.dispatch_session_request",
+        return_value={
+            "status": "error",
+            "error": "dispatch failed",
+            "recordedAt": "2026-05-07T17:10:00+08:00",
+            "issueNumber": "42",
+            "branch": "agent/issue-42-demo",
+            "sourceSessionID": "workspace_reconcile",
+            "role": "main_orchestrator",
+            "stage": "orchestrator_bootstrap",
+            "reason": "orchestrator bootstrap continuation for issue #42",
+            "title": "Continue issue #42 on agent/issue-42-demo",
+        },
+    ), patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+        _ = orchestrator_supervisor.start_issue(
+            base_dir=tmp_path,
+            issue_number="42",
+            source_session_id="workspace_reconcile",
+            updated_at="2026-05-07T17:10:00+08:00",
+        )
+
+    issue = read_issue(tmp_path, "42")
+    rollback = read_latest_issue_history(tmp_path, "42", entry_type="admin_action")
+    assert issue is not None
+    assert issue["state"] == "ready"
+    assert rollback is not None
+    payload = json.loads(str(rollback["payload_json"] or "{}"))
+    assert payload["rollback_reason"] == "dispatch_error:dispatch failed"
+    assert payload["restored_ready_for_agent"] is True
+
+
+def test_start_issue_blocks_rollback_when_latest_dispatch_result_has_active_root(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    orchestrator_supervisor._sync_issue_packet_to_db(tmp_path, issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    orchestrator_supervisor._record_dispatch_result_history(
+        base_dir=tmp_path,
+        session_result={
+            "status": "success",
+            "rootSessionID": "ses-live-root",
+            "recordedAt": "2026-05-07T17:09:59+08:00",
+            "issueNumber": "42",
+            "branch": "agent/issue-42-demo",
+            "sourceSessionID": "workspace_reconcile",
+            "role": "main_orchestrator",
+            "stage": "orchestrator_bootstrap",
+            "reason": "bootstrap dispatch result",
+            "title": "Continue issue #42 on agent/issue-42-demo",
+        },
+    )
+
+    with patch(
+        "scripts.orchestrator_supervisor.dispatch_session_request",
+        return_value={
+            "status": "error",
+            "error": "dispatch failed",
+            "recordedAt": "2026-05-07T17:10:00+08:00",
+            "issueNumber": "42",
+            "branch": "agent/issue-42-demo",
+            "sourceSessionID": "workspace_reconcile",
+            "role": "main_orchestrator",
+            "stage": "orchestrator_bootstrap",
+            "reason": "orchestrator bootstrap continuation for issue #42",
+            "title": "Continue issue #42 on agent/issue-42-demo",
+        },
+    ), patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+        try:
+            _ = orchestrator_supervisor.start_issue(
+                base_dir=tmp_path,
+                issue_number="42",
+                source_session_id="workspace_reconcile",
+                updated_at="2026-05-07T17:10:00+08:00",
+            )
+        except RuntimeError as error:
+            assert "rollback blocked" in str(error)
+            assert "ses-live-root" in str(error)
+        else:
+            raise AssertionError("expected rollback guard to block")
+
+
 def test_reconcile_issue_worker_without_root_session_evidence_keeps_dispatching_state(tmp_path: Path):
     issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")

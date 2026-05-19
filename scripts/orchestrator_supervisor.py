@@ -54,6 +54,7 @@ from scripts.control_plane_db import (
     transition_issue_state,
     upsert_issue_ranking,
     upsert_issue_state,
+    claim_issue_if_ready,
 )
 from scripts.host_adapter import HostAdapter, SessionStartContext
 
@@ -564,6 +565,7 @@ def _record_dispatch_result_history(
     if not issue_number or not recorded_at:
         return 0
     body_text = _session_result_body(session_result)
+    body_hash = _content_hash(body_text)
     return append_issue_history(
         base_dir,
         issue_number=issue_number,
@@ -578,8 +580,8 @@ def _record_dispatch_result_history(
         summary=str(session_result.get("reason") or status),
         payload=dict(session_result),
         body_text=body_text,
-        content_hash=_content_hash(body_text),
-        unique_key=f"dispatch-result:{request_id or recorded_at}",
+        content_hash=body_hash,
+        unique_key=f"dispatch-result:{issue_number}:{body_hash}",
     )
 
 
@@ -892,18 +894,20 @@ def start_issue(
         )
 
     issue_number = _validate_start_packet_issue_number(requested_issue_number=normalized_issue_number, packet=packet)
-    issue_state = read_issue(base_dir, issue_number)
-    state = str(issue_state.get("state") or "ready") if issue_state else "ready"
-    current_session_id = str(issue_state.get("current_session_id") or "") if issue_state else ""
-    if state != "ready" or current_session_id:
-        if state != "ready":
-            raise RuntimeError(f"issue #{issue_number} is already {state}; refusing duplicate start.")
-        raise RuntimeError(
-            f"issue #{issue_number} still has an active current session fence; refusing duplicate start."
-        )
-
     timestamp = _now(updated_at)
     ensure_issue_row(base_dir, issue_number=issue_number, updated_at=timestamp)
+    claim_command_id = f"start-issue:{issue_number}:claimed"
+    try:
+        _ = claim_issue_if_ready(
+            base_dir,
+            issue_number=issue_number,
+            command_id=claim_command_id,
+            scheduler_id="upsert",
+            reason=f"Upsert issue #{issue_number} state to claimed.",
+            updated_at=timestamp,
+        )
+    except ValueError as error:
+        raise RuntimeError(str(error)) from error
     resolved_base_branch = _resolve_issue_base_branch(base_dir, packet)
     if not resolved_base_branch:
         raise RuntimeError(f"issue #{issue_number} has unresolved stacked dependencies; refusing start until exactly one parent PR is stackable or all dependencies are completed")
@@ -934,13 +938,6 @@ def start_issue(
         summary=f"Resolved issue #{issue_number} base branch to {resolved_base_branch}.",
         payload={"issue_number": issue_number, "target_branch": packet.branch, "base_branch": resolved_base_branch},
         unique_key=f"stack-base:{issue_number}:{resolved_base_branch}:{timestamp}",
-    )
-    _ = upsert_issue_state(
-        base_dir=base_dir,
-        issue_number=issue_number,
-        state="claimed",
-        command_id=f"start-issue:{issue_number}:claimed",
-        updated_at=timestamp,
     )
     sync_error = _sync_issue_progress_label(
         base_dir=base_dir,
@@ -1031,14 +1028,26 @@ def start_issue(
             updated_at=recorded_at,
         )
     else:
+        prior_dispatch_result = read_latest_dispatch_result(base_dir, issue_number=issue_number)
+        _record_dispatch_result_history(base_dir=base_dir, session_result=session_result)
+        active_root_session_id = str((prior_dispatch_result or {}).get("rootSessionID") or "")
+        active_dispatch_status = str((prior_dispatch_result or {}).get("status") or "")
+        if active_root_session_id and active_dispatch_status == "success":
+            raise RuntimeError(
+                f"dispatch failure rollback blocked for issue #{issue_number}: latest dispatch_result has active root session {active_root_session_id}"
+            )
         failure_updated_at = str(session_result.get("recordedAt") or timestamp)
         release_issue_execution(
             base_dir=base_dir,
             issue_number=issue_number,
             restore_ready_for_agent=True,
             updated_at=failure_updated_at,
+            rollback_reason=(
+                f"dispatch_error:{str(session_result.get('error') or 'unknown')}"
+            ),
         )
-    _record_dispatch_result_history(base_dir=base_dir, session_result=session_result)
+    if session_result.get("status") == "success":
+        _record_dispatch_result_history(base_dir=base_dir, session_result=session_result)
     return session_result
 
 
@@ -2202,6 +2211,7 @@ def release_issue_execution(
     base_dir: Path,
     issue_number: str,
     restore_ready_for_agent: bool,
+    rollback_reason: str = "",
     final_state: str | None = None,
     updated_at: str | None = None,
 ) -> None:
@@ -2215,6 +2225,7 @@ def release_issue_execution(
         sync_local_main_after_release_merge=cast(Callable[..., str], _lifecycle_helpers.sync_local_main_after_release_merge),
         close_github_issue_after_release_merge=_close_github_issue_after_release_merge,
         transition_state=_transition_issue_state_if_possible,
+        rollback_reason=rollback_reason,
         final_state=final_state,
         updated_at=updated_at,
     )
@@ -2837,7 +2848,7 @@ def _record_session_result_history(base_dir: Path, ledger: JsonObject, session_r
         command_id=request_id,
         summary=str(session_result.get("reason") or status),
         payload=dict(session_result),
-        unique_key=f"session-result:{request_id}:{recorded_at}",
+        unique_key=f"session-result:{issue_number}:{request_id}:{recorded_at}",
     )
     if (
         str(session_result.get("role") or "") != "main_orchestrator"
