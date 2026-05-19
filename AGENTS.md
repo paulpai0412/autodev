@@ -36,7 +36,7 @@
 
 ## Workflow rules agents are likely to miss
 - `main_orchestrator` is orchestration-only. It validates contracts and routes work; it does **not** implement issue scope or perform final issue QA itself.
-- `issue_worker`, `pr_verifier`, and `release_worker` run as subagents inside the current root orchestrator session, and the root should launch them synchronously with `run_in_background: false`. Fresh root-session dispatch is only for `main_orchestrator` bootstrap/recovery handoff.
+- `issue_worker` and `pr_verifier` run as subagents inside the current root orchestrator session, and the root should launch them synchronously with `run_in_background: false`. `release_worker` runs as a synchronous foreground subagent inside an independent release root session claimed by the release command. Fresh root-session dispatch is only for `main_orchestrator` bootstrap/recovery handoff and the dedicated release root-session entrypoint.
 - On this branch, development scheduling is bounded and issue-scoped: multiple issues may progress concurrently, but the same issue must never have more than one active root orchestrator or development path.
 - `scripts/orchestrator_bootstrap_runner.py` and `scripts/orchestrator_supervisor.py` are now coupled through the SQLite control-plane schema and DB-backed dispatch/reconcile flow. Breaking issue/history field expectations will break bootstrap and recovery.
 
