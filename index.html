@@ -712,6 +712,13 @@
         return prefix + "-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
       }
 
+      function normalizeOptionalString(value) {
+        if (value === null || value === undefined || value === "") {
+          return null;
+        }
+        return String(value);
+      }
+
       function normalizeProject(project) {
         return {
           repoId: String(project.repoId),
@@ -741,11 +748,21 @@
             ? raw.flowRuns
                 .filter(function (flowRun) { return flowRun && flowRun.flowRunId; })
                 .map(function (flowRun) {
-                  var readinessPassed = typeof flowRun.readinessPassed === "boolean"
+                   var readinessPassed = typeof flowRun.readinessPassed === "boolean"
                     ? flowRun.readinessPassed
                     : true;
 
                   var pipeline = normalizeSpecPipeline(flowRun.specPipeline);
+                  var uiScope = Boolean(flowRun.ui_scope || flowRun.uiScope);
+                  var prototypeApproved = Boolean(flowRun.prototype_approved);
+                  var prototypeArtifactRef = normalizeOptionalString(flowRun.prototype_artifact_ref);
+                  var prototypeApprover = normalizeOptionalString(flowRun.prototype_approver);
+                  var prototypeApprovedAt = normalizeOptionalString(flowRun.prototype_approved_at);
+                  var prototypeGateDecision = flowRun.prototype_gate_decision === "approved" ? "approved" : "blocked";
+                  if (!uiScope || (prototypeApproved && prototypeArtifactRef)) {
+                    prototypeGateDecision = "approved";
+                  }
+
                   return {
                     flowRunId: String(flowRun.flowRunId),
                     repoId: String(flowRun.repoId || ""),
@@ -753,6 +770,12 @@
                     createdAt: String(flowRun.createdAt || nowIso()),
                     readinessPassed: readinessPassed,
                     specPipeline: pipeline,
+                    ui_scope: uiScope,
+                    prototype_approved: prototypeApproved,
+                    prototype_artifact_ref: prototypeArtifactRef,
+                    prototype_gate_decision: prototypeGateDecision,
+                    prototype_approver: prototypeApprover,
+                    prototype_approved_at: prototypeApprovedAt,
                   };
                 })
             : [],
@@ -983,13 +1006,21 @@
           return { checks: checks, canStartFlowRun: canStartFlowRun };
         }
 
-        function startFlowRun() {
+        function startFlowRun(prototypeOpts) {
           var gate = evaluateReadiness();
           if (!gate.canStartFlowRun) {
             throw new Error("Readiness gate failed. Fix checks before starting Flow Run.");
           }
 
-          return createFlowRunFromOrchestration({ readinessPassed: true });
+          var args = prototypeOpts && typeof prototypeOpts === "object" ? prototypeOpts : {};
+          return createFlowRunFromOrchestration({
+            readinessPassed: true,
+            ui_scope: args.ui_scope,
+            prototype_approved: args.prototype_approved,
+            prototype_artifact_ref: args.prototype_artifact_ref,
+            prototype_approver: args.prototype_approver,
+            prototype_approved_at: args.prototype_approved_at,
+          });
         }
 
         function createFlowRunFromOrchestration(input) {
@@ -1003,18 +1034,135 @@
             throw new Error("Cannot create Flow Run without repo binding.");
           }
 
+          var uiScope = Boolean(args.ui_scope || args.uiScope);
+          var prototypeApproved = Boolean(args.prototype_approved);
+          var prototypeArtifactRef = normalizeOptionalString(args.prototype_artifact_ref);
+          var prototypeApprover = normalizeOptionalString(args.prototype_approver);
+          var prototypeApprovedAt = normalizeOptionalString(args.prototype_approved_at);
+          var prototypeGateDecision = "approved";
+
+          if (uiScope && !(prototypeApproved && prototypeArtifactRef)) {
+            prototypeGateDecision = "blocked";
+          }
+
           var flowRun = {
             flowRunId: makeId("flow"),
             repoId: repoId,
-            stage: "clarify",
+            stage: "spec_pipeline",
             createdAt: nowIso(),
             readinessPassed: readinessPassed,
             specPipeline: createDefaultSpecPipeline(),
+            ui_scope: uiScope,
+            prototype_approved: prototypeApproved,
+            prototype_artifact_ref: prototypeArtifactRef,
+            prototype_gate_decision: prototypeGateDecision,
+            prototype_approver: prototypeApprover,
+            prototype_approved_at: prototypeApprovedAt,
           };
 
           db.flowRuns.push(flowRun);
           writeDb(db);
+          return db.flowRuns[db.flowRuns.length - 1];
+        }
+
+        function getFlowRun(flowRunId) {
+          var db = readDb();
+          return db.flowRuns.find(function (fr) {
+            return fr.flowRunId === String(flowRunId || "");
+          }) || null;
+        }
+
+        function updatePrototypeGate(flowRun, updates) {
+          var run = flowRun && typeof flowRun === "object" ? flowRun : {};
+          var patch = updates && typeof updates === "object" ? updates : {};
+          var next = Object.assign({}, run);
+
+          if (Object.prototype.hasOwnProperty.call(patch, "ui_scope") || Object.prototype.hasOwnProperty.call(patch, "uiScope")) {
+            next.ui_scope = Boolean(patch.ui_scope || patch.uiScope);
+          }
+          if (Object.prototype.hasOwnProperty.call(patch, "prototype_approved")) {
+            next.prototype_approved = Boolean(patch.prototype_approved);
+          }
+          if (Object.prototype.hasOwnProperty.call(patch, "prototype_artifact_ref")) {
+            next.prototype_artifact_ref = normalizeOptionalString(patch.prototype_artifact_ref);
+          }
+          if (Object.prototype.hasOwnProperty.call(patch, "prototype_approver")) {
+            next.prototype_approver = normalizeOptionalString(patch.prototype_approver);
+          }
+          if (Object.prototype.hasOwnProperty.call(patch, "prototype_approved_at")) {
+            next.prototype_approved_at = normalizeOptionalString(patch.prototype_approved_at);
+          }
+
+          if (!next.ui_scope || (next.prototype_approved && next.prototype_artifact_ref)) {
+            next.prototype_gate_decision = "approved";
+          } else {
+            next.prototype_gate_decision = "blocked";
+          }
+
+          return next;
+        }
+
+        function advanceFlowRunStage(flowRunId, targetStage, updates) {
+          var db = readDb();
+          var runIndex = db.flowRuns.findIndex(function (fr) {
+            return fr.flowRunId === String(flowRunId || "");
+          });
+
+          if (runIndex < 0) {
+            throw new Error("Flow Run not found: " + flowRunId);
+          }
+
+          var flowRun = updatePrototypeGate(db.flowRuns[runIndex], updates);
+
+          if (flowRun.ui_scope && flowRun.prototype_gate_decision === "blocked" && targetStage === "issue-plan") {
+            db.flowRuns[runIndex] = flowRun;
+            writeDb(db);
+            throw new Error("Prototype gate blocked: UI-scoped Flow Run requires approved prototype before advancing to issue-plan.");
+          }
+
+          if (flowRun.ui_scope && targetStage === "issue-plan" && flowRun.prototype_artifact_ref) {
+            flowRun.prototype_gate_decision = "approved";
+          }
+
+          flowRun.stage = targetStage;
+          db.flowRuns[runIndex] = flowRun;
+          writeDb(db);
           return flowRun;
+        }
+
+        function emitIssuePlanAcceptanceCriteria(flowRunId, criteria) {
+          var flowRun = getFlowRun(flowRunId);
+          if (!flowRun) {
+            throw new Error("Flow Run not found: " + flowRunId);
+          }
+
+          var list = Array.isArray(criteria) ? criteria : [];
+          var prototypeRef = normalizeOptionalString(flowRun.prototype_artifact_ref);
+
+          if (flowRun.ui_scope && !prototypeRef) {
+            throw new Error("UI-scoped Flow Run requires prototype_artifact_ref for issue acceptance criteria emission.");
+          }
+
+          return list.map(function (criterion, index) {
+            var item = criterion && typeof criterion === "object"
+              ? {
+                  id: normalizeOptionalString(criterion.id) || "AC-" + String(index + 1),
+                  text: normalizeOptionalString(criterion.text) || "",
+                }
+              : {
+                  id: "AC-" + String(index + 1),
+                  text: normalizeOptionalString(criterion) || "",
+                };
+
+            if (flowRun.ui_scope) {
+              item.prototype_ref = prototypeRef;
+              item.prototype_gate_decision = flowRun.prototype_gate_decision;
+              item.prototype_approver = flowRun.prototype_approver;
+              item.prototype_approved_at = flowRun.prototype_approved_at;
+            }
+
+            return item;
+          });
         }
 
         function listFlowRunEvents(flowRunId) {
@@ -1297,6 +1445,9 @@
           getActiveProject: getActiveProject,
           evaluateReadiness: evaluateReadiness,
           startFlowRun: startFlowRun,
+          getFlowRun: getFlowRun,
+          advanceFlowRunStage: advanceFlowRunStage,
+          emitIssuePlanAcceptanceCriteria: emitIssuePlanAcceptanceCriteria,
           listFlowRunEvents: listFlowRunEvents,
           replayFlowRunEvents: replayFlowRunEvents,
           appendFlowRunEvent: appendFlowRunEvent,
