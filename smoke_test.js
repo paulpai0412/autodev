@@ -89,6 +89,160 @@ function runTests() {
     assert.equal(app.getSpecPipelineStatus(flowRun.flowRunId).currentStage, "issue-plan");
   });
 
+  test("AC3: approval queue lists release-blocked PRs with approval state in one view", () => {
+    const app = createControlTowerApp({
+      storage: createMemoryStorage(),
+      env: {
+        githubToken: "ghp_demo",
+        runtimePathExists: true,
+        runtimeConfigExists: true,
+      },
+    });
+
+    app.registerProject({ repoId: "acme/alpha", displayName: "Alpha" });
+    app.switchActiveProject("acme/alpha");
+    const flowRun = app.startFlowRun();
+
+    const queue = app.listApprovalQueue(flowRun.flowRunId);
+    assert.equal(Array.isArray(queue), true);
+    assert.equal(queue.length >= 2, true);
+    assert.equal(queue[0].releaseBlocked, true);
+    assert.equal(typeof queue[0].approvalState, "string");
+    assert.equal(typeof queue[0].releasePathState, "string");
+  });
+
+  test("AC4: approving GitHub identity is explicit before approval submit", () => {
+    const app = createControlTowerApp({
+      storage: createMemoryStorage(),
+      env: {
+        githubToken: "ghp_demo",
+        runtimePathExists: true,
+        runtimeConfigExists: true,
+        githubLogin: "paulpai0412",
+        githubAvatarUrl: "https://avatars.githubusercontent.com/u/1?v=4",
+      },
+    });
+
+    app.registerProject({ repoId: "acme/alpha", displayName: "Alpha" });
+    app.switchActiveProject("acme/alpha");
+    const flowRun = app.startFlowRun();
+
+    const identity = app.getApprovingIdentity(flowRun.flowRunId);
+    assert.equal(identity.login, "paulpai0412");
+    assert.equal(
+      identity.avatarUrl,
+      "https://avatars.githubusercontent.com/u/1?v=4",
+    );
+  });
+
+  test("AC5: approval action records GitHub review result and unblocks release path", () => {
+    const app = createControlTowerApp({
+      storage: createMemoryStorage(),
+      env: {
+        githubToken: "ghp_demo",
+        runtimePathExists: true,
+        runtimeConfigExists: true,
+        githubLogin: "paulpai0412",
+        approvePullRequest(payload) {
+          return {
+            reviewId: "rvw-1",
+            accepted: true,
+            prNumber: payload.prNumber,
+          };
+        },
+      },
+    });
+
+    app.registerProject({ repoId: "acme/alpha", displayName: "Alpha" });
+    app.switchActiveProject("acme/alpha");
+    const flowRun = app.startFlowRun();
+
+    const queue = app.listApprovalQueue(flowRun.flowRunId);
+    const target = queue.find((item) => item.requiredChecksPassed && item.policyReady);
+    assert.ok(target, "expected at least one approvable queue item");
+
+    const result = app.approveReleaseBlockedPullRequest(flowRun.flowRunId, {
+      prNumber: target.prNumber,
+    });
+    assert.equal(result.approvalState, "approved");
+    assert.equal(result.reviewResult.state, "APPROVED");
+    assert.equal(result.reviewResult.reviewer, "paulpai0412");
+    assert.equal(result.releasePathState, "ready");
+    assert.equal(result.releaseBlocked, false);
+
+    const stored = app.listApprovalQueue(flowRun.flowRunId).find((item) => item.prNumber === target.prNumber);
+    assert.equal(stored.releasePathState, "ready");
+    assert.equal(stored.releaseBlocked, false);
+    assert.equal(stored.reviewResult.state, "APPROVED");
+  });
+
+  test("AC5: GitHub-native approval command is gh pr review --approve", () => {
+    const app = createControlTowerApp({ storage: createMemoryStorage() });
+
+    const command = app.buildGitHubApproveCommand({
+      repoId: "acme/alpha",
+      prNumber: 88,
+      body: "Ship it",
+    });
+
+    assert.deepEqual(command, [
+      "gh",
+      "pr",
+      "review",
+      "88",
+      "--repo",
+      "acme/alpha",
+      "--approve",
+      "--body",
+      "Ship it",
+    ]);
+  });
+
+  test("AC5: approval action can submit through gh command adapter and record command", () => {
+    const recorded = [];
+    const app = createControlTowerApp({
+      storage: createMemoryStorage(),
+      env: {
+        githubToken: "ghp_demo",
+        runtimePathExists: true,
+        runtimeConfigExists: true,
+        githubLogin: "paulpai0412",
+        runCommand(payload) {
+          recorded.push(payload.command);
+          return { ok: true };
+        },
+      },
+    });
+
+    app.registerProject({ repoId: "acme/alpha", displayName: "Alpha" });
+    app.switchActiveProject("acme/alpha");
+    const flowRun = app.startFlowRun();
+    const target = app
+      .listApprovalQueue(flowRun.flowRunId)
+      .find((item) => item.requiredChecksPassed && item.policyReady);
+
+    const result = app.approveReleaseBlockedPullRequest(flowRun.flowRunId, {
+      prNumber: target.prNumber,
+      body: "Approved by operator",
+    });
+
+    assert.equal(recorded.length, 1);
+    assert.deepEqual(recorded[0], [
+      "gh",
+      "pr",
+      "review",
+      String(target.prNumber),
+      "--repo",
+      "acme/alpha",
+      "--approve",
+      "--body",
+      "Approved by operator",
+    ]);
+    assert.deepEqual(result.reviewCommand, recorded[0]);
+    assert.equal(result.releasePathState, "ready");
+    assert.equal(result.releaseBlocked, false);
+  });
+
   test("AC4: pipeline emits structured stage status and blocking prompts", () => {
     const app = createControlTowerApp({
       storage: createMemoryStorage(),
