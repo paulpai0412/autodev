@@ -133,3 +133,78 @@ def test_select_blocks_child_issue_when_parent_pr_is_not_stackable(tmp_path: Pat
     )
 
     assert "12" not in [packet.issue_number for packet in selected]
+
+
+def test_dependency_issue_numbers_parses_publisher_blocked_by_issue_number_format() -> None:
+    dependencies = ["- Blocked by issue #9"]
+    numbers = _dependency_issue_numbers("10", dependencies)
+    assert numbers == ["9"]
+
+
+def test_dependency_issue_numbers_parses_publisher_blocked_by_hash_only_format() -> None:
+    dependencies = ["- Blocked by #9"]
+    numbers = _dependency_issue_numbers("10", dependencies)
+    assert numbers == ["9"]
+
+
+def test_dependency_issue_numbers_excludes_self_reference() -> None:
+    dependencies = ["- Blocked by issue #10"]
+    numbers = _dependency_issue_numbers("10", dependencies)
+    assert numbers == []
+
+
+def test_select_blocks_child_issue_with_publisher_blocked_by_issue_format(tmp_path: Path) -> None:
+    ingest_issue_packet(
+        tmp_path,
+        issue_number="9",
+        issue_packet=_packet("9", branch="agent/issue-9-parent", dependencies=["none"]),
+        updated_at="2026-05-19T10:00:00+08:00",
+    )
+    ingest_issue_packet(
+        tmp_path,
+        issue_number="10",
+        issue_packet=_packet(
+            "10",
+            branch="agent/issue-10-child",
+            dependencies=["## Blocked by", "- Blocked by issue #9"],
+        ),
+        updated_at="2026-05-19T10:01:00+08:00",
+    )
+
+    selected_before = select_issue_packets_for_capacity(
+        tmp_path,
+        workflow={},
+        current_issue={"number": "", "parentReference": ""},
+        completed_issue_numbers_func=lambda _base_dir: set(),
+        parse_issue_packet_text=_unused_parse_issue_packet_text,
+        sync_issue_packet_to_db_func=lambda *_args, **_kwargs: None,
+        issue_packet_record_from_json=issue_packet_record_from_json,
+        dependency_issue_numbers=_dependency_issue_numbers,
+        now=lambda value: value or "2026-05-19T10:02:00+08:00",
+        development_capacity=1,
+    )
+
+    assert "10" not in [packet.issue_number for packet in selected_before]
+
+    upsert_issue_state(
+        tmp_path,
+        issue_number="9",
+        state="completed",
+        command_id="complete-9",
+        updated_at="2026-05-19T10:02:30+08:00",
+    )
+
+    selected_after = select_issue_packets_for_capacity(
+        tmp_path,
+        workflow={},
+        current_issue={"number": "", "parentReference": ""},
+        completed_issue_numbers_func=lambda _base_dir: {"9"},
+        parse_issue_packet_text=_unused_parse_issue_packet_text,
+        sync_issue_packet_to_db_func=lambda *_args, **_kwargs: None,
+        issue_packet_record_from_json=issue_packet_record_from_json,
+        dependency_issue_numbers=_dependency_issue_numbers,
+        now=lambda value: value or "2026-05-19T10:03:00+08:00",
+        development_capacity=1,
+    )
+
+    assert "10" in [packet.issue_number for packet in selected_after]
