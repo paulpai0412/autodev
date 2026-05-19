@@ -32,6 +32,18 @@ class SessionStartResult:
     readability_status: str = ""
     metadata: dict[str, object] = field(default_factory=dict)
 
+    @property
+    def should_retry_without_source_session(self) -> bool:
+        """Signal whether dispatch should retry once without source-session linkage.
+
+        Some hosts reject continuation/pre-filled contexts with errors like
+        "assistant message prefill". In that case, the orchestrator can recover
+        by launching a fresh root session without source-session affinity.
+        """
+
+        value = self.metadata.get("retryWithoutSourceSession")
+        return bool(value)
+
 
 @dataclass(frozen=True)
 class SessionOutcome:

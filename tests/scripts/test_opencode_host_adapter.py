@@ -244,6 +244,19 @@ def test_open_code_host_adapter_start_root_session_returns_error_when_probe_fail
     assert process.terminated is True
 
 
+def test_open_code_host_adapter_sets_retry_flag_for_prefill_error(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    process = _FakeProcess(stdout=io.StringIO(), stderr=io.StringIO("Bad Request: This model does not support assistant message prefill."), poll_result=None)
+    monkeypatch.setattr(adapter, "spawn_detached_opencode_run", lambda command, workdir: process)
+    monkeypatch.setattr(adapter, "read_initial_session_id", lambda *args, **kwargs: (None, "", "Bad Request: This model does not support assistant message prefill."))
+    monkeypatch.setattr(adapter, "wait_for_session_id_in_db", lambda *args, **kwargs: None)
+
+    host = adapter.OpenCodeHostAdapter(cli_resolver=lambda: "/fake/opencode")
+    result = host.start_root_session(_session_context(tmp_path, agent="build"))
+
+    assert result.status == "error"
+    assert result.should_retry_without_source_session is True
+
+
 def test_open_code_host_adapter_start_root_session_success_omits_build_agent(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     captured: dict[str, object] = {}
     process = _FakeProcess(stdout=io.StringIO(), stderr=io.StringIO(), poll_result=0)

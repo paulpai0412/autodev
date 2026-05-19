@@ -13,6 +13,7 @@ class IssuePacketRecord:
     issue_number: str
     title: str
     branch: str
+    base_branch: str
     backing_type: str
     prior_handoff: str
     labels: list[str]
@@ -210,7 +211,7 @@ def _dependency_issue_numbers(issue_number: str, dependencies: list[str]) -> lis
     numbers: list[str] = []
     for dependency in dependencies:
         lowered = dependency.lower()
-        blocked_match = re.search(r"blocked by issue\s*#(\d+)", lowered)
+        blocked_match = re.search(r"blocked by(?:\s+issue)?\s*#(\d+)", lowered)
         if blocked_match:
             blocked_by = blocked_match.group(1)
             if blocked_by != issue_number and blocked_by not in numbers:
@@ -219,6 +220,9 @@ def _dependency_issue_numbers(issue_number: str, dependencies: list[str]) -> lis
         if not any(token in lowered for token in ["released", "closed", "complete", "depends on", "requires"]):
             continue
         for found in _parse_issue_numbers(dependency):
+            if found != issue_number and found not in numbers:
+                numbers.append(found)
+        for found in re.findall(r"(?<!\w)#(\d+)", dependency):
             if found != issue_number and found not in numbers:
                 numbers.append(found)
     return numbers
@@ -282,12 +286,14 @@ def parse_issue_packet_text(text: str, issue_packet_path: str) -> IssuePacketRec
     branch = _extract_mapping_value_optional(text, "branch:", "name")
     if not branch:
         raise ValueError("missing 'name' in mapping 'branch:'")
+    base_branch = _extract_mapping_value_optional(text, "branch:", "base") or "main"
     prior_handoff = _extract_nested_scalar_optional(text, "bootstrap_context", "prior_handoff")
     backing_type = "github" if issue_url else "local_seeded"
     return IssuePacketRecord(
         issue_number=issue_number,
         title=title,
         branch=branch,
+        base_branch=base_branch,
         backing_type=backing_type,
         prior_handoff="" if prior_handoff == "none" else prior_handoff,
         labels=_extract_issue_labels(text),
@@ -302,6 +308,7 @@ def issue_packet_record_to_json(record: IssuePacketRecord) -> JsonObject:
         "issue_number": record.issue_number,
         "title": record.title,
         "branch": record.branch,
+        "base_branch": record.base_branch,
         "backing_type": record.backing_type,
         "prior_handoff": record.prior_handoff,
         "labels": list(record.labels),
@@ -324,6 +331,7 @@ def issue_packet_record_from_json(payload: dict[str, object]) -> IssuePacketReco
         issue_number=issue_number,
         title=str(payload.get("title") or ""),
         branch=branch,
+        base_branch=str(payload.get("base_branch") or "main"),
         backing_type=str(payload.get("backing_type") or "github"),
         prior_handoff=str(payload.get("prior_handoff") or ""),
         labels=labels,

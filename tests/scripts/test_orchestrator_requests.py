@@ -35,6 +35,11 @@ def test_build_prompt_for_main_orchestrator_excludes_release_worker_child_subage
     assert "Use the DB-backed supervisor reconcile flow before the first issue_worker launch" in prompt
     assert "Use the first supervisor decision to confirm the issue_worker dispatch" in prompt
     assert "Wait for each child task call to finish in the foreground before continuing." in prompt
+    assert 'load_skills=["tdd", "karpathy-guidelines", "git-master"]' in prompt
+    assert 'load_skills=["tdd", "karpathy-guidelines", "git-master", "web-design-engineer"]' in prompt
+    assert "Do not omit tdd for code-changing issue work." in prompt
+    assert 'load_skills=["review-work", "karpathy-guidelines"]' in prompt
+    assert 'load_skills=["review-work", "karpathy-guidelines", "browser-qa", "e2e-testing"]' in prompt
     assert "Do not include karpathy-guidelines in load_skills for child subagents" not in prompt
 
 
@@ -173,7 +178,15 @@ def test_build_prompt_for_pr_verifier_requires_evidence_packet_before_completion
     )
 
     assert "Persist verifier acceptance or failure as an evidence_packet via submit-artifact" in prompt
+    assert "Evidence payload contract" in prompt
+    assert "surface_qa_gate as an object {status: 'pass', evidence_ref: '<non-empty>'}" in prompt
     assert "Do not stop, summarize, or report verification progress until the evidence_packet payload is stored in SQLite" in prompt
+    assert "Immediately after submit-artifact for evidence_packet, run inspect" in prompt
+    assert "Inspect command: python3 scripts/orchestrator_supervisor.py inspect --base-dir" in prompt
+    assert "If inspect does not show persisted evidence_packet" in prompt
+    assert "Only return after SQLite persistence is visible via inspect" in prompt
+    assert 'load_skills containing "review-work"' in prompt
+    assert 'include both "browser-qa" and "e2e-testing" in pr_verifier load_skills' in prompt
 
 
 def test_build_prompt_for_issue_worker_requires_pr_metadata_before_success() -> None:
@@ -182,6 +195,7 @@ def test_build_prompt_for_issue_worker_requires_pr_metadata_before_success() -> 
         "issue": {
             "number": "18",
             "branch": "agent/issue-18-demo",
+            "baseBranch": "agent/issue-17-parent",
         },
         "workflow": {
             "workflowPolicyPath": "docs/agents/autonomous-development-workflow.yaml",
@@ -201,7 +215,10 @@ def test_build_prompt_for_issue_worker_requires_pr_metadata_before_success() -> 
     )
 
     assert "Persist the normalized worker_result into SQLite with submit-artifact" in prompt
+    assert "fetch and merge the latest base branch" in prompt
     assert "Do not report status=success until the implementation branch is pushed" in prompt
+    assert 'include "web-design-engineer" in issue_worker load_skills before coding.' in prompt
+    assert "from base branch agent/issue-17-parent" in prompt
     assert "Do not create the formal PR" in prompt
     assert "submit blocked or failed instead of success" in prompt
 
@@ -211,6 +228,7 @@ def test_build_prompt_for_pr_verifier_owns_formal_pr_creation() -> None:
         "issue": {
             "number": "18",
             "branch": "agent/issue-18-demo",
+            "baseBranch": "agent/issue-17-parent",
         },
         "workflow": {
             "workflowPolicyPath": "docs/agents/autonomous-development-workflow.yaml",
@@ -229,6 +247,8 @@ def test_build_prompt_for_pr_verifier_owns_formal_pr_creation() -> None:
 
     assert "create or record the formal PR" in prompt
     assert "include pr_number in the evidence_packet payload" in prompt
+    assert "head branch agent/issue-18-demo and base branch agent/issue-17-parent" in prompt
+    assert "include base_branch in the evidence_packet payload" in prompt
 
 
 def test_build_prompt_for_local_seeded_issue_avoids_github_issue_assumptions() -> None:

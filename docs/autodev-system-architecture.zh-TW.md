@@ -93,7 +93,7 @@ sequenceDiagram
 
 | 子命令 | 必填 flags | 可選 flags（預設） | 用途 |
 |---|---|---|---|
-| `init` | 無 | `--project-root` (`.`), `--github-repo` (`paulpai0412/wferp`), `--dry-run`, `--check`, `--force`, `--json` | 初始化 consumer project 與 GitHub wiring |
+| `init` | 無 | `--project-root` (`.`), `--github-repo` (`paulpai0412/autodev`), `--dry-run`, `--check`, `--force`, `--json` | 初始化 consumer project 與 GitHub wiring |
 | `install-commands` | 無 | `--commands-dir` (預設由 host adapter，否則 `~/.config/opencode/commands`), `--dry-run`, `--force`, `--json` | 安裝全域 `/autodev-*` 命令 |
 | `doctor` | 無 | `--project-root` (`.`), `--json` | 專案 readiness 檢查 |
 | `start` | `--issue-number` | `--project-root` (`.`) | 啟動指定 issue |
@@ -140,7 +140,7 @@ sequenceDiagram
 
 | 參數 | 必填 | 預設 | 用途 |
 |---|---|---|---|
-| `--repo` | 否 | `AUTODEV_GITHUB_REPO` 或 `paulpai0412/wferp` | GitHub issue 來源 repo |
+| `--repo` | 否 | `AUTODEV_GITHUB_REPO` 或 `paulpai0412/autodev` | GitHub issue 來源 repo |
 | `--issues-json` | 否 | 無 | 本地 fixture JSON |
 | `--project-root` | 否 | `.` | consumer project root |
 | `--output-dir` | 否 | 無 | deprecated compatibility flag（DB-backed intake 忽略輸出） |
@@ -149,7 +149,7 @@ sequenceDiagram
 
 | 變數 | 讀取位置 | 允許值 | 預設 | 影響 |
 |---|---|---|---|---|
-| `AUTODEV_GITHUB_REPO` | `scripts/issue_packet_intake.py` (module-level `DEFAULT_REPO`) | `<owner/repo>` | `paulpai0412/wferp` | intake 來源 repo |
+| `AUTODEV_GITHUB_REPO` | `scripts/issue_packet_intake.py` (module-level `DEFAULT_REPO`) | `<owner/repo>` | `paulpai0412/autodev` | intake 來源 repo |
 | `AUTODEV_HOME` | `scripts/autodev_project.py:_command_templates`（產生全域命令時嵌入） | 路徑字串 | `${AUTODEV_HOME:-~/apps/autodev}` 或當前 workflow repo | `/autodev-*` 命令指向哪個 autodev 安裝路徑 |
 | `AUTODEV_DEVELOPMENT_CAPACITY` | `scripts/orchestrator_supervisor.py:_development_capacity` | 正整數字串 | `1` | 同時可進行的開發 issue 數 |
 | `AUTODEV_RELEASE_CAPACITY` | `scripts/orchestrator_supervisor.py:_release_capacity` | 正整數字串 | `1` | 同時可進行的 release issue 數 |
@@ -247,3 +247,11 @@ PYTHONPATH=. python3 scripts/autodev_project.py release --project-root <project>
 - `docs/agents/runtime/multi-issue-concurrency.md`
 - `docs/agents/runtime/host-adapter-strategy.md`
 - `docs/autodev-user-manual.zh-TW.md`
+
+
+Bad Request: This model does not support assistant message prefill. The conversation must end with a user message.
+
+
+我想為autodev做一個網頁應用，除了自動開發流程外，還要加上由新增或維護一個專案開始，由grill-me-doc生成需求文檔，再由to-prd產生產品規格書，再交給to-issue生成github issue list,然後使用autodev進行自動化開發循環，使用autodev-flow skill由零到完成逐步完成專案推進，包含專案init,intake,start,reconcile,release,completed等步驟，可監控每個session執行進度，包含主seesion,issue worker,pr_verifier,release worker的交付狀況及SSE訊息流，需有主控看板可看全部issue執行狀態，並可手動介入進行recovery或reconcile,看板可看到整個完成進度KPI，請先看下autodev專案現有功能，設計WEB UI方案給我，並提供此專案定位建議，以利UI設計方向規劃
+
+/to-issues 整合prd及ui 原型，展開issues, 並記錄每個issue的相依性及依先後執行順序排列issue編號

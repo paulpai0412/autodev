@@ -16,6 +16,7 @@
 - Script-level regressions live in `tests/scripts/`. If you change one orchestrator script, update the matching test file.
 
 ## Exact operator commands
+- Preferred operator interface: `autodev-flow` skill contracts (`C0..C6`). Use script-level commands below only as low-level execution/debug surfaces.
 - Minimal verified setup: `python3 -m pip install pytest`
 - Initialize a consumer project and bootstrap git/GitHub wiring: `PYTHONPATH=. python3 scripts/autodev_project.py init --project-root <project> --github-repo <owner/repo>`
 - Install user-global autodev host commands (OpenCode adapter by default): `PYTHONPATH=. python3 scripts/autodev_project.py install-commands`
@@ -43,7 +44,7 @@
 - Consumer projects keep `.autodev.yaml`, domain docs, generated artifacts, and runtime state; they must not keep local copies of workflow scripts, templates, command docs, or plugins.
 - Runtime source of truth is `.opencode/runtime/control-plane.sqlite3`; issue selection, lifecycle, audit, dispatch facts, and resume state must all be recoverable from SQLite.
 - Local issue packet / handoff / worker-result / evidence / release-result files must not be required for runtime progress on this branch. If compatibility artifacts still exist, they are historical projections only; runtime gates must read DB facts from `issues` and `issue_history`.
-- GitHub intake defaults to `paulpai0412/wferp`; override `AUTODEV_GITHUB_REPO` when this workspace should target a different tracker.
+- GitHub intake defaults to `paulpai0412/autodev`; override `AUTODEV_GITHUB_REPO` when this workspace should target a different tracker.
 - Keep repo artifacts compact and index-only. Any historical artifact docs that remain should stay compact and non-canonical.
 - `python3 scripts/agent_context_budget_check.py` is the artifact gate. Do not paste raw test logs, browser traces, screenshots, SQL logs, or full transcripts into repo docs or GitHub comments; store only compact summaries plus refs.
 

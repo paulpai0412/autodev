@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Protocol, cast
 from uuid import uuid4
@@ -10,6 +11,8 @@ from uuid import uuid4
 
 JsonObject = dict[str, object]
 ReconcileResult = tuple[JsonObject, JsonObject, JsonObject | None]
+
+PR_VERIFIER_QUEUE_GRACE_SECONDS = 90
 
 
 def _set_artifact_ref(artifacts: dict[str, str], semantic_key: str, value: str) -> None:
@@ -77,10 +80,134 @@ def _extract_pr_number_from_fact(fact: dict[str, object]) -> str:
     return ""
 
 
+def _issue_packet_requires_browser_e2e(issue_packet: dict[str, object] | None) -> bool:
+    if not isinstance(issue_packet, dict):
+        return False
+    verifier_manual_qa_raw = issue_packet.get("verifier_manual_qa")
+    if not isinstance(verifier_manual_qa_raw, dict):
+        return False
+    surface_raw = str(verifier_manual_qa_raw.get("surface") or "").strip().lower()
+    if not surface_raw:
+        return False
+    return any(token in surface_raw for token in ("browser", "static-html", "static html", "web_ui", "web ui", "html"))
+
+
+def _worker_result_web_surface_changed(worker_result: dict[str, object]) -> bool:
+    files_changed_raw = worker_result.get("files_changed")
+    paths: list[str] = []
+    if isinstance(files_changed_raw, list):
+        for item in files_changed_raw:
+            if isinstance(item, dict):
+                path_text = str(item.get("path") or "").strip().lower()
+                if path_text:
+                    paths.append(path_text)
+            elif isinstance(item, str):
+                path_text = item.strip().lower()
+                if path_text:
+                    paths.append(path_text)
+    for path_text in paths:
+        if path_text.endswith((".html", ".htm", ".css", ".tsx", ".jsx", ".vue", ".svelte")):
+            return True
+        if any(token in path_text for token in ("/index.html", "/public/", "/static/", "/templates/", "/frontend/", "/ui/", "/pages/", "/components/")):
+            return True
+    return False
+
+
+def _evidence_has_browser_e2e_gate(evidence_packet: dict[str, object]) -> bool:
+    gates_raw = evidence_packet.get("gates")
+    if not isinstance(gates_raw, dict):
+        return False
+
+    surface_gate_raw = gates_raw.get("surface_qa_gate")
+
+    # Preferred contract: surface_qa_gate is an object with status + evidence_ref.
+    if isinstance(surface_gate_raw, dict):
+        surface_gate = cast(dict[str, object], surface_gate_raw)
+        status = str(surface_gate.get("status") or "").strip().lower()
+        evidence_ref = str(surface_gate.get("evidence_ref") or "").strip()
+        return status == "pass" and bool(evidence_ref)
+
+    # Backward-compatible contract: legacy flat gate strings.
+    if isinstance(surface_gate_raw, str):
+        if surface_gate_raw.strip().lower() != "pass":
+            return False
+
+        browser_gate_raw = gates_raw.get("browser_e2e_gate")
+        browser_gate_pass = False
+        if isinstance(browser_gate_raw, str):
+            browser_gate_pass = browser_gate_raw.strip().lower() == "pass"
+        elif isinstance(browser_gate_raw, dict):
+            browser_gate = cast(dict[str, object], browser_gate_raw)
+            browser_gate_pass = str(browser_gate.get("status") or "").strip().lower() == "pass"
+
+        browser_evidence_raw = evidence_packet.get("browser_e2e_evidence")
+        has_browser_evidence = isinstance(browser_evidence_raw, dict) and bool(browser_evidence_raw)
+
+        artifact_manifest_raw = evidence_packet.get("artifact_manifest")
+        has_manifest = isinstance(artifact_manifest_raw, list) and len(artifact_manifest_raw) > 0
+
+        return browser_gate_pass and (has_browser_evidence or has_manifest)
+
+    return False
+
+
+def _browser_e2e_gate_deficiency(evidence_packet: dict[str, object]) -> str:
+    gates_raw = evidence_packet.get("gates")
+    if not isinstance(gates_raw, dict):
+        return "missing key: gates (object)"
+
+    surface_gate_raw = gates_raw.get("surface_qa_gate")
+    if not isinstance(surface_gate_raw, dict):
+        return "missing key: gates.surface_qa_gate (object)"
+
+    surface_gate = cast(dict[str, object], surface_gate_raw)
+    status = str(surface_gate.get("status") or "").strip().lower()
+    if status != "pass":
+        return "invalid value: gates.surface_qa_gate.status must be 'pass'"
+
+    evidence_ref = str(surface_gate.get("evidence_ref") or "").strip()
+    if not evidence_ref:
+        return "missing key: gates.surface_qa_gate.evidence_ref (non-empty string)"
+
+    return "missing browser_e2e evidence contract fields"
+
+
+def _parse_iso8601(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _is_recent_pr_verifier_queue_transition(
+    row: dict[str, object] | None,
+    *,
+    now_iso: str,
+    max_age_seconds: int,
+) -> bool:
+    if not isinstance(row, dict):
+        return False
+    if str(row.get("role") or "") != "pr_verifier":
+        return False
+    if str(row.get("stage") or "") != "pr_verifier_execution":
+        return False
+    if str(row.get("status") or "") != "queued":
+        return False
+
+    created_at = _parse_iso8601(str(row.get("created_at") or ""))
+    now = _parse_iso8601(now_iso)
+    if created_at is None or now is None:
+        return False
+    return (now - created_at).total_seconds() <= max_age_seconds
+
+
 class IssuePacketRecord(Protocol):
     issue_number: str
     title: str
     branch: str
+    base_branch: str
     backing_type: str
     prior_handoff: str
     labels: list[str]
@@ -256,6 +383,7 @@ def queue_orchestrator_recovery(
                 "issue_number": selected_issue.issue_number,
                 "title": selected_issue.title,
                 "branch": selected_issue.branch,
+                "base_branch": selected_issue.base_branch,
                 "backing_type": selected_issue.backing_type,
                 "prior_handoff": selected_issue.prior_handoff,
                 "labels": list(selected_issue.labels),
@@ -443,11 +571,13 @@ def reconcile_pr_verifier(
     *,
     base_dir: Path,
     issue: dict[str, str],
+    current: dict[str, str],
     attempts: dict[str, int],
     limits: dict[str, int],
     artifacts: dict[str, str],
     updated_at: str,
     read_issue: Callable[[Path, str], JsonObject | None],
+    read_issue_packet: Callable[[Path, str], JsonObject],
     read_artifact_fact: Callable[[str], dict[str, object]],
     read_latest_history_entry: Callable[[str], dict[str, object] | None],
     record_pr_opened: Callable[..., dict[str, object]],
@@ -465,6 +595,27 @@ def reconcile_pr_verifier(
     if not bool(persisted_evidence.get("parse_ok")):
         persisted_evidence = _fact_from_latest_history_entry(read_latest_history_entry("evidence_packet"))
     if not bool(persisted_evidence.get("parse_ok")):
+        latest_runtime_transition = read_latest_history_entry("runtime_transition")
+        if current.get("status") == "queued" and _is_recent_pr_verifier_queue_transition(
+            latest_runtime_transition,
+            now_iso=updated_at,
+            max_age_seconds=PR_VERIFIER_QUEUE_GRACE_SECONDS,
+        ):
+            summary = (
+                f"pr_verifier for issue #{issue['number']} is queued and SQLite has not recorded evidence_packet yet. "
+                "Keep the queued dispatch state unchanged."
+            )
+            return (
+                ledger,
+                {
+                    "action": "no_change",
+                    "next_role": current.get("role") or "pr_verifier",
+                    "next_stage": current.get("stage") or "pr_verifier_execution",
+                    "summary": summary,
+                    "request_title": "",
+                },
+                None,
+            )
         summary = (
             f"pr_verifier for issue #{issue['number']} ended without recording evidence_packet in SQLite. "
             "Retry the verifier once before recovery."
@@ -509,6 +660,47 @@ def reconcile_pr_verifier(
     )
     status = cast(str, persisted_evidence.get("status") or "")
     if status == "pass":
+        persisted_worker = _stored_fact(artifacts, "worker_result", read_artifact_fact)
+        issue_packet = read_issue_packet(base_dir, issue["number"])
+        browser_e2e_required = _issue_packet_requires_browser_e2e(issue_packet) or _worker_result_web_surface_changed(persisted_worker)
+        if browser_e2e_required and not _evidence_has_browser_e2e_gate(persisted_evidence):
+            deficiency = _browser_e2e_gate_deficiency(persisted_evidence)
+            summary = (
+                f"Verifier for issue #{issue['number']} reported pass without required browser_e2e_gate evidence in evidence_packet "
+                f"({deficiency}). Retry pr_verifier with gates.surface_qa_gate set to {{status: 'pass', evidence_ref: '<non-empty>'}} "
+                "or provide legacy-compatible browser_e2e evidence fields before acceptance."
+            )
+            set_failure_func(ledger, kind="contract_invalid", summary=summary, retryable=True)
+            if attempts["pr_verifier"] < limits["pr_verifier"]:
+                attempts["pr_verifier"] += 1
+                transition_issue_state_if_possible(
+                    base_dir=base_dir,
+                    issue_number=issue["number"],
+                    to_state="verifying",
+                    command_id=uuid4().hex,
+                    updated_at=updated_at,
+                    reason=f"Retry pr_verifier for issue #{issue['number']} after missing browser_e2e_gate evidence.",
+                )
+                queue_transition_func(
+                    ledger,
+                    next_role="pr_verifier",
+                    next_stage="pr_verifier_execution",
+                    summary=summary,
+                    updated_at=updated_at,
+                )
+                return ledger, subagent_decision_func(
+                    ledger,
+                    next_role="pr_verifier",
+                    next_stage="pr_verifier_execution",
+                    summary=summary,
+                ), None
+            return queue_orchestrator_recovery_func(
+                ledger,
+                base_dir=base_dir,
+                updated_at=updated_at,
+                summary=summary,
+                final_state="failed",
+            )
         if current_issue_state in {"completed", "failed", "quarantined"}:
             summary = (
                 f"Verifier for issue #{issue['number']} passed, but the issue is already {current_issue_state}. "
@@ -530,17 +722,76 @@ def reconcile_pr_verifier(
                 "request_title": "/autodev-release",
             }, None
         pr_number = _extract_pr_number_from_fact(persisted_evidence)
-        pr_source_artifact = "evidence_packet"
-        if not pr_number:
-            persisted_worker = _stored_fact(artifacts, "worker_result", read_artifact_fact)
-            pr_number = _extract_pr_number_from_fact(persisted_worker)
-            if pr_number:
-                pr_source_artifact = "worker_result_fallback"
         if not pr_number or pr_number == "none":
             summary = (
-                f"Verifier for issue #{issue['number']} passed without a PR number. Route to main_orchestrator recovery instead of waiting."
+                f"Verifier for issue #{issue['number']} passed without a PR number in evidence_packet. "
+                "Retry pr_verifier so verifier-owned evidence can confirm the PR binding before release."
             )
             set_failure_func(ledger, kind="contract_invalid", summary=summary, retryable=True)
+            if attempts["pr_verifier"] < limits["pr_verifier"]:
+                attempts["pr_verifier"] += 1
+                transition_issue_state_if_possible(
+                    base_dir=base_dir,
+                    issue_number=issue["number"],
+                    to_state="verifying",
+                    command_id=uuid4().hex,
+                    updated_at=updated_at,
+                    reason=f"Retry pr_verifier for issue #{issue['number']} after missing PR number in evidence_packet.",
+                )
+                queue_transition_func(
+                    ledger,
+                    next_role="pr_verifier",
+                    next_stage="pr_verifier_execution",
+                    summary=summary,
+                    updated_at=updated_at,
+                )
+                return ledger, subagent_decision_func(
+                    ledger,
+                    next_role="pr_verifier",
+                    next_stage="pr_verifier_execution",
+                    summary=summary,
+                ), None
+            return queue_orchestrator_recovery_func(
+                ledger,
+                base_dir=base_dir,
+                updated_at=updated_at,
+                summary=summary,
+                final_state="failed",
+            )
+        worker_pr_number = _extract_pr_number_from_fact(persisted_worker)
+        if worker_pr_number and worker_pr_number != pr_number:
+            summary = (
+                f"Verifier for issue #{issue['number']} passed with PR #{pr_number} in evidence_packet, "
+                f"but worker_result recorded PR #{worker_pr_number}. "
+                "Retry pr_verifier so verifier-owned evidence can reconcile the PR binding before release."
+            )
+            set_failure_func(ledger, kind="contract_invalid", summary=summary, retryable=True)
+            if attempts["pr_verifier"] < limits["pr_verifier"]:
+                attempts["pr_verifier"] += 1
+                transition_issue_state_if_possible(
+                    base_dir=base_dir,
+                    issue_number=issue["number"],
+                    to_state="verifying",
+                    command_id=uuid4().hex,
+                    updated_at=updated_at,
+                    reason=(
+                        f"Retry pr_verifier for issue #{issue['number']} after PR number mismatch "
+                        "between evidence_packet and worker_result."
+                    ),
+                )
+                queue_transition_func(
+                    ledger,
+                    next_role="pr_verifier",
+                    next_stage="pr_verifier_execution",
+                    summary=summary,
+                    updated_at=updated_at,
+                )
+                return ledger, subagent_decision_func(
+                    ledger,
+                    next_role="pr_verifier",
+                    next_stage="pr_verifier_execution",
+                    summary=summary,
+                ), None
             return queue_orchestrator_recovery_func(
                 ledger,
                 base_dir=base_dir,
@@ -558,8 +809,10 @@ def reconcile_pr_verifier(
             payload={
                 "issue_number": issue["number"],
                 "pr_number": pr_number,
+                "head_branch": issue.get("branch", ""),
+                "base_branch": issue.get("baseBranch", "main"),
                 "verifier_session_id": verifier_session_id,
-                "source_artifact": pr_source_artifact,
+                "source_artifact": "evidence_packet",
             },
         )
         transition_issue_state_if_possible(
@@ -672,6 +925,7 @@ def reconcile_release_worker(
     non_terminal_release_failure_kinds: set[str],
     read_issue: Callable[[Path, str], JsonObject | None],
     read_artifact_fact: Callable[[str], dict[str, object]],
+    read_session_outcome: Callable[[str], object | None],
     transition_issue_state_if_possible: Callable[..., None],
     set_failure_func: Callable[..., None],
     queue_orchestrator_recovery_func: Callable[..., tuple[JsonObject, JsonObject, JsonObject]],
@@ -682,8 +936,19 @@ def reconcile_release_worker(
     verifier_session_id = str(issue_state.get("current_session_id") or "") if issue_state else ""
     persisted_release = _stored_fact(artifacts, "release_result", read_artifact_fact)
     if not bool(persisted_release.get("parse_ok")):
-        if current.get("status") == "running" or (
-            current.get("status") == "queued" and attempts["release_worker"] < limits["release_worker"]
+        current_status = str(current.get("status") or "")
+        session_terminal_without_artifact = False
+        if verifier_session_id and current_status in {"running", "queued"}:
+            outcome = read_session_outcome(verifier_session_id)
+            outcome_status = ""
+            if isinstance(outcome, dict):
+                outcome_status = str(outcome.get("status") or "")
+            else:
+                outcome_status = str(getattr(outcome, "status", "") or "")
+            if outcome_status and outcome_status not in {"running", "queued", "unknown"}:
+                session_terminal_without_artifact = True
+        if not session_terminal_without_artifact and (
+            current_status == "running" or (current_status == "queued" and attempts["release_worker"] < limits["release_worker"])
         ):
             summary = (
                 f"release_worker for issue #{issue['number']} is {current.get('status') or 'queued'} and SQLite has not recorded "
@@ -702,7 +967,7 @@ def reconcile_release_worker(
             )
         summary = (
             f"release_worker for issue #{issue['number']} ended without recording release_result in SQLite. "
-            "Retry release once before recovery."
+            "Re-dispatch release_worker so the subagent can submit release_result before completion."
         )
         set_failure_func(ledger, kind="contract_invalid", summary=summary, retryable=True)
         if attempts["release_worker"] < limits["release_worker"]:
@@ -872,6 +1137,8 @@ def reconcile_issue_selection_or_recovery(
 ) -> ReconcileResult | None:
     issue_state = read_issue(base_dir, issue["number"])
     persisted_release = _stored_fact(artifacts, "release_result", read_artifact_fact)
+    persisted_evidence = _stored_fact(artifacts, "evidence_packet", read_artifact_fact)
+    persisted_worker = _stored_fact(artifacts, "worker_result", read_artifact_fact)
     issue_runtime_state = str(issue_state.get("state") or "") if issue_state else ""
     if issue_runtime_state in {"failed", "ready"} and bool(persisted_release.get("parse_ok")) and is_successful_release_status(cast(str, persisted_release.get("status") or "")):
         summary = (
@@ -886,6 +1153,21 @@ def reconcile_issue_selection_or_recovery(
             summary=summary,
             final_state="completed",
         )
+    if issue_runtime_state in {"failed", "ready"} and bool(persisted_evidence.get("parse_ok")) and str(persisted_evidence.get("status") or "") == "pass":
+        browser_e2e_required = _worker_result_web_surface_changed(persisted_worker)
+        if (not browser_e2e_required) or _evidence_has_browser_e2e_gate(persisted_evidence):
+            summary = (
+                f"Late successful verifier evidence for issue #{issue['number']} arrived after recovery. "
+                "Reconcile the control plane into verified so independent release can continue."
+            )
+            set_failure_func(ledger, kind="none", summary="", retryable=True)
+            return queue_orchestrator_recovery_func(
+                ledger,
+                base_dir=base_dir,
+                updated_at=updated_at,
+                summary=summary,
+                final_state="verified",
+            )
     last_failure = cast(dict[str, object], ledger.get("lastFailure", {}))
     if issue_state and str(issue_state.get("state") or "") == "failed" and bool(last_failure.get("retryable")):
         summary = cast(str, last_failure.get("summary") or "") or (
@@ -902,6 +1184,25 @@ def reconcile_issue_selection_or_recovery(
 
 
 def no_change_decision(ledger: JsonObject, *, current: dict[str, str], updated_at: str, bump_ledger_revision: Callable[[JsonObject, str], None]) -> ReconcileResult:
+    issue = cast(dict[str, str], ledger.get("issue", {}))
+    issue_number = str(issue.get("number") or "")
+    if not str(current.get("role") or "") and not str(current.get("stage") or ""):
+        summary = (
+            f"Issue #{issue_number or 'unknown'} has no queued role/stage in the DB-backed control plane. "
+            "Run start-issue first to seed orchestrator_bootstrap, then reconcile again."
+        )
+        del updated_at, bump_ledger_revision
+        return (
+            ledger,
+            {
+                "action": "start_issue_required",
+                "next_role": "main_orchestrator",
+                "next_stage": "orchestrator_bootstrap",
+                "summary": summary,
+                "request_title": "start-issue",
+            },
+            None,
+        )
     summary = f"Supervisor found role={current['role']} stage={current['stage']} with no automatic transition. Keep the current state unchanged."
     del updated_at, bump_ledger_revision
     return (

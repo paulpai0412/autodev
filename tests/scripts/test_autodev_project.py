@@ -29,6 +29,8 @@ def completed(args: list[str], *, returncode: int = 0, stdout: str = "", stderr:
 def fake_init_bootstrap_run(args: list[str], **_kwargs: object) -> CompletedProcess[str]:
     if args[:3] == ["git", "rev-parse", "--is-inside-work-tree"]:
         return completed(args, returncode=128, stderr="not a git repository")
+    if args[:4] == ["git", "rev-parse", "--verify", "HEAD"]:
+        return completed(args, returncode=128, stderr="fatal: Needed a single revision")
     if args[:4] == ["git", "remote", "get-url", "origin"]:
         return completed(args, returncode=2, stderr="no such remote")
     if args[:3] == ["gh", "repo", "view"]:
@@ -54,14 +56,14 @@ def test_init_creates_project_contract_dirs_and_agents_managed_block(tmp_path: P
                 "--project-root",
                 str(tmp_path),
                 "--github-repo",
-                "paulpai0412/wferp",
+                "paulpai0412/autodev",
             ]
         )
 
     assert exit_code == 0
     config = read(tmp_path / ".autodev.yaml")
     assert 'schema_version: "1.0"' in config
-    assert "github_repo: paulpai0412/wferp" in config
+    assert "github_repo: paulpai0412/autodev" in config
     assert "control_plane_db: .opencode/runtime/control-plane.sqlite3" in config
     assert (tmp_path / ".opencode/runtime/.gitkeep").exists()
     assert (tmp_path / ".opencode/runtime/control-plane.sqlite3").exists()
@@ -74,8 +76,8 @@ def test_init_creates_project_contract_dirs_and_agents_managed_block(tmp_path: P
     assert "Do not copy workflow implementation" in agents
     commands = [call.args[0] for call in run.call_args_list]
     assert ["git", "init", "-b", "main"] in commands
-    assert ["git", "remote", "add", "origin", "https://github.com/paulpai0412/wferp.git"] in commands
-    assert ["gh", "repo", "create", "paulpai0412/wferp", "--private", "--description", autodev_project.DEFAULT_REPO_DESCRIPTION] in commands
+    assert ["git", "remote", "add", "origin", "https://github.com/paulpai0412/autodev.git"] in commands
+    assert ["gh", "repo", "create", "paulpai0412/autodev", "--private", "--description", autodev_project.DEFAULT_REPO_DESCRIPTION] in commands
     label_commands = [command for command in commands if isinstance(command, list) and command[:3] == ["gh", "label", "create"]]
     assert len(label_commands) == len(autodev_project.BOOTSTRAP_LABELS)
 
@@ -103,7 +105,7 @@ def test_install_commands_writes_autodev_prefixed_global_commands(tmp_path: Path
     assert "description: Start autodev workflow" in start_command
     assert "scripts/autodev_project.py start" in start_command
     assert '--issue-number "$1"' in start_command
-    assert 'AUTODEV_HOME="${AUTODEV_HOME:-$HOME/apps/autodev}"' in start_command
+    assert f'AUTODEV_HOME="${{AUTODEV_HOME:-{autodev_project.ROOT}}}"' in start_command
     assert 'PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" start' in start_command
     assert str(tmp_path) not in start_command
     assert (commands_dir / entrypoints["reconcile"]).exists()
@@ -167,12 +169,12 @@ def test_install_commands_defaults_to_host_adapter_commands_dir(tmp_path: Path):
 
 
 def test_repo_local_commands_use_autodev_project_wrappers():
-    start_command = read(autodev_project.ROOT / ".opencode/commands/auto-dev.md")
-    reconcile_command = read(autodev_project.ROOT / ".opencode/commands/supervisor-reconcile.md")
+    start_command = read(autodev_project.ROOT / ".opencode/commands/autodev-start.md")
+    reconcile_command = read(autodev_project.ROOT / ".opencode/commands/autodev-reconcile.md")
     release_command = read(autodev_project.ROOT / ".opencode/commands/autodev-release.md")
-    show_command = read(autodev_project.ROOT / ".opencode/commands/show-last-root-session.md")
+    show_command = read(autodev_project.ROOT / ".opencode/commands/autodev-show-session.md")
 
-    assert 'AUTODEV_HOME="${AUTODEV_HOME:-$HOME/apps/autodev}"' in start_command
+    assert f'AUTODEV_HOME="${{AUTODEV_HOME:-{autodev_project.ROOT}}}"' in start_command
     assert 'PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" start --project-root "$PWD" --issue-number "$1"' in start_command
     assert 'PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" reconcile --project-root "$PWD"' in reconcile_command
     assert 'PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" release --project-root "$PWD" --issue-number "$1" --auto-approve' in release_command
@@ -212,6 +214,12 @@ def test_doctor_reports_tracked_runtime_files(tmp_path: Path, capsys: CaptureFix
     assert exit_code == 1
     assert "missing .gitignore entries for .opencode/runtime/*" in captured.out
     assert "tracked autodev runtime files must be removed from git index: .opencode/runtime/control-plane.sqlite3" in captured.out
+
+
+def test_runtime_gitignore_requires_explicit_control_plane_db_line(tmp_path: Path) -> None:
+    write(tmp_path / ".gitignore", ".opencode/runtime/*\n!.opencode/runtime/.gitkeep\n")
+
+    assert autodev_project._runtime_gitignore_is_configured(tmp_path) is False
 
 
 def test_doctor_passes_freshly_initialized_project(tmp_path: Path, capsys: CaptureFixture[str]):
@@ -271,6 +279,8 @@ def test_init_updates_origin_when_force_is_set(tmp_path: Path):
     def fake_run(args: list[str], **_kwargs: object) -> CompletedProcess[str]:
         if args[:3] == ["git", "rev-parse", "--is-inside-work-tree"]:
             return completed(args, stdout="true\n")
+        if args[:4] == ["git", "rev-parse", "--verify", "HEAD"]:
+            return completed(args, stdout="abc123\n")
         if args[:4] == ["git", "remote", "get-url", "origin"]:
             return completed(args, stdout="https://github.com/example/old.git\n")
         if args[:3] == ["gh", "repo", "view"]:
@@ -304,6 +314,8 @@ def test_init_reports_origin_mismatch_without_force(tmp_path: Path, capsys: Capt
     def fake_run(args: list[str], **_kwargs: object) -> CompletedProcess[str]:
         if args[:3] == ["git", "rev-parse", "--is-inside-work-tree"]:
             return completed(args, stdout="true\n")
+        if args[:4] == ["git", "rev-parse", "--verify", "HEAD"]:
+            return completed(args, stdout="abc123\n")
         if args[:4] == ["git", "remote", "get-url", "origin"]:
             return completed(args, stdout="https://github.com/example/old.git\n")
         if args[:3] == ["gh", "repo", "view"]:
@@ -326,6 +338,45 @@ def test_init_reports_origin_mismatch_without_force(tmp_path: Path, capsys: Capt
     captured = capsys.readouterr()
     assert exit_code == 1
     assert "origin remote points to https://github.com/example/old.git; expected https://github.com/paulpai0412/autodev-demo-todo.git" in captured.out
+
+
+def test_init_seeds_local_main_from_origin_for_unborn_repo(tmp_path: Path):
+    write(tmp_path / "AGENTS.md", "# AGENTS.md\n")
+
+    def fake_run(args: list[str], **_kwargs: object) -> CompletedProcess[str]:
+        if args[:3] == ["git", "rev-parse", "--is-inside-work-tree"]:
+            return completed(args, stdout="true\n")
+        if args[:4] == ["git", "rev-parse", "--verify", "HEAD"]:
+            return completed(args, returncode=128, stderr="fatal: Needed a single revision")
+        if args[:4] == ["git", "remote", "get-url", "origin"]:
+            return completed(args, stdout="https://github.com/paulpai0412/autodev-demo-todo.git\n")
+        if args[:4] == ["gh", "repo", "view", "paulpai0412/autodev-demo-todo"]:
+            return completed(args, stdout="repo exists\n")
+        if args[:4] == ["git", "fetch", "origin", "main"]:
+            return completed(args)
+        if args[:5] == ["git", "rev-parse", "--verify", "--quiet", "refs/remotes/origin/main"]:
+            return completed(args, stdout="db3001170851e85a95aadcc5f68097521ca1addb\n")
+        if args[:5] == ["git", "checkout", "-B", "main", "refs/remotes/origin/main"]:
+            return completed(args)
+        if args[:3] == ["gh", "label", "create"]:
+            return completed(args)
+        raise AssertionError(f"unexpected command: {args}")
+
+    with patch("scripts.autodev_project.subprocess.run", side_effect=fake_run) as run:
+        exit_code = autodev_project.main(
+            [
+                "init",
+                "--project-root",
+                str(tmp_path),
+                "--github-repo",
+                "paulpai0412/autodev-demo-todo",
+            ]
+        )
+
+    assert exit_code == 0
+    commands = [call.args[0] for call in run.call_args_list]
+    assert ["git", "fetch", "origin", "main"] in commands
+    assert ["git", "checkout", "-B", "main", "refs/remotes/origin/main"] in commands
 
 
 def test_init_rejects_invalid_github_repo_slug(tmp_path: Path):
@@ -450,6 +501,26 @@ def test_start_resolves_consumer_project_root_from_nested_directory(tmp_path: Pa
     assert ["--base-dir", str(tmp_path)] in [command[i:i+2] for i in range(len(command)-1)]
     assert not (nested / "docs").exists()
     assert not (tmp_path / "docs/agents/runtime/context-checkpoint.yaml").exists()
+
+
+def test_start_resolves_canonical_project_root_from_issue_worktree_path(tmp_path: Path):
+    issue_worktree = tmp_path / ".opencode/runtime/issue-worktrees/issue-42"
+    issue_worktree.mkdir(parents=True, exist_ok=True)
+    write(tmp_path / ".autodev.yaml", 'schema_version: "1.0"\nproject:\n  name: demo\n')
+
+    with patch(
+        "scripts.autodev_project.subprocess.run",
+        return_value=CompletedProcess(args=["python3"], returncode=0),
+    ) as run:
+        exit_code = autodev_project.main(
+            ["start", "--project-root", str(issue_worktree), "--issue-number", "34"]
+        )
+
+    assert exit_code == 0
+    kwargs = run.call_args.kwargs
+    command = run.call_args.args[0]
+    assert kwargs["cwd"] == tmp_path
+    assert ["--base-dir", str(tmp_path)] in [command[i:i+2] for i in range(len(command)-1)]
 
 
 def test_reconcile_resolves_consumer_project_root_from_nested_directory(tmp_path: Path):
@@ -630,13 +701,19 @@ def test_start_prints_path_confirmation_before_dispatch(tmp_path: Path, capsys: 
     assert f"[autodev:start] runtime-db={tmp_path / '.opencode/runtime/control-plane.sqlite3'}" in captured.out
 
 
-def test_reconcile_fails_when_no_active_db_issue_exists(tmp_path: Path):
-    try:
-        autodev_project.main(["reconcile", "--project-root", str(tmp_path)])
-    except RuntimeError as error:
-        assert "no DB-backed autodev issue is currently active for reconcile" in str(error)
-    else:
-        raise AssertionError("expected reconcile to reject missing active DB issue")
+def test_reconcile_allows_workspace_intake_without_preexisting_db_issue(tmp_path: Path):
+    with patch(
+        "scripts.autodev_project.subprocess.run",
+        return_value=CompletedProcess(args=["python3"], returncode=0),
+    ) as run:
+        exit_code = autodev_project.main(["reconcile", "--project-root", str(tmp_path)])
+
+    assert exit_code == 0
+    command = run.call_args.args[0]
+    kwargs = run.call_args.kwargs
+    assert command[:4] == ["python3", "-m", "scripts.orchestrator_supervisor", "reconcile-workspace"]
+    assert ["--base-dir", str(tmp_path)] in [command[i:i + 2] for i in range(len(command) - 1)]
+    assert kwargs["cwd"] == tmp_path
 
 
 def test_show_session_resolves_consumer_project_root_from_nested_directory(tmp_path: Path, capsys: CaptureFixture[str]):

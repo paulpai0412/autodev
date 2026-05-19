@@ -2,27 +2,27 @@
 
 Issues and PRDs for this repo live as GitHub issues:
 
-- Repository: `paulpai0412/wferp`
-- URL: <https://github.com/paulpai0412/wferp>
+- Repository: `paulpai0412/autodev`
+- URL: <https://github.com/paulpai0412/autodev>
 - Source skill setup: <https://github.com/mattpocock/skills/tree/main/skills/engineering/setup-matt-pocock-skills>
 
 Use the `gh` CLI for issue operations when a skill says to publish to or fetch from the issue tracker.
 
 ## Runtime prerequisites
 
-- `gh auth status --repo paulpai0412/wferp` should succeed on any machine expected to materialize issue packets from GitHub.
+- `gh auth status --repo paulpai0412/autodev` should succeed on any machine expected to materialize issue packets from GitHub.
 - Network access to GitHub is required for live issue intake.
 - When GitHub is temporarily unavailable, the autonomous loop can keep working only from issue data already ingested into SQLite.
-- Intake default repo is `paulpai0412/wferp`; override it per consumer project with `AUTODEV_GITHUB_REPO=<owner/repo>`.
+- Intake default repo is `paulpai0412/autodev`; override it per consumer project with `AUTODEV_GITHUB_REPO=<owner/repo>`.
 
 ## Conventions
 
-- **Create an issue**: `gh issue create --repo paulpai0412/wferp --title "..." --body "..."`. Use a heredoc for multi-line bodies.
-- **Read an issue**: `gh issue view <number> --repo paulpai0412/wferp --comments`, filtering comments by `jq` and also fetching labels when needed.
-- **List issues**: `gh issue list --repo paulpai0412/wferp --state open --json number,title,body,labels,comments --jq '[.[] | {number, title, body, labels: [.labels[].name], comments: [.comments[].body]}]'` with appropriate `--label` and `--state` filters.
-- **Comment on an issue**: `gh issue comment <number> --repo paulpai0412/wferp --body "..."`.
-- **Apply / remove labels**: `gh issue edit <number> --repo paulpai0412/wferp --add-label "..."` / `--remove-label "..."`.
-- **Close**: `gh issue close <number> --repo paulpai0412/wferp --comment "..."`.
+- **Create an issue**: `gh issue create --repo paulpai0412/autodev --title "..." --body "..."`. Use a heredoc for multi-line bodies.
+- **Read an issue**: `gh issue view <number> --repo paulpai0412/autodev --comments`, filtering comments by `jq` and also fetching labels when needed.
+- **List issues**: `gh issue list --repo paulpai0412/autodev --state open --json number,title,body,labels,comments --jq '[.[] | {number, title, body, labels: [.labels[].name], comments: [.comments[].body]}]'` with appropriate `--label` and `--state` filters.
+- **Comment on an issue**: `gh issue comment <number> --repo paulpai0412/autodev --body "..."`.
+- **Apply / remove labels**: `gh issue edit <number> --repo paulpai0412/autodev --add-label "..."` / `--remove-label "..."`.
+- **Close**: `gh issue close <number> --repo paulpai0412/autodev --comment "..."`.
 
 When running inside this clone, `gh` can also infer the repository from `git remote -v`.
 
@@ -75,8 +75,8 @@ Use this compact GitHub comment shape after `release_worker` merge-time cleanup 
 
 ## When a skill says "publish to the issue tracker"
 
-Create a GitHub issue in `paulpai0412/wferp`.
+Create a GitHub issue in `paulpai0412/autodev`.
 
 ## When a skill says "fetch the relevant ticket"
 
-Run `gh issue view <number> --repo paulpai0412/wferp --comments`.
+Run `gh issue view <number> --repo paulpai0412/autodev --comments`.

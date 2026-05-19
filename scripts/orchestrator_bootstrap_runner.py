@@ -4,9 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.control_plane_db import read_issue_packet
 from scripts.orchestrator_supervisor import parse_issue_packet_text, start_issue
@@ -30,6 +34,7 @@ def _issue_packet_to_json(issue_packet: object) -> dict[str, object]:
         "issue_number": str(getattr(record, "issue_number")),
         "title": str(getattr(record, "title")),
         "branch": str(getattr(record, "branch")),
+        "base_branch": str(getattr(record, "base_branch", "main")),
         "backing_type": str(getattr(record, "backing_type")),
         "prior_handoff": str(getattr(record, "prior_handoff")),
         "labels": list(cast(list[str], getattr(record, "labels"))),

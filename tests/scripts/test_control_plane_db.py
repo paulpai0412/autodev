@@ -8,6 +8,7 @@ from scripts.control_plane_db import (
     available_release_slots,
     append_issue_event,
     append_issue_history,
+    canonical_control_plane_base_dir,
     completed_issue_numbers,
     control_plane_db_path,
     development_slot_occupancy,
@@ -62,6 +63,7 @@ def test_describe_control_plane_schema_exposes_real_issue_columns(tmp_path: Path
 
     assert schema["dbPath"] == str(control_plane_db_path(tmp_path))
     assert "current_session_id" in issue_columns
+    assert "worktree_path" in issue_columns
     assert "runtime_context_json" in issue_columns
     assert "latest_refs_json" in issue_columns
     assert "issue_packet_json" in issue_columns
@@ -69,6 +71,18 @@ def test_describe_control_plane_schema_exposes_real_issue_columns(tmp_path: Path
     assert "payload_json" in history_columns
     assert "body_text" in history_columns
     assert "content_hash" in history_columns
+
+
+def test_control_plane_db_path_uses_canonical_project_root_from_issue_worktree(tmp_path: Path):
+    issue_worktree = tmp_path / ".opencode/runtime/issue-worktrees/issue-42"
+    issue_worktree.mkdir(parents=True, exist_ok=True)
+
+    db_path = ensure_control_plane_db(issue_worktree)
+
+    assert canonical_control_plane_base_dir(issue_worktree) == tmp_path
+    assert db_path == tmp_path / ".opencode/runtime/control-plane.sqlite3"
+    assert control_plane_db_path(issue_worktree) == tmp_path / ".opencode/runtime/control-plane.sqlite3"
+    assert not (issue_worktree / ".opencode/runtime/control-plane.sqlite3").exists()
 
 
 def test_transition_issue_state_records_issue_and_history(tmp_path: Path):
@@ -489,6 +503,7 @@ def test_ingest_issue_packet_and_runtime_context_store_on_issue_row(tmp_path: Pa
         artifact_refs={
             "worker_result_ref": "docs/agents/worker-results/issue-42.yaml",
         },
+        worktree_path="/tmp/project/.opencode/runtime/issue-worktrees/issue-42",
     )
 
     packet = read_issue_packet(tmp_path, "42")
@@ -504,6 +519,7 @@ def test_ingest_issue_packet_and_runtime_context_store_on_issue_row(tmp_path: Pa
     assert issue["branch"] == "agent/issue-42-demo"
     assert issue["current_role"] == "issue_worker"
     assert issue["current_stage"] == "issue_worker_execution"
+    assert issue["worktree_path"] == "/tmp/project/.opencode/runtime/issue-worktrees/issue-42"
     assert runtime_context["dispatch_request"]["request_id"] == "req-42"
     assert runtime_context["artifact_refs"]["worker_result_ref"] == "docs/agents/worker-results/issue-42.yaml"
     assert latest_ref["status"] == "ingested"

@@ -14,8 +14,8 @@ def test_render_issue_packet_creates_compact_ready_packet():
     issue = GitHubIssue(
         number="42",
         title="Add governed SQL traceability",
-        body="1. Preserve verifier evidence\n2. Keep raw logs out of repo docs\nParent: https://github.com/paulpai0412/wferp/issues/1",
-        url="https://github.com/paulpai0412/wferp/issues/42",
+        body="1. Preserve verifier evidence\n2. Keep raw logs out of repo docs\nParent: https://github.com/paulpai0412/autodev/issues/1",
+        url="https://github.com/paulpai0412/autodev/issues/42",
         labels=["ready-for-agent"],
     )
 
@@ -26,6 +26,9 @@ def test_render_issue_packet_creates_compact_ready_packet():
     assert 'labels: ["ready-for-agent"]' in packet
     assert 'branch: {name: "agent/issue-42-add-governed-sql-traceability", base: "main"}' in packet
     assert 'prepared_at: "2026-05-10T12:00:00+08:00"' in packet
+    assert '<fill-from-issue-or-worker-discovery>' not in packet
+    assert 'scope:' in packet
+    assert 'relevant_paths:' in packet
 
 
 def test_issue_packet_payload_contains_db_ready_fields():
@@ -33,7 +36,7 @@ def test_issue_packet_payload_contains_db_ready_fields():
         number="42",
         title="Add governed SQL traceability",
         body="- observable behavior",
-        url="https://github.com/paulpai0412/wferp/issues/42",
+        url="https://github.com/paulpai0412/autodev/issues/42",
         labels=["ready-for-agent"],
     )
 
@@ -41,8 +44,45 @@ def test_issue_packet_payload_contains_db_ready_fields():
 
     assert payload["issue_number"] == "42"
     assert payload["branch"] == "agent/issue-42-add-governed-sql-traceability"
+    assert payload["base_branch"] == "main"
     assert payload["backing_type"] == "github"
     assert "kind: issue_packet" in str(payload["raw_text"])
+
+
+def test_issue_packet_payload_preserves_explicit_base_branch():
+    issue = GitHubIssue(
+        number="43",
+        title="Build child feature",
+        body="Base Branch: agent/issue-42-parent\n- observable behavior",
+        url="https://github.com/paulpai0412/autodev/issues/43",
+        labels=["ready-for-agent"],
+    )
+
+    payload = issue_packet_payload(issue, prepared_at="2026-05-10T12:00:00+08:00")
+
+    assert payload["base_branch"] == "agent/issue-42-parent"
+    assert 'base: "agent/issue-42-parent"' in str(payload["raw_text"])
+
+
+def test_render_issue_packet_infers_scope_and_relevant_paths_from_issue_body():
+    issue = GitHubIssue(
+        number="44",
+        title="Tag vocab items",
+        body=(
+            "## Scope\n"
+            "- Add tag CRUD in `index.html`\n"
+            "- Keep default flow in `smoke_test.js`\n"
+            "\n"
+            "Use `docs/agents/issue-tracker.md` for tracking.\n"
+        ),
+        url="https://github.com/paulpai0412/autodev/issues/44",
+        labels=["ready-for-agent"],
+    )
+
+    packet = render_issue_packet(issue, prepared_at="2026-05-10T12:00:00+08:00")
+
+    assert 'in: ["Add tag CRUD in `index.html`", "Keep default flow in `smoke_test.js`"]' in packet
+    assert 'relevant_paths: ["index.html", "smoke_test.js", "docs/agents/issue-tracker.md"]' in packet
 
 
 def test_sync_issue_packets_to_db_ingests_packets(tmp_path: Path):
@@ -52,7 +92,7 @@ def test_sync_issue_packets_to_db_ingests_packets(tmp_path: Path):
             number="42",
             title="Add governed SQL traceability",
             body="- observable behavior",
-            url="https://github.com/paulpai0412/wferp/issues/42",
+            url="https://github.com/paulpai0412/autodev/issues/42",
             labels=["ready-for-agent"],
         )
     ]
@@ -75,7 +115,7 @@ def test_main_reads_json_fixture(tmp_path: Path, capsys):
                     "number": 42,
                     "title": "Add governed SQL traceability",
                     "body": "- observable behavior",
-                    "url": "https://github.com/paulpai0412/wferp/issues/42",
+                    "url": "https://github.com/paulpai0412/autodev/issues/42",
                     "labels": ["ready-for-agent"],
                 }
             ]
@@ -105,7 +145,7 @@ def test_main_discovers_consumer_project_from_project_root(tmp_path: Path, capsy
                     "number": 42,
                     "title": "Add governed SQL traceability",
                     "body": "- observable behavior",
-                    "url": "https://github.com/paulpai0412/wferp/issues/42",
+                    "url": "https://github.com/paulpai0412/autodev/issues/42",
                     "labels": ["ready-for-agent"],
                 }
             ]
@@ -131,7 +171,7 @@ def test_main_requires_consumer_project_root(tmp_path: Path, capsys):
                     "number": 42,
                     "title": "Add governed SQL traceability",
                     "body": "- observable behavior",
-                    "url": "https://github.com/paulpai0412/wferp/issues/42",
+                    "url": "https://github.com/paulpai0412/autodev/issues/42",
                     "labels": ["ready-for-agent"],
                 }
             ]
@@ -159,7 +199,7 @@ def test_main_blocks_when_runtime_db_is_tracked(tmp_path: Path, capsys):
                     "number": 42,
                     "title": "Add governed SQL traceability",
                     "body": "- observable behavior",
-                    "url": "https://github.com/paulpai0412/wferp/issues/42",
+                    "url": "https://github.com/paulpai0412/autodev/issues/42",
                     "labels": ["ready-for-agent"],
                 }
             ]
