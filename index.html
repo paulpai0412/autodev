@@ -1,107 +1,658 @@
-<!doctype html>
-<html lang="en">
+<!DOCTYPE html>
+<html lang="zh-Hant">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Control Tower Flow Run Skeleton</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="data:,">
+  <title>Autodev Control Tower · 繁中 Claude 風格 Prototype</title>
   <style>
     :root {
-      --bg: #f2f4f8;
-      --surface: #ffffff;
-      --text: #182033;
-      --muted: #54627a;
-      --accent: #0f5fff;
-      --danger: #bf1f3b;
-      --line: #d5dce8;
+      color-scheme: light;
+      --bg: #faf8f2;
+      --bg-soft: #f1ede4;
+      --surface: #fffdf8;
+      --surface-warm: #f7f1e8;
+      --ink: #181511;
+      --ink-soft: #575047;
+      --ink-faint: #8c8377;
+      --line: rgba(38, 32, 25, .13);
+      --line-strong: rgba(38, 32, 25, .24);
+      --clay: #c65f3d;
+      --clay-dark: #98452c;
+      --clay-soft: #f2d8ca;
+      --green: #637b54;
+      --green-soft: #e3eadc;
+      --amber: #a9782f;
+      --amber-soft: #f2e4c4;
+      --red: #a85143;
+      --red-soft: #efd4ce;
+      --blue: #657d9d;
+      --blue-soft: #dde6ef;
+      --shadow: 0 24px 70px rgba(63, 50, 36, .12);
+      --shadow-soft: 0 8px 28px rgba(63, 50, 36, .08);
+      --radius-xl: 28px;
+      --radius-lg: 20px;
+      --radius-md: 14px;
+      --radius-sm: 9px;
+      --font-ui: "Aptos", "Segoe UI", "Noto Sans TC", "PingFang TC", sans-serif;
+      --font-serif: Georgia, "Noto Serif TC", "Iowan Old Style", serif;
+      --font-mono: "SFMono-Regular", "Cascadia Code", monospace;
     }
 
     * { box-sizing: border-box; }
-
     body {
       margin: 0;
-      font-family: "Plus Jakarta Sans", "Segoe UI", sans-serif;
-      background: radial-gradient(circle at top left, #ffffff, var(--bg));
-      color: var(--text);
       min-height: 100vh;
-      padding: 24px;
+      color: var(--ink);
+      font-family: var(--font-ui);
+      background:
+        radial-gradient(circle at 12% -10%, rgba(198, 95, 61, .13), transparent 30%),
+        radial-gradient(circle at 96% 10%, rgba(101, 125, 157, .09), transparent 28%),
+        linear-gradient(135deg, var(--bg) 0%, #fffaf1 48%, var(--bg-soft) 100%);
+      overflow: hidden;
+      text-wrap: pretty;
     }
+
+    button, input, select { font: inherit; }
 
     .shell {
-      max-width: 900px;
-      margin: 0 auto;
+      height: 100vh;
+      padding: 18px;
+      display: grid;
+      grid-template-rows: 72px minmax(0, 1fr);
+      gap: 14px;
+    }
+
+    .topbar, .sidebar, .stage, .sidecar {
+      background: rgba(255, 253, 248, .88);
+      border: 1px solid var(--line);
+      box-shadow: var(--shadow-soft);
+      backdrop-filter: blur(18px);
+    }
+
+    .topbar {
+      border-radius: 22px;
+      display: grid;
+      grid-template-columns: 320px 1fr auto;
+      align-items: center;
+      gap: 18px;
+      padding: 0 18px;
+    }
+
+    .brand { display: flex; align-items: center; gap: 13px; min-width: 0; }
+    .mark {
+      width: 42px;
+      height: 42px;
+      border-radius: 13px;
+      display: grid;
+      place-items: center;
+      background: var(--ink);
+      color: #fff7ec;
+      font-family: var(--font-serif);
+      font-size: 18px;
+      letter-spacing: -.08em;
+    }
+    .brand h1 { margin: 0; font-size: 16px; letter-spacing: -.02em; }
+    .brand p { margin: 3px 0 0; color: var(--ink-faint); font-size: 12px; }
+
+    .context-pill {
+      justify-self: start;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+      padding: 9px 13px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: rgba(247, 241, 232, .8);
+      color: var(--ink-soft);
+      font-size: 13px;
+    }
+    .context-pill code { color: var(--ink-faint); font-family: var(--font-mono); font-size: 11px; }
+
+    .top-actions { display: flex; align-items: center; gap: 9px; }
+    .pill {
+      padding: 9px 11px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: #fbf6ed;
+      color: var(--ink-soft);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .pill strong { color: var(--green); }
+
+    .btn {
+      border: 1px solid var(--line-strong);
+      background: var(--surface);
+      color: var(--ink);
+      min-height: 38px;
+      padding: 0 13px;
+      border-radius: 999px;
+      cursor: pointer;
+      transition: transform .16s ease, background .16s ease, border-color .16s ease;
+    }
+    .btn:hover { transform: translateY(-1px); border-color: rgba(152, 69, 44, .35); }
+    .btn.primary { background: var(--ink); color: #fff7ec; border-color: var(--ink); }
+    .btn.clay { background: var(--clay); border-color: var(--clay); color: white; }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 236px minmax(720px, 1fr) 380px;
+      gap: 14px;
+      min-height: 0;
+    }
+
+    .sidebar, .stage, .sidecar { border-radius: var(--radius-xl); min-height: 0; }
+
+    .sidebar { padding: 14px; display: flex; flex-direction: column; gap: 16px; }
+    .nav-title {
+      margin: 8px 10px 6px;
+      color: var(--ink-faint);
+      font-size: 11px;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+    .nav-item {
+      width: 100%;
+      border: 0;
+      background: transparent;
+      color: var(--ink-soft);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 10px 11px;
+      border-radius: 12px;
+      cursor: pointer;
+      transition: background .16s ease, color .16s ease;
+    }
+    .nav-item:hover { background: rgba(198,95,61,.07); color: var(--ink); }
+    .nav-item.active { background: var(--clay-soft); color: var(--clay-dark); }
+    .badge { color: var(--ink-faint); font-size: 11px; }
+
+    .policy-note {
+      margin-top: auto;
+      border: 1px solid rgba(198,95,61,.18);
+      border-radius: 18px;
+      background: #fbefe7;
+      padding: 15px;
+    }
+    .policy-note h3 { margin: 0 0 7px; font-size: 14px; }
+    .policy-note p { margin: 0; color: var(--ink-soft); font-size: 13px; line-height: 1.55; }
+
+    .stage { overflow: hidden; display: grid; grid-template-rows: auto minmax(0, 1fr); box-shadow: var(--shadow); }
+    .stage-header {
+      padding: 28px 30px 16px;
+      display: flex;
+      justify-content: space-between;
+      gap: 22px;
+      align-items: flex-start;
+    }
+    .eyebrow { color: var(--clay-dark); font-family: var(--font-mono); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; }
+    .stage-header h2 {
+      margin: 8px 0 10px;
+      max-width: 820px;
+      font-family: var(--font-serif);
+      font-size: clamp(36px, 4vw, 58px);
+      line-height: .98;
+      letter-spacing: -.055em;
+      font-weight: 500;
+    }
+    .stage-header p { margin: 0; color: var(--ink-soft); font-size: 16px; line-height: 1.6; max-width: 820px; }
+    .screen-wrap { padding: 0 24px 24px; overflow: auto; }
+
+    .screen { display: none; animation: enter .24s ease both; }
+    .screen.active { display: block; }
+    @keyframes enter { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+
+    .flow-rail {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 10px;
+      margin-bottom: 16px;
+    }
+    .flow-step {
+      min-height: 118px;
+      padding: 14px;
+      border-radius: 18px;
+      border: 1px solid var(--line);
+      background: linear-gradient(180deg, var(--surface), var(--surface-warm));
+      position: relative;
+    }
+    .flow-step::after {
+      content: "";
+      position: absolute;
+      right: -8px;
+      top: 50%;
+      width: 6px;
+      height: 1px;
+      background: var(--line-strong);
+    }
+    .flow-step:last-child::after { display: none; }
+    .step-no { font-family: var(--font-mono); color: var(--clay-dark); font-size: 12px; }
+    .flow-step h3 { margin: 9px 0 6px; font-size: 16px; letter-spacing: -.02em; }
+    .flow-step p { margin: 0; color: var(--ink-soft); font-size: 13px; line-height: 1.45; }
+
+    .summary-grid { display: grid; grid-template-columns: 1.05fr .95fr; gap: 14px; }
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      background: rgba(255,253,248,.78);
+      overflow: hidden;
+    }
+    .panel-head {
+      padding: 17px 18px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .panel-head h3 { margin: 0; font-size: 17px; letter-spacing: -.02em; }
+    .panel-head span { color: var(--ink-faint); font-size: 12px; }
+    .panel-body { padding: 18px; }
+
+    .prd-card {
+      display: grid;
+      grid-template-columns: 132px 1fr;
+      gap: 16px;
+      padding: 16px;
+      border-radius: 18px;
+      background: #fbf2e8;
+      border: 1px solid rgba(198,95,61,.16);
+      margin-bottom: 12px;
+    }
+    .prd-score {
+      display: grid;
+      place-items: center;
+      min-height: 132px;
+      border-radius: 17px;
+      background: var(--ink);
+      color: #fff7ec;
+      text-align: center;
+    }
+    .prd-score strong { font-family: var(--font-serif); font-size: 44px; font-weight: 500; line-height: 1; }
+    .prd-score span { font-size: 12px; color: rgba(255,247,236,.72); }
+    .prd-card h4 { margin: 0 0 8px; font-size: 20px; letter-spacing: -.03em; }
+    .prd-card p { margin: 0; color: var(--ink-soft); line-height: 1.65; font-size: 15px; }
+
+    .requirement-list { display: grid; gap: 10px; }
+    .requirement {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 12px;
+      align-items: center;
+      padding: 13px;
+      border: 1px solid var(--line);
+      border-radius: 15px;
+      background: rgba(255,253,248,.74);
+    }
+    .rid { font-family: var(--font-mono); color: var(--clay-dark); font-size: 12px; }
+    .requirement strong { display:block; font-size: 15px; margin-bottom: 3px; }
+    .requirement small { color: var(--ink-faint); font-size: 12px; }
+
+    .todo-list { display: grid; gap: 9px; }
+    .todo {
+      display: grid;
+      grid-template-columns: 34px 1fr auto;
+      gap: 11px;
+      align-items: center;
+      padding: 12px;
+      border-radius: 14px;
       border: 1px solid var(--line);
       background: var(--surface);
-      border-radius: 14px;
-      padding: 20px;
+    }
+    .check {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
       display: grid;
-      gap: 16px;
+      place-items: center;
+      border: 1px solid var(--line-strong);
+      color: var(--ink-faint);
+      font-size: 13px;
+    }
+    .todo.done .check { background: var(--green); color: white; border-color: var(--green); }
+    .todo.active .check { background: var(--clay); color: white; border-color: var(--clay); }
+    .todo h4 { margin: 0 0 3px; font-size: 14px; }
+    .todo p { margin: 0; color: var(--ink-faint); font-size: 12px; }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      padding: 0 9px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: var(--surface-warm);
+      color: var(--ink-soft);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .tag.done { color: var(--green); background: var(--green-soft); border-color: rgba(99,123,84,.2); }
+    .tag.active { color: var(--clay-dark); background: var(--clay-soft); border-color: rgba(198,95,61,.22); }
+    .tag.blocked { color: var(--amber); background: var(--amber-soft); border-color: rgba(169,120,47,.22); }
+    .tag.risk { color: var(--red); background: var(--red-soft); border-color: rgba(168,81,67,.22); }
+    .tag.info { color: var(--blue); background: var(--blue-soft); border-color: rgba(101,125,157,.2); }
+
+    .metric-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 14px; }
+    .metric {
+      padding: 15px;
+      border-radius: 16px;
+      border: 1px solid var(--line);
+      background: rgba(255,253,248,.74);
+    }
+    .metric span { color: var(--ink-faint); font-size: 12px; }
+    .metric strong { display:block; margin-top: 7px; font-family: var(--font-serif); font-size: 34px; font-weight: 500; letter-spacing: -.05em; }
+    .metric small { color: var(--ink-soft); font-size: 12px; }
+
+    .lane-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+    .lane {
+      padding: 13px;
+      border-radius: 16px;
+      border: 1px solid var(--line);
+      background: rgba(247,241,232,.68);
+      min-height: 220px;
+    }
+    .lane h4 { margin: 0 0 12px; font-size: 14px; display:flex; justify-content:space-between; }
+    .issue {
+      padding: 11px;
+      border-radius: 13px;
+      border: 1px solid var(--line);
+      background: var(--surface);
+      margin-bottom: 8px;
+    }
+    .issue strong { display:block; font-size: 13px; margin-bottom: 4px; }
+    .issue p { margin: 0; color: var(--ink-faint); font-size: 12px; line-height: 1.35; }
+
+    .sidecar {
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      overflow: hidden;
+    }
+    .chat-head { padding: 20px; border-bottom: 1px solid var(--line); }
+    .chat-head h3 { margin: 0; font-size: 17px; }
+    .chat-head p { margin: 6px 0 0; color: var(--ink-faint); font-size: 13px; line-height: 1.45; }
+    .chat { padding: 16px; overflow: auto; display: grid; gap: 12px; align-content: start; }
+    .message {
+      padding: 14px;
+      border-radius: 17px;
+      background: var(--surface-warm);
+      border: 1px solid var(--line);
+    }
+    .message.operator { background: #fbefe7; border-color: rgba(198,95,61,.18); }
+    .message h4 { margin: 0 0 7px; font-size: 13px; display:flex; justify-content:space-between; gap: 12px; }
+    .message h4 span { color: var(--ink-faint); font-weight: 400; }
+    .message p { margin: 0; color: var(--ink-soft); font-size: 13px; line-height: 1.55; }
+    .stream {
+      margin-top: 10px;
+      padding: 8px 10px;
+      border-radius: 10px;
+      background: rgba(24,21,17,.05);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--ink-faint);
+    }
+    .composer { padding: 14px; border-top: 1px solid var(--line); display: flex; gap: 8px; }
+    .composer input {
+      min-width: 0;
+      flex: 1;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 0 13px;
+      background: var(--surface);
+      color: var(--ink-soft);
     }
 
-    .row {
-      display: flex;
-      gap: 12px;
-      flex-wrap: wrap;
+    .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .timeline { display:grid; gap: 11px; }
+    .event { display:grid; grid-template-columns: 58px 1fr auto; gap: 10px; align-items:start; }
+    .event time { color: var(--ink-faint); font-family: var(--font-mono); font-size: 12px; }
+    .event b { display:block; font-size: 13px; margin-bottom: 3px; }
+    .event p { margin:0; color: var(--ink-soft); font-size: 12px; }
+
+    .registry-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+    }
+    .field-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      margin-top: 10px;
       align-items: center;
     }
-
-    input, button {
-      font: inherit;
-      border-radius: 10px;
+    .field-row select,
+    .field-row input {
+      width: 100%;
+      min-height: 38px;
       border: 1px solid var(--line);
-      padding: 10px 12px;
+      border-radius: 10px;
+      background: var(--surface);
+      color: var(--ink-soft);
+      padding: 0 10px;
+    }
+    .check-list {
+      display: grid;
+      gap: 8px;
+      margin-top: 12px;
+    }
+    .check-item {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(255,253,248,.74);
+      padding: 10px;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      align-items: center;
+    }
+    .mini-note {
+      margin-top: 8px;
+      color: var(--ink-faint);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .projects-readonly {
+      display: grid;
+      gap: 8px;
+      margin-top: 12px;
+    }
+    .project-row {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(255,253,248,.74);
+      padding: 10px;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      align-items: center;
+    }
+    .project-meta {
+      color: var(--ink-faint);
+      font-size: 12px;
+      margin-top: 3px;
     }
 
-    input { min-width: 240px; }
+    .tweaks { position: fixed; right: 22px; bottom: 22px; z-index: 5; display:flex; gap: 10px; align-items:end; }
+    .tweaks-panel { display:none; padding: 13px; border-radius: 16px; background: var(--ink); color:#fff7ec; box-shadow: var(--shadow); width: 220px; }
+    .tweaks.open .tweaks-panel { display:block; }
+    .tweaks-panel h4 { margin: 0 0 10px; }
+    .tweak-row { display:flex; justify-content:space-between; align-items:center; gap:10px; margin-top:8px; font-size:12px; color:rgba(255,247,236,.72); }
+    .tweak-row select { max-width: 118px; border-radius: 8px; border: 0; padding: 5px; }
 
-    button {
-      border-color: var(--accent);
-      background: var(--accent);
-      color: #fff;
-      cursor: pointer;
+    body.compact .flow-step { min-height: 96px; padding: 11px; }
+    body.compact .panel-body { padding: 14px; }
+    body.deep { --bg: #f3eadf; --bg-soft: #e7dbcc; --surface: #fff8ef; --surface-warm: #f1e2d5; --clay: #b85638; }
+
+    @media (max-width: 1280px) {
+      body { overflow: auto; }
+      .shell { height: auto; min-height: 100vh; }
+      .grid { grid-template-columns: 210px minmax(0,1fr); }
+      .sidecar { grid-column: 1 / -1; min-height: 420px; }
+      .flow-rail { grid-template-columns: repeat(3, 1fr); }
+      .summary-grid, .two-col, .registry-grid { grid-template-columns: 1fr; }
     }
-
-    button:disabled {
-      opacity: 0.5;
-      cursor: not-allowed;
-    }
-
-    .muted { color: var(--muted); }
-    .error { color: var(--danger); }
-    .list { margin: 0; padding-left: 20px; }
   </style>
 </head>
 <body>
-  <main class="shell">
-    <h1>Control Tower App DB + Flow Run Skeleton</h1>
-    <p class="muted">Flow Runs are bound to a selected consumer repo and stored in App DB localStorage only.</p>
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand"><div class="mark">A</div><div><h1>Autodev Control Tower</h1><p>一條龍開發流程 · Claude 暖紙介面</p></div></div>
+      <div class="context-pill"><strong>wferp</strong><code>/home/timmypai/apps/wferp</code></div>
+      <div class="top-actions"><div class="pill">GitHub 身份 · <strong>paulpai0412</strong></div><div class="pill">Flow Run · <strong>進行中</strong></div><button class="btn primary" type="button" data-screen-target="flow">新流程</button></div>
+    </header>
 
-    <section>
-      <h2>1) Select Consumer Repo</h2>
-      <div class="row">
-        <input id="repo-id" placeholder="owner/repo" value="paulpai0412/autodev-demo-todo">
-        <button id="select-repo" type="button">Select Repo</button>
-      </div>
-      <p id="selected-repo" class="muted">No repo selected.</p>
-    </section>
+    <main class="grid">
+      <aside class="sidebar">
+        <div>
+          <div class="nav-title">Plan</div>
+          <button class="nav-item active" type="button" data-screen-target="flow">一條龍總覽 <span class="badge">首頁</span></button>
+          <button class="nav-item" type="button" data-screen-target="prd">PRD × Issue <span class="badge">14</span></button>
+          <button class="nav-item" type="button" data-screen-target="gate">準備度關卡 <span class="badge">通過</span></button>
+          <button class="nav-item" type="button" data-screen-target="issues">Issue Plan <span class="badge">DAG</span></button>
+        </div>
+        <div>
+          <div class="nav-title">Runtime</div>
+          <button class="nav-item" type="button" data-screen-target="run">執行儀表板 <span class="badge">即時</span></button>
+          <button class="nav-item" type="button" data-screen-target="release">PR 審核佇列 <span class="badge">2</span></button>
+          <button class="nav-item" type="button" data-screen-target="recovery">復原中心 <span class="badge">1</span></button>
+        </div>
+        <div class="policy-note"><h3>Balanced Auto</h3><p>開發容量 2、Release 容量 1。PR 合併前仍需要人工確認 GitHub Review 身份。</p></div>
+      </aside>
 
-    <section>
-      <h2>2) Create Flow Run</h2>
-      <div class="row">
-        <button id="create-flow" type="button">Create Flow Run</button>
-        <button id="advance-stage" type="button">Advance To Planning</button>
-      </div>
-      <p id="error" class="error" aria-live="polite"></p>
-    </section>
+      <section class="stage">
+        <div class="stage-header"><div><div class="eyebrow" id="screen-eyebrow">Flow Overview</div><h2 id="screen-title">從需求到 Release 的一條龍開發控制塔。</h2><p id="screen-copy">把 PRD 需求、Issue todo、執行狀態與審核關卡放在同一個畫面，讓技術操作者可以同時掌握功能範圍與交付進度。</p></div><div class="top-actions"><button class="btn" type="button">重新整理 DB</button><button class="btn clay" type="button">Reconcile</button></div></div>
+        <div class="screen-wrap">
+          <section class="screen active" id="screen-flow" data-eyebrow="Flow Overview" data-title="從需求到 Release 的一條龍開發控制塔。" data-copy="把 PRD 需求、Issue todo、執行狀態與審核關卡放在同一個畫面，讓技術操作者可以同時掌握功能範圍與交付進度。">
+            <div class="flow-rail">
+              <div class="flow-step"><span class="step-no">01</span><h3>專案初始化</h3><p>綁定 repo、GitHub、runtime DB 與 host adapter。</p></div>
+              <div class="flow-step"><span class="step-no">02</span><h3>需求釐清</h3><p>透過對話收斂 domain language 與問題邊界。</p></div>
+              <div class="flow-step"><span class="step-no">03</span><h3>PRD 產出</h3><p>將目標、範圍、驗收條件變成可追蹤文件。</p></div>
+              <div class="flow-step"><span class="step-no">04</span><h3>Issue Plan</h3><p>拆成有相依性的 todo issue，而非平面清單。</p></div>
+              <div class="flow-step"><span class="step-no">05</span><h3>Autodev 執行</h3><p>Intake、start、reconcile、worker、verifier。</p></div>
+              <div class="flow-step"><span class="step-no">06</span><h3>審核發布</h3><p>PR approval、release worker、完成與證據留存。</p></div>
+            </div>
+            <div class="summary-grid">
+              <div class="panel"><div class="panel-head"><h3>PRD 需求摘要</h3><span>Control Tower v0</span></div><div class="panel-body">
+                <div class="prd-card"><div class="prd-score"><div><strong>72%</strong><span>需求覆蓋進度</span></div></div><div><h4>本階段目標</h4><p>建立本地單人 Control Tower，支援從需求釐清、PRD、UI Prototype Gate、Issue Plan 到 autodev 執行與 PR 審核的完整交付流程。</p></div></div>
+                <div class="requirement-list">
+                  <div class="requirement"><span class="rid">R-01</span><div><strong>規格管線與 PRD</strong><small>grill-with-docs → to-prd → 可審核 artifact</small></div><span class="tag done">完成 3/3</span></div>
+                  <div class="requirement"><span class="rid">R-02</span><div><strong>Prototype Gate</strong><small>UI 範圍必須先通過 HTML prototype approval</small></div><span class="tag active">進行 2/4</span></div>
+                  <div class="requirement"><span class="rid">R-03</span><div><strong>Issue Todo 與 DAG</strong><small>每個需求對應 issue、狀態、阻塞與執行 lanes</small></div><span class="tag active">進行 5/7</span></div>
+                  <div class="requirement"><span class="rid">R-04</span><div><strong>Runtime 與 Release Governance</strong><small>DB-only 狀態、Verifier evidence、PR approval queue</small></div><span class="tag blocked">待審核 4/8</span></div>
+                </div>
+              </div></div>
+              <div class="panel"><div class="panel-head"><h3>Todo Issue 清單</h3><span>依 PRD 分組</span></div><div class="panel-body"><div class="todo-list">
+                <div class="todo done"><div class="check">✓</div><div><h4>#3 App DB schema</h4><p>對應 R-01 · 對話、規格與串流狀態</p></div><span class="tag done">已驗證</span></div>
+                <div class="todo done"><div class="check">✓</div><div><h4>#4 Project Registry</h4><p>對應 R-01 · 專案切換與準備度脈絡</p></div><span class="tag done">已驗證</span></div>
+                <div class="todo active"><div class="check">•</div><div><h4>#6 WebSocket Interaction Layer</h4><p>對應 R-02/R-04 · 進度、重播、提問</p></div><span class="tag active">執行中</span></div>
+                <div class="todo active"><div class="check">•</div><div><h4>#7 UI Prototype Gate</h4><p>對應 R-02 · 產生 issues 前需完成 prototype 核准</p></div><span class="tag active">審核中</span></div>
+                <div class="todo"><div class="check">4</div><div><h4>#11 Run Dashboard</h4><p>對應 R-03/R-04 · KPI、session、人工介入訊號</p></div><span class="tag">可執行</span></div>
+                <div class="todo"><div class="check">5</div><div><h4>#14 End-to-end Verification</h4><p>對應 R-04 · spec → release 完整證據</p></div><span class="tag blocked">阻塞中</span></div>
+              </div></div></div>
+            </div>
+          </section>
 
-    <section>
-      <h2>Stored Flow Runs</h2>
-      <ul id="flow-runs" class="list"></ul>
-    </section>
-  </main>
+          <section class="screen" id="screen-prd" data-eyebrow="PRD × Issue" data-title="每個 PRD 需求都要能追到 todo issue。" data-copy="需求不是獨立文件；它應該直接投影成可執行 issue、相依關係、目前狀態與驗收風險。">
+            <div class="two-col"><div class="panel"><div class="panel-head"><h3>需求到任務矩陣</h3><span>traceability</span></div><div class="panel-body"><div class="requirement-list">
+              <div class="requirement"><span class="rid">R-01</span><div><strong>一條龍 Flow Run</strong><small>#3 #4 #5 #8 · 初始化、需求、PRD、Issue publish</small></div><span class="tag done">已覆蓋</span></div>
+              <div class="requirement"><span class="rid">R-02</span><div><strong>互動式規格與 WebSocket</strong><small>#6 #7 · chat sidecar、replay、prototype gate</small></div><span class="tag active">開發中</span></div>
+              <div class="requirement"><span class="rid">R-03</span><div><strong>執行治理與可觀測性</strong><small>#9 #10 #11 · runtime DB reader、dashboard、timeline</small></div><span class="tag">ready</span></div>
+              <div class="requirement"><span class="rid">R-04</span><div><strong>審核與完成</strong><small>#12 #13 #14 · PR queue、GitHub approval、E2E evidence</small></div><span class="tag blocked">依賴中</span></div>
+            </div></div></div><div class="panel"><div class="panel-head"><h3>驗收焦點</h3><span>PRD acceptance</span></div><div class="panel-body timeline">
+              <div class="event"><time>A1</time><div><b>可從需求走到 Issue Plan</b><p>PRD 產出、prototype gate、DAG issue plan 都需有審核紀錄。</p></div><span class="tag active">v0</span></div>
+              <div class="event"><time>A2</time><div><b>Issue 有明確相依與狀態</b><p>Blocked by issue #N 必須可被 intake 解析。</p></div><span class="tag done">就緒</span></div>
+              <div class="event"><time>A3</time><div><b>Release 前保留人工 PR approval</b><p>顯示本地 GitHub 身份與 verifier evidence。</p></div><span class="tag blocked">gate</span></div>
+            </div></div></div>
+          </section>
+
+          <section class="screen" id="screen-gate" data-eyebrow="Readiness Gate" data-title="Project Registry 與 Readiness Gate 先過關才能啟動流程。" data-copy="切換專案只更新 active context；Readiness Gate 會檢查 GitHub auth 與 runtime path，失敗時明確阻擋 Flow Run。">
+            <div class="registry-grid">
+              <div class="panel">
+                <div class="panel-head"><h3>Project Registry</h3><span>single active project</span></div>
+                <div class="panel-body">
+                  <div class="field-row">
+                    <select id="registry-select" aria-label="Select registered project"></select>
+                    <button class="btn" id="switch-project" type="button">切換</button>
+                  </div>
+                  <p class="mini-note" id="active-project-note">目前未選擇專案。</p>
+                  <p class="mini-note">切換行為只會更新 UI context，不會觸發 reconcile / release。</p>
+                </div>
+              </div>
+              <div class="panel">
+                <div class="panel-head"><h3>Readiness Inputs</h3><span>gate sources</span></div>
+                <div class="panel-body">
+                  <div class="field-row">
+                    <input id="github-token" placeholder="GitHub token (empty means missing)" value="" aria-label="GitHub token">
+                    <span class="tag blocked">GitHub Auth</span>
+                  </div>
+                  <div class="field-row">
+                    <select id="runtime-path-exists" aria-label="Runtime path exists"><option value="false">runtime path missing</option><option value="true">runtime path exists</option></select>
+                    <span class="tag info">Runtime Path</span>
+                  </div>
+                  <div class="field-row">
+                    <select id="runtime-config-exists" aria-label="Runtime config exists"><option value="false">.autodev.yaml missing</option><option value="true">.autodev.yaml exists</option></select>
+                    <span class="tag info">Runtime Config</span>
+                  </div>
+                  <p class="mini-note">預設故意設為未就緒，確保 Start Flow Run 一開始會被 gate 阻擋。</p>
+                </div>
+              </div>
+            </div>
+            <div class="panel" style="margin-top:14px">
+              <div class="panel-head"><h3>Readiness Gate</h3><span>must pass before flow start</span></div>
+              <div class="panel-body">
+                <div class="check-list" id="readiness-checks"></div>
+                <div class="field-row" style="margin-top:14px; grid-template-columns: 1fr auto auto;">
+                  <p class="mini-note" id="gate-hint">Readiness gate 尚未通過。</p>
+                  <button class="btn" id="refresh-gate" type="button">重新檢查</button>
+                  <button class="btn primary" id="start-flow-run" type="button" disabled>Start Flow Run</button>
+                </div>
+                <p class="mini-note" id="start-result"></p>
+              </div>
+            </div>
+            <div class="panel" style="margin-top:14px">
+              <div class="panel-head"><h3>All Projects（Read-only）</h3><span>no cross-repo lifecycle</span></div>
+              <div class="panel-body">
+                <div class="projects-readonly" id="all-projects-view"></div>
+                <p class="mini-note">此視圖僅可閱讀，不提供跨專案 reconcile / release 按鈕。</p>
+              </div>
+            </div>
+          </section>
+
+          <section class="screen" id="screen-issues" data-eyebrow="Issue Plan" data-title="Issue Plan 是可執行 DAG，不是平面任務清單。" data-copy="每張卡都保留 PRD 對應、依賴與目前 ready/running/blocked 狀態，讓操作者可以判斷下一個 autodev slice。">
+            <div class="lane-grid"><div class="lane"><h4>Foundation <span class="tag done">就緒</span></h4><div class="issue"><strong>#3 App DB</strong><p>R-01 · 無相依</p></div><div class="issue"><strong>#4 Registry</strong><p>R-01 · after #3</p></div></div><div class="lane"><h4>Interaction <span class="tag active">執行中</span></h4><div class="issue"><strong>#6 WebSocket stream</strong><p>R-02 · after #3 #5</p></div><div class="issue"><strong>#7 Prototype Gate</strong><p>R-02 · after #5</p></div></div><div class="lane"><h4>Runtime <span class="tag">下一步</span></h4><div class="issue"><strong>#10 Runtime reader</strong><p>R-03 · after #4</p></div><div class="issue"><strong>#11 Dashboard</strong><p>R-03 · after #6 #10</p></div></div><div class="lane"><h4>Release <span class="tag blocked">阻塞中</span></h4><div class="issue"><strong>#13 GitHub approval</strong><p>R-04 · 需要 identity gate</p></div><div class="issue"><strong>#14 E2E verification</strong><p>R-04 · after #10 #12 #13</p></div></div></div>
+          </section>
+
+          <section class="screen" id="screen-run" data-eyebrow="Run Dashboard" data-title="執行儀表板只呈現決策需要的訊號。" data-copy="從 DB-only control plane 讀取 issue/session/release 狀態，避免讓畫面變成無限聊天紀錄。">
+            <div class="metric-row"><div class="metric"><span>作用中 issues</span><strong>4</strong><small>2 running · 1 verifying</small></div><div class="metric"><span>開發容量</span><strong>2/2</strong><small>slot saturated</small></div><div class="metric"><span>Release queue</span><strong>3</strong><small>2 need approval</small></div><div class="metric"><span>阻塞</span><strong>1</strong><small>stale verifier</small></div></div>
+            <div class="panel"><div class="panel-head"><h3>近期控制平面事件</h3><span>issue_history</span></div><div class="panel-body timeline"><div class="event"><time>11:42</time><div><b>#142 dispatching → running</b><p>current_session_id 已寫入 issues snapshot。</p></div><span class="tag active">root</span></div><div class="event"><time>11:39</time><div><b>#139 verifier accepted</b><p>evidence packet 通過，等待 release policy。</p></div><span class="tag done">verified</span></div><div class="event"><time>11:35</time><div><b>#128 quarantined</b><p>stale heartbeat，其他 issue 可繼續執行。</p></div><span class="tag risk">recovery</span></div></div></div>
+          </section>
+
+          <section class="screen" id="screen-release" data-eyebrow="PR Approval Queue" data-title="PR 審核佇列把 Release gate 留在 Control Tower 裡。" data-copy="操作者可以確認 verifier evidence、GitHub checks 與本地 approval identity，再送出 GitHub-native review approval。">
+            <div class="todo-list"><div class="todo active"><div class="check">•</div><div><h4>PR #88 · Control Tower App DB schema</h4><p>#132 verified · checks passing · approving as paulpai0412</p></div><button class="btn primary" type="button">核准</button></div><div class="todo"><div class="check">2</div><div><h4>PR #91 · Runtime DB reader</h4><p>#139 verified · required check still running</p></div><button class="btn" type="button" disabled>阻塞</button></div></div>
+          </section>
+
+          <section class="screen" id="screen-recovery" data-eyebrow="Recovery Center" data-title="復原操作必須 issue-scoped，不拖垮整個工作區。" data-copy="Quarantine、resume、retry 與 fail 都寫入 issue_history，保留完整 audit trail。">
+            <div class="two-col"><div class="panel"><div class="panel-head"><h3>#128 Stale verifier</h3><span class="tag risk">quarantined</span></div><div class="panel-body"><p style="color:var(--ink-soft);line-height:1.65;margin-top:0">last_event_at 超過門檻，但只隔離單一 issue；其他 ready issue 仍可由 workspace reconcile 補位。</p><button class="btn primary" type="button">Resume quarantined</button> <button class="btn" type="button">Retry failed</button></div></div><div class="panel"><div class="panel-head"><h3>建議命令</h3><span>audit-safe</span></div><div class="panel-body"><code style="font-family:var(--font-mono);color:var(--clay-dark);line-height:1.8">orchestrator_supervisor.py resume-quarantined --issue-number 128 --reason "verifier session recovered"</code></div></div></div>
+          </section>
+        </div>
+      </section>
+
+      <aside class="sidecar">
+        <div class="chat-head"><h3>互動式 Flow Chat</h3><p>WebSocket 串流 · 提問 · 核准 · skill 編排</p></div>
+        <div class="chat"><div class="message operator"><h4>操作者 <span>11:17</span></h4><p>建立繁中 Claude 風格 Control Tower，讓 PRD 需求能連到 todo issue list 與交付進度。</p></div><div class="message"><h4>/grill-with-docs <span>11:20</span></h4><p>確認 primary persona 是 Technical Operator / Engineering Lead，主畫面採 dashboard-first 但不 chat-first。</p><div class="stream">event: artifact.updated · CONTEXT.md</div></div><div class="message"><h4>to-prd <span>11:31</span></h4><p>PRD 已產生：Control Tower v0。下一步檢查 UI Prototype Gate 與 Issue Plan DAG。</p><div class="stream">event: skill.completed · artifact: PRD</div></div><div class="message"><h4>等待核准 <span>now</span></h4><p>是否核准此 PRD × Issue traceability 版面，作為 UI issue 的 prototype baseline？</p><div style="margin-top:10px"><button class="btn primary" type="button">核准</button> <button class="btn" type="button">要求修改</button></div></div></div>
+        <div class="composer"><input value="要求 Control Tower 修正需求或繼續執行..." aria-label="Chat input"><button class="btn primary" type="button">送出</button></div>
+      </aside>
+    </main>
+  </div>
+
+  <div class="tweaks" id="tweaks"><div class="tweaks-panel"><h4>Tweaks</h4><div class="tweak-row"><span>色調</span><select id="tone"><option value="paper">暖紙</option><option value="deep">深陶土</option></select></div><div class="tweak-row"><span>密度</span><select id="density"><option value="normal">正常</option><option value="compact">緊湊</option></select></div></div><button class="btn" type="button" id="tweak-toggle">Tweaks</button></div>
 
   <script id="control-tower-core">
     (function () {
-      var APP_DB_KEY = "control-tower-app-db.v1";
+      var APP_DB_KEY = "control-tower-registry.v1";
 
       function nowIso() {
         return new Date().toISOString();
@@ -111,13 +662,25 @@
         return prefix + "-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
       }
 
+      function normalizeProject(project) {
+        return {
+          repoId: String(project.repoId),
+          displayName: project.displayName ? String(project.displayName) : String(project.repoId),
+        };
+      }
+
       function normalizeDb(raw) {
         if (!raw || typeof raw !== "object") {
-          return { selectedRepo: null, flowRuns: [] };
+          return { projects: [], activeRepoId: null, flowRuns: [] };
         }
 
         return {
-          selectedRepo: raw.selectedRepo || null,
+          projects: Array.isArray(raw.projects)
+            ? raw.projects
+                .filter(function (project) { return project && project.repoId; })
+                .map(normalizeProject)
+            : [],
+          activeRepoId: raw.activeRepoId ? String(raw.activeRepoId) : null,
           flowRuns: Array.isArray(raw.flowRuns) ? raw.flowRuns : [],
         };
       }
@@ -125,127 +688,179 @@
       function createControlTowerApp(options) {
         var opts = options || {};
         var storage = opts.storage || (typeof window !== "undefined" ? window.localStorage : null);
+        var env = opts.env || {};
+        var lifecycleEvents = [];
 
         if (!storage || typeof storage.getItem !== "function" || typeof storage.setItem !== "function") {
           throw new Error("createControlTowerApp requires a storage with getItem/setItem.");
         }
 
-        function readAppDb() {
+        function readDb() {
           var raw = storage.getItem(APP_DB_KEY);
           if (!raw) {
-            return { selectedRepo: null, flowRuns: [] };
+            return { projects: [], activeRepoId: null, flowRuns: [] };
           }
 
           try {
             return normalizeDb(JSON.parse(raw));
           } catch (error) {
-            return { selectedRepo: null, flowRuns: [] };
+            return { projects: [], activeRepoId: null, flowRuns: [] };
           }
         }
 
-        function writeAppDb(db) {
-          storage.setItem(APP_DB_KEY, JSON.stringify(db));
-          return db;
+        function writeDb(db) {
+          var next = normalizeDb(db);
+          storage.setItem(APP_DB_KEY, JSON.stringify(next));
+          return next;
         }
 
-        function selectConsumerRepo(input) {
+        function listRegisteredProjects() {
+          return readDb().projects;
+        }
+
+        function registerProject(input) {
           if (!input || !input.repoId) {
-            throw new Error("A consumer repo is required.");
+            throw new Error("Project repoId is required.");
           }
 
-          var db = readAppDb();
-          db.selectedRepo = {
-            repoId: String(input.repoId),
-            displayName: input.displayName ? String(input.displayName) : String(input.repoId),
-            selectedAt: nowIso(),
-          };
-          writeAppDb(db);
-          return db.selectedRepo;
+          var db = readDb();
+          var project = normalizeProject(input);
+          var exists = db.projects.some(function (item) { return item.repoId === project.repoId; });
+          if (!exists) {
+            db.projects.push(project);
+          }
+          if (!db.activeRepoId) {
+            db.activeRepoId = project.repoId;
+          }
+          writeDb(db);
+          return project;
         }
 
-        function createFlowRun(input) {
-          var db = readAppDb();
-          if (!db.selectedRepo || !db.selectedRepo.repoId) {
-            throw new Error("Flow Run creation requires a selected consumer repo.");
+        function switchActiveProject(repoId) {
+          var targetId = String(repoId || "").trim();
+          var db = readDb();
+          var target = db.projects.find(function (item) { return item.repoId === targetId; });
+          if (!target) {
+            throw new Error("Project is not registered: " + targetId);
           }
 
-          var createdAt = nowIso();
+          db.activeRepoId = targetId;
+          writeDb(db);
+          return target;
+        }
+
+        function getActiveProject() {
+          var db = readDb();
+          if (!db.activeRepoId) {
+            return null;
+          }
+          return db.projects.find(function (item) { return item.repoId === db.activeRepoId; }) || null;
+        }
+
+        function getEnvValue(key, fallback) {
+          if (Object.prototype.hasOwnProperty.call(env, key)) {
+            return env[key];
+          }
+          return fallback;
+        }
+
+        function evaluateReadiness() {
+          var githubToken = String(getEnvValue("githubToken", "")).trim();
+          var runtimePathExists = Boolean(getEnvValue("runtimePathExists", false));
+          var runtimeConfigExists = Boolean(getEnvValue("runtimeConfigExists", false));
+          var activeProject = getActiveProject();
+
+          var checks = {
+            activeProject: {
+              ok: Boolean(activeProject),
+              label: "Active project selected",
+              detail: activeProject ? activeProject.repoId : "No project selected",
+            },
+            githubAuth: {
+              ok: githubToken.length > 0,
+              label: "GitHub auth token",
+              detail: githubToken.length > 0 ? "Token available" : "Missing token",
+            },
+            runtimePath: {
+              ok: runtimePathExists,
+              label: "Runtime path",
+              detail: runtimePathExists ? "Runtime path exists" : "Runtime path missing",
+            },
+            runtimeConfig: {
+              ok: runtimeConfigExists,
+              label: ".autodev.yaml",
+              detail: runtimeConfigExists ? "Config file detected" : "Config file missing",
+            },
+          };
+
+          var canStartFlowRun = Object.keys(checks).every(function (key) {
+            return checks[key].ok;
+          });
+
+          return { checks: checks, canStartFlowRun: canStartFlowRun };
+        }
+
+        function startFlowRun() {
+          var gate = evaluateReadiness();
+          if (!gate.canStartFlowRun) {
+            throw new Error("Readiness gate failed. Fix checks before starting Flow Run.");
+          }
+
+          var activeProject = getActiveProject();
+          var db = readDb();
           var flowRun = {
             flowRunId: makeId("flow"),
-            repoId: db.selectedRepo.repoId,
-            stage: input && input.stage ? String(input.stage) : "spec_pipeline",
-            createdAt: createdAt,
-            updatedAt: createdAt,
+            repoId: activeProject.repoId,
+            stage: "spec_pipeline",
+            createdAt: nowIso(),
           };
 
           db.flowRuns.push(flowRun);
-          writeAppDb(db);
+          writeDb(db);
           return flowRun;
         }
 
-        function setFlowRunStage(flowRunId, stage) {
-          var db = readAppDb();
-          var nextStage = String(stage || "");
-          var found = null;
-
-          db.flowRuns = db.flowRuns.map(function (run) {
-            if (run.flowRunId !== flowRunId) {
-              return run;
-            }
-
-            found = {
-              flowRunId: run.flowRunId,
-              repoId: run.repoId,
-              stage: nextStage,
-              createdAt: run.createdAt,
-              updatedAt: nowIso(),
+        function getAllProjectsView() {
+          var active = getActiveProject();
+          var projects = listRegisteredProjects().map(function (project) {
+            return {
+              repoId: project.repoId,
+              displayName: project.displayName,
+              active: active ? active.repoId === project.repoId : false,
+              actions: [],
             };
-            return found;
           });
 
-          if (!found) {
-            throw new Error("Flow Run not found: " + flowRunId);
-          }
-
-          writeAppDb(db);
-          return found;
+          return {
+            readOnly: true,
+            projects: projects,
+          };
         }
 
-        function saveChatSpecState(flowRunId, payload) {
-          var db = readAppDb();
-          var updated = null;
+        function triggerAllProjectsLifecycleAction(actionName) {
+          throw new Error("All Projects view is read-only; lifecycle actions are blocked: " + actionName);
+        }
 
-          db.flowRuns = db.flowRuns.map(function (run) {
-            if (run.flowRunId !== flowRunId) {
-              return run;
-            }
-
-            updated = {
-              flowRunId: run.flowRunId,
-              repoId: run.repoId,
-              stage: run.stage,
-              createdAt: run.createdAt,
-              updatedAt: nowIso(),
-              chatSpecState: payload || {},
-            };
-            return updated;
-          });
-
-          if (!updated) {
-            throw new Error("Flow Run not found: " + flowRunId);
-          }
-
-          writeAppDb(db);
-          return updated;
+        function getLifecycleEvents() {
+          return lifecycleEvents.slice();
         }
 
         return {
           APP_DB_KEY: APP_DB_KEY,
-          readAppDb: readAppDb,
-          selectConsumerRepo: selectConsumerRepo,
-          createFlowRun: createFlowRun,
-          setFlowRunStage: setFlowRunStage,
-          saveChatSpecState: saveChatSpecState,
+          readDb: readDb,
+          writeDb: writeDb,
+          listRegisteredProjects: listRegisteredProjects,
+          registerProject: registerProject,
+          switchActiveProject: switchActiveProject,
+          getActiveProject: getActiveProject,
+          evaluateReadiness: evaluateReadiness,
+          startFlowRun: startFlowRun,
+          getAllProjectsView: getAllProjectsView,
+          triggerAllProjectsLifecycleAction: triggerAllProjectsLifecycleAction,
+          getLifecycleEvents: getLifecycleEvents,
+          setEnv: function (nextEnv) {
+            env = nextEnv || {};
+          },
         };
       }
 
@@ -265,69 +880,170 @@
   </script>
 
   <script>
-    (function () {
-      if (typeof window === "undefined" || !window.ControlTowerCore) {
-        return;
-      }
+    const buttons = document.querySelectorAll('[data-screen-target]');
+    const screens = document.querySelectorAll('.screen');
+    const eyebrow = document.getElementById('screen-eyebrow');
+    const title = document.getElementById('screen-title');
+    const copy = document.getElementById('screen-copy');
 
-      var app = window.ControlTowerCore.createControlTowerApp();
-      var repoInput = document.getElementById("repo-id");
-      var selectedRepoText = document.getElementById("selected-repo");
-      var errorText = document.getElementById("error");
-      var flowRunsList = document.getElementById("flow-runs");
-
-      function render() {
-        var db = app.readAppDb();
-        selectedRepoText.textContent = db.selectedRepo
-          ? "Selected: " + db.selectedRepo.repoId
-          : "No repo selected.";
-
-        flowRunsList.innerHTML = "";
-        db.flowRuns.forEach(function (run) {
-          var item = document.createElement("li");
-          item.textContent = run.flowRunId + " | " + run.repoId + " | " + run.stage + " | " + run.updatedAt;
-          flowRunsList.appendChild(item);
+    buttons.forEach((button) => {
+      button.addEventListener('click', () => {
+        const target = button.dataset.screenTarget;
+        const screen = document.getElementById(`screen-${target}`);
+        if (!screen) return;
+        document.querySelectorAll('.nav-item').forEach((item) => {
+          item.classList.toggle('active', item.dataset.screenTarget === target);
         });
-      }
+        screens.forEach((item) => {
+          item.classList.toggle('active', item.id === `screen-${target}`);
+        });
+        eyebrow.textContent = screen.dataset.eyebrow;
+        title.textContent = screen.dataset.title;
+        copy.textContent = screen.dataset.copy;
+      });
+    });
 
-      function safeCall(fn) {
-        errorText.textContent = "";
-        try {
-          fn();
-          render();
-        } catch (error) {
-          errorText.textContent = error && error.message ? error.message : "Unknown error";
+    document.getElementById('tweak-toggle').addEventListener('click', () => document.getElementById('tweaks').classList.toggle('open'));
+    document.getElementById('tone').addEventListener('change', (event) => document.body.classList.toggle('deep', event.target.value === 'deep'));
+    document.getElementById('density').addEventListener('change', (event) => document.body.classList.toggle('compact', event.target.value === 'compact'));
+
+    if (window.ControlTowerCore) {
+      const app = window.ControlTowerCore.createControlTowerApp();
+      const registrySelect = document.getElementById('registry-select');
+      const switchProjectButton = document.getElementById('switch-project');
+      const activeProjectNote = document.getElementById('active-project-note');
+      const githubTokenInput = document.getElementById('github-token');
+      const runtimePathSelect = document.getElementById('runtime-path-exists');
+      const runtimeConfigSelect = document.getElementById('runtime-config-exists');
+      const readinessChecks = document.getElementById('readiness-checks');
+      const gateHint = document.getElementById('gate-hint');
+      const refreshGateButton = document.getElementById('refresh-gate');
+      const startFlowRunButton = document.getElementById('start-flow-run');
+      const startResult = document.getElementById('start-result');
+      const allProjectsView = document.getElementById('all-projects-view');
+
+      const bootstrapProjects = () => {
+        if (app.listRegisteredProjects().length > 0) {
+          return;
         }
-      }
 
-      document.getElementById("select-repo").addEventListener("click", function () {
-        safeCall(function () {
-          var repoId = repoInput.value.trim();
-          app.selectConsumerRepo({ repoId: repoId, displayName: repoId });
+        app.registerProject({ repoId: 'paulpai0412/autodev', displayName: 'Autodev' });
+        app.registerProject({ repoId: 'paulpai0412/wferp', displayName: 'WFERP' });
+        app.registerProject({ repoId: 'acme/demo-app', displayName: 'Demo App' });
+      };
+
+      const applyEnvFromInputs = () => {
+        app.setEnv({
+          githubToken: githubTokenInput.value.trim(),
+          runtimePathExists: runtimePathSelect.value === 'true',
+          runtimeConfigExists: runtimeConfigSelect.value === 'true',
         });
-      });
+      };
 
-      document.getElementById("create-flow").addEventListener("click", function () {
-        safeCall(function () {
-          app.createFlowRun({ stage: "spec_pipeline" });
-        });
-      });
+      const renderRegistry = () => {
+        const active = app.getActiveProject();
+        const projects = app.listRegisteredProjects();
+        registrySelect.innerHTML = '';
 
-      document.getElementById("advance-stage").addEventListener("click", function () {
-        safeCall(function () {
-          var db = app.readAppDb();
-          if (!db.flowRuns.length) {
-            throw new Error("Create a Flow Run first.");
+        projects.forEach((project) => {
+          const option = document.createElement('option');
+          option.value = project.repoId;
+          option.textContent = `${project.displayName} (${project.repoId})`;
+          if (active && active.repoId === project.repoId) {
+            option.selected = true;
           }
+          registrySelect.appendChild(option);
+        });
 
-          var latest = db.flowRuns[db.flowRuns.length - 1];
-          app.setFlowRunStage(latest.flowRunId, "planning");
-          app.saveChatSpecState(latest.flowRunId, { note: "spec notes" });
+        activeProjectNote.textContent = active
+          ? `目前作用中專案：${active.displayName} (${active.repoId})`
+          : '目前未選擇專案。';
+      };
+
+      const renderReadiness = () => {
+        applyEnvFromInputs();
+        const gate = app.evaluateReadiness();
+        readinessChecks.innerHTML = '';
+
+        Object.values(gate.checks).forEach((check) => {
+          const item = document.createElement('div');
+          item.className = 'check-item';
+
+          const text = document.createElement('div');
+          text.innerHTML = `<strong>${check.label}</strong><div class="project-meta">${check.detail}</div>`;
+          item.appendChild(text);
+
+          const tag = document.createElement('span');
+          tag.className = `tag ${check.ok ? 'done' : 'blocked'}`;
+          tag.textContent = check.ok ? '通過' : '阻擋';
+          item.appendChild(tag);
+          readinessChecks.appendChild(item);
+        });
+
+        startFlowRunButton.disabled = !gate.canStartFlowRun;
+        gateHint.textContent = gate.canStartFlowRun
+          ? 'Readiness gate 已通過，可啟動 Flow Run。'
+          : 'Readiness gate 尚未通過，Start Flow Run 已封鎖。';
+      };
+
+      const renderAllProjects = () => {
+        const view = app.getAllProjectsView();
+        allProjectsView.innerHTML = '';
+
+        view.projects.forEach((project) => {
+          const row = document.createElement('div');
+          row.className = 'project-row';
+          const text = document.createElement('div');
+          text.innerHTML = `<strong>${project.displayName}</strong><div class="project-meta">${project.repoId}${project.active ? ' · active' : ''}</div>`;
+          row.appendChild(text);
+
+          const tag = document.createElement('span');
+          tag.className = 'tag info';
+          tag.textContent = view.readOnly ? 'read-only' : 'editable';
+          row.appendChild(tag);
+          allProjectsView.appendChild(row);
+        });
+      };
+
+      const renderEverything = () => {
+        renderRegistry();
+        renderReadiness();
+        renderAllProjects();
+      };
+
+      bootstrapProjects();
+      renderEverything();
+
+      switchProjectButton.addEventListener('click', () => {
+        app.switchActiveProject(registrySelect.value);
+        startResult.textContent = '已切換 active project；未觸發任何跨專案 lifecycle action。';
+        renderEverything();
+      });
+
+      [githubTokenInput, runtimePathSelect, runtimeConfigSelect].forEach((element) => {
+        element.addEventListener('change', () => {
+          startResult.textContent = '';
+          renderReadiness();
         });
       });
 
-      render();
-    })();
+      refreshGateButton.addEventListener('click', () => {
+        startResult.textContent = '';
+        renderReadiness();
+      });
+
+      startFlowRunButton.addEventListener('click', () => {
+        try {
+          const flowRun = app.startFlowRun();
+          startResult.textContent = `Flow Run started: ${flowRun.flowRunId} (${flowRun.repoId})`;
+          startResult.className = 'mini-note';
+        } catch (error) {
+          startResult.textContent = error.message;
+          startResult.className = 'mini-note error';
+        }
+        renderReadiness();
+      });
+    }
   </script>
 </body>
 </html>

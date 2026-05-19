@@ -50,71 +50,91 @@ function createMemoryStorage() {
 
 function runTests() {
   const core = loadControlTowerModule();
-  const { createControlTowerApp, APP_DB_KEY } = core;
+  const { createControlTowerApp } = core;
   const tests = [];
 
   function test(name, fn) {
     tests.push({ name, fn });
   }
 
-  test("AC3: rejects flow run creation without selected consumer repo", () => {
-    const app = createControlTowerApp({ storage: createMemoryStorage() });
+  test("AC3: switching project context does not trigger cross-repo lifecycle actions", () => {
+    const app = createControlTowerApp({
+      storage: createMemoryStorage(),
+      env: {
+        githubToken: "ghp_demo",
+        runtimePathExists: true,
+        runtimeConfigExists: true,
+      },
+    });
+
+    app.registerProject({ repoId: "acme/alpha", displayName: "Alpha" });
+    app.registerProject({ repoId: "acme/beta", displayName: "Beta" });
+
+    app.switchActiveProject("acme/alpha");
+    app.switchActiveProject("acme/beta");
+
+    assert.equal(app.getActiveProject().repoId, "acme/beta");
+    assert.equal(app.getLifecycleEvents().length, 0);
+  });
+
+  test("AC4: readiness gate blocks flow run start when checks fail", () => {
+    const app = createControlTowerApp({
+      storage: createMemoryStorage(),
+      env: {
+        githubToken: "",
+        runtimePathExists: false,
+        runtimeConfigExists: false,
+      },
+    });
+
+    app.registerProject({ repoId: "acme/alpha", displayName: "Alpha" });
+    app.switchActiveProject("acme/alpha");
+
+    const gate = app.evaluateReadiness();
+    assert.equal(gate.canStartFlowRun, false);
+    assert.equal(gate.checks.githubAuth.ok, false);
+    assert.equal(gate.checks.runtimePath.ok, false);
+    assert.equal(gate.checks.runtimeConfig.ok, false);
 
     assert.throws(
       () => {
-        app.createFlowRun({ stage: "spec_pipeline" });
+        app.startFlowRun();
       },
-      /selected consumer repo/i,
+      /Readiness gate failed/i,
     );
   });
 
-  test("AC4: app DB persists flow run identity stage and timestamps", () => {
-    const storage = createMemoryStorage();
-    const app = createControlTowerApp({ storage });
-
-    app.selectConsumerRepo({ repoId: "acme/app", displayName: "Acme App" });
-    const flowRun = app.createFlowRun({ stage: "spec_pipeline" });
-
-    assert.equal(flowRun.repoId, "acme/app");
-    assert.equal(flowRun.stage, "spec_pipeline");
-    assert.ok(flowRun.flowRunId);
-    assert.ok(flowRun.createdAt);
-    assert.ok(flowRun.updatedAt);
-
-    const appReloaded = createControlTowerApp({ storage });
-    const snapshot = appReloaded.readAppDb();
-
-    assert.equal(snapshot.flowRuns.length, 1);
-    assert.equal(snapshot.flowRuns[0].flowRunId, flowRun.flowRunId);
-    assert.equal(snapshot.flowRuns[0].stage, "spec_pipeline");
-
-    const raw = JSON.parse(storage.getItem(APP_DB_KEY));
-    assert.equal(raw.flowRuns[0].flowRunId, flowRun.flowRunId);
-  });
-
-  test("AC5: chat/spec writes never touch consumer issues or issue_history", () => {
-    const writes = [];
-    const consumerRuntimeDb = {
-      write(tableName) {
-        writes.push(tableName);
-      },
-    };
-
+  test("AC5: all-projects view is read-only and exposes no cross-repo lifecycle actions", () => {
     const app = createControlTowerApp({
       storage: createMemoryStorage(),
-      consumerRuntimeDb,
+      env: {
+        githubToken: "ghp_demo",
+        runtimePathExists: true,
+        runtimeConfigExists: true,
+      },
     });
 
-    app.selectConsumerRepo({ repoId: "acme/app", displayName: "Acme App" });
-    const run = app.createFlowRun({ stage: "spec_pipeline" });
-    app.saveChatSpecState(run.flowRunId, { prompt: "build dashboard" });
-    app.setFlowRunStage(run.flowRunId, "planning");
+    app.registerProject({ repoId: "acme/alpha", displayName: "Alpha" });
+    app.registerProject({ repoId: "acme/beta", displayName: "Beta" });
+    const allProjects = app.getAllProjectsView();
 
-    assert.deepEqual(writes, []);
+    assert.equal(allProjects.readOnly, true);
+    assert.equal(Array.isArray(allProjects.projects), true);
+    assert.equal(allProjects.projects.length, 2);
+    allProjects.projects.forEach((project) => {
+      assert.equal(Array.isArray(project.actions), true);
+      assert.equal(project.actions.length, 0);
+    });
+
+    assert.throws(
+      () => {
+        app.triggerAllProjectsLifecycleAction("reconcile-all");
+      },
+      /read-only/i,
+    );
   });
 
   let passed = 0;
-
   for (const { name, fn } of tests) {
     try {
       fn();
