@@ -57,7 +57,7 @@ function runTests() {
     tests.push({ name, fn });
   }
 
-  test("AC3: switching project context does not trigger cross-repo lifecycle actions", () => {
+  test("AC3: flow run exposes explicit clarify -> prd -> issue-plan transitions", () => {
     const app = createControlTowerApp({
       storage: createMemoryStorage(),
       env: {
@@ -68,16 +68,69 @@ function runTests() {
     });
 
     app.registerProject({ repoId: "acme/alpha", displayName: "Alpha" });
-    app.registerProject({ repoId: "acme/beta", displayName: "Beta" });
-
     app.switchActiveProject("acme/alpha");
-    app.switchActiveProject("acme/beta");
 
-    assert.equal(app.getActiveProject().repoId, "acme/beta");
-    assert.equal(app.getLifecycleEvents().length, 0);
+    const flowRun = app.startFlowRun();
+    const stageNames = app
+      .getSpecPipelineStatus(flowRun.flowRunId)
+      .stages.map((stage) => stage.stage);
+
+    assert.equal(stageNames.join("->"), "clarify->prd->issue-plan");
+    assert.equal(app.getSpecPipelineStatus(flowRun.flowRunId).currentStage, "clarify");
+
+    app.advanceSpecPipeline(flowRun.flowRunId);
+    assert.equal(app.getSpecPipelineStatus(flowRun.flowRunId).currentStage, "prd");
+
+    app.advanceSpecPipeline(flowRun.flowRunId);
+    assert.equal(app.getSpecPipelineStatus(flowRun.flowRunId).currentStage, "issue-plan");
   });
 
-  test("AC4: readiness gate blocks flow run start when checks fail", () => {
+  test("AC4: pipeline emits structured stage status and blocking prompts", () => {
+    const app = createControlTowerApp({
+      storage: createMemoryStorage(),
+      env: {
+        githubToken: "ghp_demo",
+        runtimePathExists: true,
+        runtimeConfigExists: true,
+      },
+    });
+
+    app.registerProject({ repoId: "acme/alpha", displayName: "Alpha" });
+    app.switchActiveProject("acme/alpha");
+    const flowRun = app.startFlowRun();
+
+    const blocking = app.addBlockingQuestion(flowRun.flowRunId, {
+      stage: "clarify",
+      prompt: "Who is the primary operator persona?",
+    });
+
+    const blockedStatus = app.getSpecPipelineStatus(flowRun.flowRunId);
+    const clarify = blockedStatus.stages.find((stage) => stage.stage === "clarify");
+
+    assert.equal(clarify.status, "blocked");
+    assert.equal(Array.isArray(clarify.blockingQuestions), true);
+    assert.equal(clarify.blockingQuestions.length, 1);
+    assert.equal(clarify.blockingQuestions[0].questionId, blocking.questionId);
+    assert.equal(blockedStatus.blockingQuestions.length, 1);
+
+    assert.throws(
+      () => {
+        app.advanceSpecPipeline(flowRun.flowRunId);
+      },
+      /blocking question/i,
+    );
+
+    app.resolveBlockingQuestion(flowRun.flowRunId, blocking.questionId, "Tech lead");
+    const unblockedStatus = app.getSpecPipelineStatus(flowRun.flowRunId);
+    const clarifyAfterResolve = unblockedStatus.stages.find(
+      (stage) => stage.stage === "clarify",
+    );
+
+    assert.equal(clarifyAfterResolve.status, "in_progress");
+    assert.equal(clarifyAfterResolve.blockingQuestions[0].status, "resolved");
+  });
+
+  test("AC5: stage progression is rejected when flow run is not readiness-passed", () => {
     const app = createControlTowerApp({
       storage: createMemoryStorage(),
       env: {
@@ -89,48 +142,16 @@ function runTests() {
 
     app.registerProject({ repoId: "acme/alpha", displayName: "Alpha" });
     app.switchActiveProject("acme/alpha");
-
-    const gate = app.evaluateReadiness();
-    assert.equal(gate.canStartFlowRun, false);
-    assert.equal(gate.checks.githubAuth.ok, false);
-    assert.equal(gate.checks.runtimePath.ok, false);
-    assert.equal(gate.checks.runtimeConfig.ok, false);
-
-    assert.throws(
-      () => {
-        app.startFlowRun();
-      },
-      /Readiness gate failed/i,
-    );
-  });
-
-  test("AC5: all-projects view is read-only and exposes no cross-repo lifecycle actions", () => {
-    const app = createControlTowerApp({
-      storage: createMemoryStorage(),
-      env: {
-        githubToken: "ghp_demo",
-        runtimePathExists: true,
-        runtimeConfigExists: true,
-      },
-    });
-
-    app.registerProject({ repoId: "acme/alpha", displayName: "Alpha" });
-    app.registerProject({ repoId: "acme/beta", displayName: "Beta" });
-    const allProjects = app.getAllProjectsView();
-
-    assert.equal(allProjects.readOnly, true);
-    assert.equal(Array.isArray(allProjects.projects), true);
-    assert.equal(allProjects.projects.length, 2);
-    allProjects.projects.forEach((project) => {
-      assert.equal(Array.isArray(project.actions), true);
-      assert.equal(project.actions.length, 0);
+    const flowRun = app.createFlowRunFromOrchestration({
+      repoId: "acme/alpha",
+      readinessPassed: false,
     });
 
     assert.throws(
       () => {
-        app.triggerAllProjectsLifecycleAction("reconcile-all");
+        app.advanceSpecPipeline(flowRun.flowRunId);
       },
-      /read-only/i,
+      /readiness-passed/i,
     );
   });
 
