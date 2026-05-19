@@ -1023,6 +1023,12 @@
             title: item.title ? String(item.title) : String(item.id),
             deps: Array.isArray(item.deps) ? item.deps.map(function (dep) { return String(dep); }) : [],
             state: item.state ? String(item.state) : "todo",
+            labels: Array.isArray(item.labels)
+              ? item.labels.map(function (label) { return String(label); })
+              : [],
+            acceptanceCriteria: Array.isArray(item.acceptanceCriteria)
+              ? item.acceptanceCriteria.map(function (criterion) { return String(criterion); })
+              : [],
             orderIndex: index,
           };
         }
@@ -1241,6 +1247,108 @@
             reason: "cyclic_dependencies",
             cycles: plan.cycles,
             splitGuidance: plan.splitGuidance,
+          };
+        }
+
+        function uniqueLabels(labels) {
+          var list = Array.isArray(labels) ? labels.slice() : [];
+          if (list.indexOf("ready-for-agent") === -1) {
+            list.push("ready-for-agent");
+          }
+          return list.filter(function (label, index) {
+            return list.indexOf(label) === index;
+          });
+        }
+
+        function toAcceptanceChecklist(criteria) {
+          var items = Array.isArray(criteria)
+            ? criteria.map(function (item) { return String(item || "").trim(); }).filter(Boolean)
+            : [];
+
+          if (items.length === 0) {
+            return ["- [ ] Define acceptance criteria"];
+          }
+
+          return items.map(function (item) {
+            return "- [ ] " + item;
+          });
+        }
+
+        function toBlockedByLines(issue, issueNumbers) {
+          if (!Array.isArray(issue.deps) || issue.deps.length === 0) {
+            return ["- none"];
+          }
+
+          return issue.deps.map(function (depId) {
+            var depNumber = issueNumbers[depId];
+            if (!depNumber) {
+              throw new Error("Dependency issue number missing for " + depId + ".");
+            }
+            return "- Blocked by #" + String(depNumber);
+          });
+        }
+
+        function buildPublishedIssueBody(issue, issueNumbers) {
+          var acceptanceLines = toAcceptanceChecklist(issue.acceptanceCriteria);
+          var blockedByLines = toBlockedByLines(issue, issueNumbers);
+          var bodyLines = [
+            "## Acceptance Checklist",
+          ].concat(acceptanceLines).concat([
+            "",
+            "## Blocked by",
+          ]).concat(blockedByLines);
+
+          return bodyLines.join("\n");
+        }
+
+        function publishIssuesInDependencyOrder(rawIssues, publisher) {
+          if (!publisher || typeof publisher.createIssue !== "function") {
+            throw new Error("publishIssuesInDependencyOrder requires publisher.createIssue.");
+          }
+
+          var issues = Array.isArray(rawIssues) ? rawIssues.map(normalizeIssue) : [];
+          var plan = generateIssuePlan(issues);
+          if (!plan.valid) {
+            throw new Error("Cannot publish issue plan with cyclic dependencies.");
+          }
+
+          var issuesById = new Map();
+          issues.forEach(function (issue) {
+            issuesById.set(issue.id, issue);
+          });
+
+          var issueNumbers = {};
+          var created = [];
+          plan.runnableOrder.forEach(function (issueId) {
+            var issue = issuesById.get(issueId);
+            if (!issue) {
+              return;
+            }
+
+            var payload = {
+              id: issue.id,
+              title: issue.title,
+              labels: uniqueLabels(issue.labels),
+              body: buildPublishedIssueBody(issue, issueNumbers),
+            };
+
+            var result = publisher.createIssue(payload) || {};
+            var issueNumber = Number(result.number);
+            if (!Number.isFinite(issueNumber)) {
+              throw new Error("publisher.createIssue must return { number }.");
+            }
+
+            issueNumbers[issue.id] = issueNumber;
+            created.push({
+              id: issue.id,
+              number: issueNumber,
+            });
+          });
+
+          return {
+            order: plan.runnableOrder.slice(),
+            created: created,
+            issueNumbers: issueNumbers,
           };
         }
 
@@ -1720,6 +1828,7 @@
           evaluateReadiness: evaluateReadiness,
           generateIssuePlan: generateIssuePlan,
           validateIssuePlanBeforePublish: validateIssuePlanBeforePublish,
+          publishIssuesInDependencyOrder: publishIssuesInDependencyOrder,
           startFlowRun: startFlowRun,
           getFlowRun: getFlowRun,
           advanceFlowRunStage: advanceFlowRunStage,

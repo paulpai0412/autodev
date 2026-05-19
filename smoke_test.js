@@ -508,6 +508,119 @@ function runTests() {
     assert.match(validation.splitGuidance, /split|break|cycle/i);
   });
 
+  test("AC3: publisher creates issues blocker-first and records created issue numbers", () => {
+    const app = createControlTowerApp({ storage: createMemoryStorage() });
+    const createdPayloads = [];
+    let nextIssueNumber = 300;
+
+    const published = app.publishIssuesInDependencyOrder(
+      [
+        {
+          id: "I-201",
+          title: "Foundation",
+          deps: [],
+          acceptanceCriteria: ["schema is created"],
+        },
+        {
+          id: "I-202",
+          title: "Registry",
+          deps: ["I-201"],
+          acceptanceCriteria: ["registry reads schema"],
+        },
+        {
+          id: "I-203",
+          title: "Dashboard",
+          deps: ["I-202"],
+          acceptanceCriteria: ["dashboard renders registry data"],
+        },
+      ],
+      {
+        createIssue(payload) {
+          createdPayloads.push(payload);
+          nextIssueNumber += 1;
+          return { number: nextIssueNumber };
+        },
+      },
+    );
+
+    assert.deepEqual(
+      toPlain(createdPayloads.map((payload) => payload.id)),
+      ["I-201", "I-202", "I-203"],
+    );
+    assert.deepEqual(toPlain(published.order), ["I-201", "I-202", "I-203"]);
+    assert.equal(published.issueNumbers["I-201"], 301);
+    assert.equal(published.issueNumbers["I-202"], 302);
+    assert.equal(published.issueNumbers["I-203"], 303);
+  });
+
+  test("AC4: published issue body includes parseable Blocked by phrases", () => {
+    const app = createControlTowerApp({ storage: createMemoryStorage() });
+    const createdPayloads = [];
+    let nextIssueNumber = 400;
+
+    app.publishIssuesInDependencyOrder(
+      [
+        {
+          id: "I-301",
+          title: "Foundation",
+          deps: [],
+          acceptanceCriteria: ["foundation exists"],
+        },
+        {
+          id: "I-302",
+          title: "Runtime Reader",
+          deps: ["I-301"],
+          acceptanceCriteria: ["reader can read runtime DB"],
+        },
+      ],
+      {
+        createIssue(payload) {
+          createdPayloads.push(payload);
+          nextIssueNumber += 1;
+          return { number: nextIssueNumber };
+        },
+      },
+    );
+
+    assert.match(createdPayloads[1].body, /## Blocked by/);
+    assert.match(createdPayloads[1].body, /Blocked by #401/);
+  });
+
+  test("AC5: published issues include ready-for-agent label and acceptance checklist", () => {
+    const app = createControlTowerApp({ storage: createMemoryStorage() });
+    const createdPayloads = [];
+
+    app.publishIssuesInDependencyOrder(
+      [
+        {
+          id: "I-401",
+          title: "Issue publisher",
+          deps: [],
+          acceptanceCriteria: [
+            "publisher creates issues in dependency order",
+            "publisher captures created issue numbers",
+          ],
+          labels: ["autodev"],
+        },
+      ],
+      {
+        createIssue(payload) {
+          createdPayloads.push(payload);
+          return { number: 501 };
+        },
+      },
+    );
+
+    assert.equal(createdPayloads.length, 1);
+    assert.equal(createdPayloads[0].labels.includes("ready-for-agent"), true);
+    assert.equal(createdPayloads[0].labels.includes("autodev"), true);
+    assert.match(createdPayloads[0].body, /## Acceptance Checklist/);
+    assert.match(
+      createdPayloads[0].body,
+      /- \[ \] publisher creates issues in dependency order/,
+    );
+  });
+
   let passed = 0;
   for (const { name, fn } of tests) {
     try {
