@@ -721,7 +721,13 @@
 
       function normalizeDb(raw) {
         if (!raw || typeof raw !== "object") {
-          return { projects: [], activeRepoId: null, flowRuns: [] };
+          return {
+            projects: [],
+            activeRepoId: null,
+            flowRuns: [],
+            flowRunEvents: [],
+            flowEventSequence: 0,
+          };
         }
 
         return {
@@ -750,6 +756,8 @@
                   };
                 })
             : [],
+          flowRunEvents: Array.isArray(raw.flowRunEvents) ? raw.flowRunEvents : [],
+          flowEventSequence: Number.isFinite(raw.flowEventSequence) ? Number(raw.flowEventSequence) : 0,
         };
       }
 
@@ -834,6 +842,7 @@
         var storage = opts.storage || (typeof window !== "undefined" ? window.localStorage : null);
         var env = opts.env || {};
         var lifecycleEvents = [];
+        var openSockets = [];
 
         if (!storage || typeof storage.getItem !== "function" || typeof storage.setItem !== "function") {
           throw new Error("createControlTowerApp requires a storage with getItem/setItem.");
@@ -842,13 +851,25 @@
         function readDb() {
           var raw = storage.getItem(APP_DB_KEY);
           if (!raw) {
-            return { projects: [], activeRepoId: null, flowRuns: [] };
+            return {
+              projects: [],
+              activeRepoId: null,
+              flowRuns: [],
+              flowRunEvents: [],
+              flowEventSequence: 0,
+            };
           }
 
           try {
             return normalizeDb(JSON.parse(raw));
           } catch (error) {
-            return { projects: [], activeRepoId: null, flowRuns: [] };
+            return {
+              projects: [],
+              activeRepoId: null,
+              flowRuns: [],
+              flowRunEvents: [],
+              flowEventSequence: 0,
+            };
           }
         }
 
@@ -994,6 +1015,94 @@
           db.flowRuns.push(flowRun);
           writeDb(db);
           return flowRun;
+        }
+
+        function listFlowRunEvents(flowRunId) {
+          var targetFlowRunId = String(flowRunId || "").trim();
+          var db = readDb();
+          return db.flowRunEvents
+            .filter(function (item) { return item.flowRunId === targetFlowRunId; })
+            .slice()
+            .sort(function (a, b) { return a.sequence - b.sequence; });
+        }
+
+        function replayFlowRunEvents(flowRunId, lastEventId) {
+          var events = listFlowRunEvents(flowRunId);
+          if (!lastEventId) {
+            return events;
+          }
+
+          var index = events.findIndex(function (item) {
+            return item.eventId === String(lastEventId);
+          });
+
+          if (index < 0) {
+            return events;
+          }
+
+          return events.slice(index + 1);
+        }
+
+        function appendFlowRunEvent(input) {
+          if (!input || !input.flowRunId) {
+            throw new Error("flowRunId is required for flow events.");
+          }
+
+          var targetFlowRunId = String(input.flowRunId);
+          var db = readDb();
+          var flowRunExists = db.flowRuns.some(function (item) {
+            return item.flowRunId === targetFlowRunId;
+          });
+          if (!flowRunExists) {
+            throw new Error("Flow Run is not found: " + targetFlowRunId);
+          }
+
+          var nextSequence = db.flowEventSequence + 1;
+          var event = {
+            eventId: targetFlowRunId + ":evt:" + String(nextSequence),
+            flowRunId: targetFlowRunId,
+            sequence: nextSequence,
+            kind: input.kind ? String(input.kind) : "flow.event",
+            createdAt: nowIso(),
+            ui: {
+              skillProgress: input.skillProgress || null,
+              questionPrompt: input.questionPrompt || null,
+              gateOutcome: input.gateOutcome || null,
+            },
+          };
+
+          db.flowEventSequence = nextSequence;
+          db.flowRunEvents.push(event);
+          writeDb(db);
+
+          openSockets.forEach(function (socket) {
+            if (!socket.closed && socket.flowRunId === targetFlowRunId) {
+              socket.buffer.push(event);
+            }
+          });
+
+          return event;
+        }
+
+        function openFlowRunSocket(flowRunId, options) {
+          var targetFlowRunId = String(flowRunId || "").trim();
+          var opts = options || {};
+          var socket = {
+            flowRunId: targetFlowRunId,
+            closed: false,
+            buffer: replayFlowRunEvents(targetFlowRunId, opts.lastEventId || null),
+            drain: function () {
+              var queued = this.buffer.slice();
+              this.buffer.length = 0;
+              return queued;
+            },
+            close: function () {
+              this.closed = true;
+            },
+          };
+
+          openSockets.push(socket);
+          return socket;
         }
 
         function getSpecPipelineStatus(flowRunId) {
@@ -1188,6 +1297,10 @@
           getActiveProject: getActiveProject,
           evaluateReadiness: evaluateReadiness,
           startFlowRun: startFlowRun,
+          listFlowRunEvents: listFlowRunEvents,
+          replayFlowRunEvents: replayFlowRunEvents,
+          appendFlowRunEvent: appendFlowRunEvent,
+          openFlowRunSocket: openFlowRunSocket,
           createFlowRunFromOrchestration: createFlowRunFromOrchestration,
           getSpecPipelineStatus: getSpecPipelineStatus,
           addBlockingQuestion: addBlockingQuestion,
