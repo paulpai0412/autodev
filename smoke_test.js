@@ -53,6 +53,10 @@ function runTests() {
   const { createControlTowerApp } = core;
   const tests = [];
 
+  function toPlain(value) {
+    return JSON.parse(JSON.stringify(value));
+  }
+
   function test(name, fn) {
     tests.push({ name, fn });
   }
@@ -442,6 +446,66 @@ function runTests() {
       },
       /read-only/i,
     );
+  });
+
+  test("AC3: issue plan output includes explicit edges and runnable-order projection", () => {
+    const app = createControlTowerApp({ storage: createMemoryStorage() });
+
+    const plan = app.generateIssuePlan([
+      { id: "I-001", title: "Foundation", deps: [], state: "done" },
+      { id: "I-002", title: "Registry", deps: ["I-001"], state: "todo" },
+      { id: "I-003", title: "Stream", deps: ["I-001"], state: "todo" },
+      { id: "I-004", title: "Dashboard", deps: ["I-002", "I-003"], state: "todo" },
+    ]);
+
+    assert.equal(plan.valid, true);
+    assert.equal(Array.isArray(plan.edges), true);
+    assert.deepEqual(
+      toPlain(plan.edges.map((edge) => [edge.from, edge.to])),
+      [
+        ["I-001", "I-002"],
+        ["I-001", "I-003"],
+        ["I-002", "I-004"],
+        ["I-003", "I-004"],
+      ],
+    );
+    assert.deepEqual(toPlain(plan.runnableOrder), ["I-001", "I-002", "I-003", "I-004"]);
+  });
+
+  test("AC4: execution lane projection distinguishes ready, blocked, and parallel lanes", () => {
+    const app = createControlTowerApp({ storage: createMemoryStorage() });
+
+    const plan = app.generateIssuePlan([
+      { id: "I-001", title: "Foundation", deps: [], state: "done" },
+      { id: "I-002", title: "Registry", deps: ["I-001"], state: "todo" },
+      { id: "I-003", title: "Spec Chat", deps: ["I-001"], state: "todo" },
+      { id: "I-004", title: "Dashboard", deps: ["I-002", "I-003"], state: "todo" },
+    ]);
+
+    assert.equal(plan.valid, true);
+    assert.deepEqual(toPlain(plan.executionLanes.ready.map((item) => item.id)), ["I-002", "I-003"]);
+    assert.deepEqual(toPlain(plan.executionLanes.blocked.map((item) => item.id)), ["I-004"]);
+    assert.deepEqual(
+      toPlain(plan.executionLanes.parallel.map((lane) => lane.issueIds)),
+      [["I-002", "I-003"]],
+    );
+  });
+
+  test("AC5: cycle validation rejects publish and returns split guidance", () => {
+    const app = createControlTowerApp({ storage: createMemoryStorage() });
+
+    const validation = app.validateIssuePlanBeforePublish([
+      { id: "I-101", title: "A", deps: ["I-103"], state: "todo" },
+      { id: "I-102", title: "B", deps: ["I-101"], state: "todo" },
+      { id: "I-103", title: "C", deps: ["I-102"], state: "todo" },
+    ]);
+
+    assert.equal(validation.canPublish, false);
+    assert.equal(validation.reason, "cyclic_dependencies");
+    assert.equal(Array.isArray(validation.cycles), true);
+    assert.equal(validation.cycles.length > 0, true);
+    assert.equal(typeof validation.splitGuidance, "string");
+    assert.match(validation.splitGuidance, /split|break|cycle/i);
   });
 
   let passed = 0;

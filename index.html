@@ -365,6 +365,33 @@
     .issue strong { display:block; font-size: 13px; margin-bottom: 4px; }
     .issue p { margin: 0; color: var(--ink-faint); font-size: 12px; line-height: 1.35; }
 
+    .issue-plan-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+    }
+    .mono-list {
+      margin: 0;
+      padding-left: 18px;
+      color: var(--ink-soft);
+      font-family: var(--font-mono);
+      font-size: 12px;
+      line-height: 1.7;
+    }
+    .mono-list li {
+      margin: 0;
+    }
+    .validation-note {
+      margin-top: 12px;
+      padding: 12px;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: rgba(255,253,248,.74);
+      color: var(--ink-soft);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
     .sidecar {
       display: grid;
       grid-template-rows: auto minmax(0, 1fr) auto;
@@ -671,7 +698,23 @@
           </section>
 
           <section class="screen" id="screen-issues" data-eyebrow="Issue Plan" data-title="Issue Plan 是可執行 DAG，不是平面任務清單。" data-copy="每張卡都保留 PRD 對應、依賴與目前 ready/running/blocked 狀態，讓操作者可以判斷下一個 autodev slice。">
-            <div class="lane-grid"><div class="lane"><h4>Foundation <span class="tag done">就緒</span></h4><div class="issue"><strong>#3 App DB</strong><p>R-01 · 無相依</p></div><div class="issue"><strong>#4 Registry</strong><p>R-01 · after #3</p></div></div><div class="lane"><h4>Interaction <span class="tag active">執行中</span></h4><div class="issue"><strong>#6 WebSocket stream</strong><p>R-02 · after #3 #5</p></div><div class="issue"><strong>#7 Prototype Gate</strong><p>R-02 · after #5</p></div></div><div class="lane"><h4>Runtime <span class="tag">下一步</span></h4><div class="issue"><strong>#10 Runtime reader</strong><p>R-03 · after #4</p></div><div class="issue"><strong>#11 Dashboard</strong><p>R-03 · after #6 #10</p></div></div><div class="lane"><h4>Release <span class="tag blocked">阻塞中</span></h4><div class="issue"><strong>#13 GitHub approval</strong><p>R-04 · 需要 identity gate</p></div><div class="issue"><strong>#14 E2E verification</strong><p>R-04 · after #10 #12 #13</p></div></div></div>
+            <div class="issue-plan-grid">
+              <div class="panel">
+                <div class="panel-head"><h3>Dependency Edges</h3><span id="issue-plan-edge-count">0 edges</span></div>
+                <div class="panel-body"><ol class="mono-list" id="issue-plan-edges"></ol></div>
+              </div>
+              <div class="panel">
+                <div class="panel-head"><h3>Runnable Order Projection</h3><span id="issue-plan-order-count">0 issues</span></div>
+                <div class="panel-body"><ol class="mono-list" id="issue-plan-order"></ol></div>
+              </div>
+            </div>
+
+            <div class="panel" style="margin-top:14px">
+              <div class="panel-head"><h3>Execution Lanes</h3><span id="issue-plan-lane-summary">ready 0 · blocked 0 · parallel 0</span></div>
+              <div class="panel-body lane-grid" id="issue-plan-lanes"></div>
+            </div>
+
+            <div class="validation-note" id="issue-plan-validation"></div>
           </section>
 
           <section class="screen" id="screen-run" data-eyebrow="Run Dashboard" data-title="執行儀表板只呈現決策需要的訊號。" data-copy="從 DB-only control plane 讀取 issue/session/release 狀態，避免讓畫面變成無限聊天紀錄。">
@@ -968,6 +1011,237 @@
             return env[key];
           }
           return fallback;
+        }
+
+        function normalizeIssue(item, index) {
+          if (!item || !item.id) {
+            throw new Error("Issue id is required.");
+          }
+
+          return {
+            id: String(item.id),
+            title: item.title ? String(item.title) : String(item.id),
+            deps: Array.isArray(item.deps) ? item.deps.map(function (dep) { return String(dep); }) : [],
+            state: item.state ? String(item.state) : "todo",
+            orderIndex: index,
+          };
+        }
+
+        function findCycles(issuesById) {
+          var visited = new Set();
+          var onStack = new Set();
+          var stack = [];
+          var cycles = [];
+
+          function walk(nodeId) {
+            var startIndex;
+            var cycle;
+            var key;
+            if (onStack.has(nodeId)) {
+              startIndex = stack.indexOf(nodeId);
+              if (startIndex !== -1) {
+                cycle = stack.slice(startIndex).concat(nodeId);
+                key = cycle.join("->");
+                if (!cycles.some(function (entry) { return entry.key === key; })) {
+                  cycles.push({ key: key, path: cycle });
+                }
+              }
+              return;
+            }
+
+            if (visited.has(nodeId)) {
+              return;
+            }
+
+            visited.add(nodeId);
+            onStack.add(nodeId);
+            stack.push(nodeId);
+
+            var node = issuesById.get(nodeId);
+            if (node) {
+              node.deps.forEach(function (depId) {
+                if (issuesById.has(depId)) {
+                  walk(depId);
+                }
+              });
+            }
+
+            stack.pop();
+            onStack.delete(nodeId);
+          }
+
+          issuesById.forEach(function (_value, nodeId) {
+            walk(nodeId);
+          });
+
+          return cycles.map(function (item) { return item.path; });
+        }
+
+        function generateIssuePlan(rawIssues) {
+          var issues = Array.isArray(rawIssues)
+            ? rawIssues.map(normalizeIssue)
+            : [];
+          var issuesById = new Map();
+          issues.forEach(function (item) {
+            issuesById.set(item.id, item);
+          });
+
+          var edges = [];
+          var indegree = new Map();
+          var adjacency = new Map();
+          issues.forEach(function (item) {
+            indegree.set(item.id, 0);
+            adjacency.set(item.id, []);
+          });
+
+          issues.forEach(function (item) {
+            item.deps.forEach(function (depId) {
+              if (!issuesById.has(depId)) {
+                return;
+              }
+              edges.push({ from: depId, to: item.id });
+              indegree.set(item.id, indegree.get(item.id) + 1);
+              adjacency.get(depId).push(item.id);
+            });
+          });
+
+          var queue = issues
+            .filter(function (item) { return indegree.get(item.id) === 0; })
+            .sort(function (a, b) { return a.orderIndex - b.orderIndex; })
+            .map(function (item) { return item.id; });
+
+          var runnableOrder = [];
+          var currentId;
+          while (queue.length > 0) {
+            currentId = queue.shift();
+            runnableOrder.push(currentId);
+
+            (adjacency.get(currentId) || []).forEach(function (nextId) {
+              var nextInDegree = indegree.get(nextId) - 1;
+              indegree.set(nextId, nextInDegree);
+              if (nextInDegree === 0) {
+                queue.push(nextId);
+                queue.sort(function (leftId, rightId) {
+                  return issuesById.get(leftId).orderIndex - issuesById.get(rightId).orderIndex;
+                });
+              }
+            });
+          }
+
+          var hasCycle = runnableOrder.length !== issues.length;
+          var cycles = hasCycle ? findCycles(issuesById) : [];
+          var splitGuidance = hasCycle
+            ? "Cycle detected. Break the loop by splitting one issue into a prerequisite slice so at least one dependency edge can be removed."
+            : "No cycle detected.";
+
+          var doneSet = new Set(
+            issues.filter(function (item) { return item.state === "done"; }).map(function (item) { return item.id; }),
+          );
+          var activeIssues = issues.filter(function (item) { return item.state !== "done"; });
+
+          var ready = activeIssues.filter(function (item) {
+            return item.deps.every(function (depId) {
+              return doneSet.has(depId);
+            });
+          });
+
+          var blocked = activeIssues.filter(function (item) {
+            return !ready.some(function (candidate) { return candidate.id === item.id; });
+          });
+
+          var activeChildren = new Map();
+          var activeInDegree = new Map();
+          activeIssues.forEach(function (item) {
+            activeChildren.set(item.id, []);
+            activeInDegree.set(item.id, 0);
+          });
+
+          activeIssues.forEach(function (item) {
+            item.deps.forEach(function (depId) {
+              if (activeInDegree.has(depId)) {
+                activeChildren.get(depId).push(item.id);
+                activeInDegree.set(item.id, activeInDegree.get(item.id) + 1);
+              }
+            });
+          });
+
+          var levelQueue = activeIssues
+            .filter(function (item) { return activeInDegree.get(item.id) === 0; })
+            .sort(function (a, b) { return a.orderIndex - b.orderIndex; })
+            .map(function (item) { return item.id; });
+
+          var levelMap = new Map();
+          var levelId;
+          var baseLevel;
+          levelQueue.forEach(function (id) { levelMap.set(id, 0); });
+          while (levelQueue.length > 0) {
+            levelId = levelQueue.shift();
+            baseLevel = levelMap.get(levelId) || 0;
+
+            (activeChildren.get(levelId) || []).forEach(function (nextId) {
+              var nextLevel = Math.max(levelMap.get(nextId) || 0, baseLevel + 1);
+              levelMap.set(nextId, nextLevel);
+              var nextCount = activeInDegree.get(nextId) - 1;
+              activeInDegree.set(nextId, nextCount);
+              if (nextCount === 0) {
+                levelQueue.push(nextId);
+                levelQueue.sort(function (leftId, rightId) {
+                  return issuesById.get(leftId).orderIndex - issuesById.get(rightId).orderIndex;
+                });
+              }
+            });
+          }
+
+          var levels = new Map();
+          levelMap.forEach(function (level, issueId) {
+            if (!levels.has(level)) {
+              levels.set(level, []);
+            }
+            levels.get(level).push(issueId);
+          });
+
+          var parallel = Array.from(levels.keys())
+            .sort(function (a, b) { return a - b; })
+            .map(function (level) {
+              var issueIds = levels.get(level).slice().sort(function (leftId, rightId) {
+                return issuesById.get(leftId).orderIndex - issuesById.get(rightId).orderIndex;
+              });
+              return { laneIndex: level + 1, issueIds: issueIds };
+            })
+            .filter(function (lane) { return lane.issueIds.length > 1; });
+
+          return {
+            valid: !hasCycle,
+            issues: issues,
+            edges: edges,
+            runnableOrder: runnableOrder,
+            cycles: cycles,
+            splitGuidance: splitGuidance,
+            executionLanes: {
+              ready: ready,
+              blocked: blocked,
+              parallel: parallel,
+            },
+          };
+        }
+
+        function validateIssuePlanBeforePublish(rawIssues) {
+          var plan = generateIssuePlan(rawIssues);
+          if (plan.valid) {
+            return {
+              canPublish: true,
+              reason: "ok",
+              cycles: [],
+              splitGuidance: "",
+            };
+          }
+
+          return {
+            canPublish: false,
+            reason: "cyclic_dependencies",
+            cycles: plan.cycles,
+            splitGuidance: plan.splitGuidance,
+          };
         }
 
         function evaluateReadiness() {
@@ -1444,6 +1718,8 @@
           switchActiveProject: switchActiveProject,
           getActiveProject: getActiveProject,
           evaluateReadiness: evaluateReadiness,
+          generateIssuePlan: generateIssuePlan,
+          validateIssuePlanBeforePublish: validateIssuePlanBeforePublish,
           startFlowRun: startFlowRun,
           getFlowRun: getFlowRun,
           advanceFlowRunStage: advanceFlowRunStage,
@@ -1509,8 +1785,8 @@
     document.getElementById('tone').addEventListener('change', (event) => document.body.classList.toggle('deep', event.target.value === 'deep'));
     document.getElementById('density').addEventListener('change', (event) => document.body.classList.toggle('compact', event.target.value === 'compact'));
 
-    if (window.ControlTowerCore) {
-      const app = window.ControlTowerCore.createControlTowerApp();
+      if (window.ControlTowerCore) {
+        const app = window.ControlTowerCore.createControlTowerApp();
       const registrySelect = document.getElementById('registry-select');
       const switchProjectButton = document.getElementById('switch-project');
       const activeProjectNote = document.getElementById('active-project-note');
@@ -1533,7 +1809,26 @@
       const pipelineQuestionSelect = document.getElementById('pipeline-question-select');
       const pipelineQuestionAnswer = document.getElementById('pipeline-question-answer');
       const pipelineResolveQuestion = document.getElementById('pipeline-resolve-question');
+      const issuePlanEdges = document.getElementById('issue-plan-edges');
+      const issuePlanOrder = document.getElementById('issue-plan-order');
+      const issuePlanEdgeCount = document.getElementById('issue-plan-edge-count');
+      const issuePlanOrderCount = document.getElementById('issue-plan-order-count');
+      const issuePlanLaneSummary = document.getElementById('issue-plan-lane-summary');
+      const issuePlanLanes = document.getElementById('issue-plan-lanes');
+      const issuePlanValidation = document.getElementById('issue-plan-validation');
       let activeFlowRunId = null;
+
+      const issuePlanSource = [
+        { id: 'I-001', title: 'App DB schema', deps: [], state: 'done' },
+        { id: 'I-002', title: 'Project Registry', deps: ['I-001'], state: 'done' },
+        { id: 'I-003', title: 'Flow orchestration spec', deps: ['I-001'], state: 'done' },
+        { id: 'I-006', title: 'WebSocket stream layer', deps: ['I-002', 'I-003'], state: 'todo' },
+        { id: 'I-007', title: 'UI prototype gate', deps: ['I-003'], state: 'todo' },
+        { id: 'I-010', title: 'Runtime reader', deps: ['I-002'], state: 'todo' },
+        { id: 'I-011', title: 'Execution dashboard', deps: ['I-006', 'I-010'], state: 'todo' },
+        { id: 'I-013', title: 'GitHub approval lane', deps: ['I-011'], state: 'todo' },
+        { id: 'I-014', title: 'E2E verification', deps: ['I-011', 'I-013'], state: 'todo' },
+      ];
 
       const bootstrapProjects = () => {
         if (app.listRegisteredProjects().length > 0) {
@@ -1599,7 +1894,7 @@
           : 'Readiness gate 尚未通過，Start Flow Run 已封鎖。';
       };
 
-      const renderAllProjects = () => {
+        const renderAllProjects = () => {
         const view = app.getAllProjectsView();
         allProjectsView.innerHTML = '';
 
@@ -1616,7 +1911,7 @@
           row.appendChild(tag);
           allProjectsView.appendChild(row);
         });
-      };
+        };
 
       const renderSpecPipeline = () => {
         pipelineStages.innerHTML = '';
@@ -1696,6 +1991,86 @@
         renderReadiness();
         renderAllProjects();
         renderSpecPipeline();
+        renderIssuePlan();
+      };
+
+      const renderIssuePlan = () => {
+        const plan = app.generateIssuePlan(issuePlanSource);
+        const validation = app.validateIssuePlanBeforePublish(issuePlanSource);
+
+        issuePlanEdges.innerHTML = '';
+        plan.edges.forEach((edge) => {
+          const item = document.createElement('li');
+          item.textContent = `${edge.from} -> ${edge.to}`;
+          issuePlanEdges.appendChild(item);
+        });
+        issuePlanEdgeCount.textContent = `${plan.edges.length} edges`;
+
+        issuePlanOrder.innerHTML = '';
+        plan.runnableOrder.forEach((issueId) => {
+          const item = document.createElement('li');
+          item.textContent = issueId;
+          issuePlanOrder.appendChild(item);
+        });
+        issuePlanOrderCount.textContent = `${plan.runnableOrder.length} issues`;
+
+        issuePlanLanes.innerHTML = '';
+        const laneDefs = [
+          { title: 'Ready', tag: 'done', items: plan.executionLanes.ready, empty: '目前無 ready issue' },
+          { title: 'Blocked', tag: 'blocked', items: plan.executionLanes.blocked, empty: '目前無 blocked issue' },
+          {
+            title: 'Parallel',
+            tag: 'active',
+            items: plan.executionLanes.parallel.map((lane) => ({
+              id: `Lane ${lane.laneIndex}`,
+              title: `Lane ${lane.laneIndex}`,
+              deps: lane.issueIds,
+            })),
+            empty: '目前無可平行 lane',
+          },
+          {
+            title: 'Validation',
+            tag: validation.canPublish ? 'done' : 'blocked',
+            items: [
+              {
+                id: validation.canPublish ? 'publish-ok' : 'publish-blocked',
+                title: validation.canPublish ? 'Ready to publish' : 'Publish blocked by cycle',
+                deps: validation.canPublish ? ['No cyclic dependency'] : validation.cycles[0] || [],
+              },
+            ],
+            empty: 'No validation message',
+          },
+        ];
+
+        laneDefs.forEach((laneDef) => {
+          const lane = document.createElement('div');
+          lane.className = 'lane';
+
+          const heading = document.createElement('h4');
+          heading.innerHTML = `${laneDef.title} <span class="tag ${laneDef.tag}">${laneDef.items.length}</span>`;
+          lane.appendChild(heading);
+
+          if (laneDef.items.length === 0) {
+            const empty = document.createElement('div');
+            empty.className = 'issue';
+            empty.innerHTML = `<strong>${laneDef.empty}</strong><p>--</p>`;
+            lane.appendChild(empty);
+          } else {
+            laneDef.items.forEach((item) => {
+              const card = document.createElement('div');
+              card.className = 'issue';
+              card.innerHTML = `<strong>${item.id} · ${item.title || item.id}</strong><p>deps: ${item.deps.length ? item.deps.join(', ') : 'none'}</p>`;
+              lane.appendChild(card);
+            });
+          }
+
+          issuePlanLanes.appendChild(lane);
+        });
+
+        issuePlanLaneSummary.textContent = `ready ${plan.executionLanes.ready.length} · blocked ${plan.executionLanes.blocked.length} · parallel ${plan.executionLanes.parallel.length}`;
+        issuePlanValidation.innerHTML = validation.canPublish
+          ? 'Validation passed. No cyclic dependencies detected before publish.'
+          : `Validation failed: cyclic dependencies found. ${validation.splitGuidance}`;
       };
 
       bootstrapProjects();
