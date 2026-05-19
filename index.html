@@ -459,6 +459,30 @@
       gap: 8px;
       margin-top: 12px;
     }
+    .pipeline-stage-list {
+      display: grid;
+      gap: 8px;
+      margin-top: 12px;
+    }
+    .pipeline-stage {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(255,253,248,.74);
+      padding: 10px;
+      display: grid;
+      gap: 6px;
+    }
+    .pipeline-stage-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+    }
+    .pipeline-questions {
+      color: var(--ink-faint);
+      font-size: 12px;
+      line-height: 1.4;
+    }
     .project-row {
       border: 1px solid var(--line);
       border-radius: 12px;
@@ -613,6 +637,31 @@
               </div>
             </div>
             <div class="panel" style="margin-top:14px">
+              <div class="panel-head"><h3>Spec Pipeline Orchestration</h3><span>clarify -> prd -> issue-plan</span></div>
+              <div class="panel-body">
+                <div class="pipeline-stage-list" id="pipeline-stages"></div>
+                <div class="field-row" style="grid-template-columns: 1fr auto; margin-top:14px;">
+                  <p class="mini-note" id="pipeline-hint">尚未啟動 Flow Run。</p>
+                  <button class="btn" id="pipeline-next-stage" type="button" disabled>前進到下一個 stage</button>
+                </div>
+                <div class="field-row" style="margin-top:10px; grid-template-columns: 1fr 1fr auto;">
+                  <select id="pipeline-stage-select" aria-label="Stage for blocking question" disabled>
+                    <option value="clarify">clarify</option>
+                    <option value="prd">prd</option>
+                    <option value="issue-plan">issue-plan</option>
+                  </select>
+                  <input id="pipeline-question-input" placeholder="新增 blocking question" aria-label="Blocking question prompt" disabled>
+                  <button class="btn" id="pipeline-add-question" type="button" disabled>加入問題</button>
+                </div>
+                <div class="field-row" style="margin-top:10px; grid-template-columns: 1fr 1fr auto;">
+                  <select id="pipeline-question-select" aria-label="Open blocking question" disabled></select>
+                  <input id="pipeline-question-answer" placeholder="回答 blocking question" aria-label="Blocking question answer" disabled>
+                  <button class="btn" id="pipeline-resolve-question" type="button" disabled>標記已解</button>
+                </div>
+                <p class="mini-note" id="pipeline-result"></p>
+              </div>
+            </div>
+            <div class="panel" style="margin-top:14px">
               <div class="panel-head"><h3>All Projects（Read-only）</h3><span>no cross-repo lifecycle</span></div>
               <div class="panel-body">
                 <div class="projects-readonly" id="all-projects-view"></div>
@@ -653,6 +702,7 @@
   <script id="control-tower-core">
     (function () {
       var APP_DB_KEY = "control-tower-registry.v1";
+      var SPEC_PIPELINE_STAGES = ["clarify", "prd", "issue-plan"];
 
       function nowIso() {
         return new Date().toISOString();
@@ -662,6 +712,13 @@
         return prefix + "-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
       }
 
+      function normalizeOptionalString(value) {
+        if (value === null || value === undefined || value === "") {
+          return null;
+        }
+        return String(value);
+      }
+
       function normalizeProject(project) {
         return {
           repoId: String(project.repoId),
@@ -669,44 +726,15 @@
         };
       }
 
-      function normalizeOptionalString(value) {
-        if (value === null || value === undefined) {
-          return null;
-        }
-        var text = String(value).trim();
-        return text.length > 0 ? text : null;
-      }
-
-      function normalizeFlowRun(flowRun) {
-        var run = flowRun && typeof flowRun === "object" ? flowRun : {};
-        var uiScope = Boolean(run.ui_scope || run.uiScope);
-        var prototypeApproved = Boolean(run.prototype_approved);
-        var prototypeArtifactRef = normalizeOptionalString(run.prototype_artifact_ref);
-        var prototypeApprover = normalizeOptionalString(run.prototype_approver);
-        var prototypeApprovedAt = normalizeOptionalString(run.prototype_approved_at);
-        var prototypeGateDecision = run.prototype_gate_decision === "approved" ? "approved" : "blocked";
-
-        if (!uiScope || (prototypeApproved && prototypeArtifactRef)) {
-          prototypeGateDecision = "approved";
-        }
-
-        return {
-          flowRunId: normalizeOptionalString(run.flowRunId) || makeId("flow"),
-          repoId: normalizeOptionalString(run.repoId),
-          stage: normalizeOptionalString(run.stage) || "spec_pipeline",
-          createdAt: normalizeOptionalString(run.createdAt) || nowIso(),
-          ui_scope: uiScope,
-          prototype_approved: prototypeApproved,
-          prototype_artifact_ref: prototypeArtifactRef,
-          prototype_gate_decision: prototypeGateDecision,
-          prototype_approver: prototypeApprover,
-          prototype_approved_at: prototypeApprovedAt,
-        };
-      }
-
       function normalizeDb(raw) {
         if (!raw || typeof raw !== "object") {
-          return { projects: [], activeRepoId: null, flowRuns: [] };
+          return {
+            projects: [],
+            activeRepoId: null,
+            flowRuns: [],
+            flowRunEvents: [],
+            flowEventSequence: 0,
+          };
         }
 
         return {
@@ -716,7 +744,119 @@
                 .map(normalizeProject)
             : [],
           activeRepoId: raw.activeRepoId ? String(raw.activeRepoId) : null,
-          flowRuns: Array.isArray(raw.flowRuns) ? raw.flowRuns.map(normalizeFlowRun) : [],
+          flowRuns: Array.isArray(raw.flowRuns)
+            ? raw.flowRuns
+                .filter(function (flowRun) { return flowRun && flowRun.flowRunId; })
+                .map(function (flowRun) {
+                   var readinessPassed = typeof flowRun.readinessPassed === "boolean"
+                    ? flowRun.readinessPassed
+                    : true;
+
+                  var pipeline = normalizeSpecPipeline(flowRun.specPipeline);
+                  var uiScope = Boolean(flowRun.ui_scope || flowRun.uiScope);
+                  var prototypeApproved = Boolean(flowRun.prototype_approved);
+                  var prototypeArtifactRef = normalizeOptionalString(flowRun.prototype_artifact_ref);
+                  var prototypeApprover = normalizeOptionalString(flowRun.prototype_approver);
+                  var prototypeApprovedAt = normalizeOptionalString(flowRun.prototype_approved_at);
+                  var prototypeGateDecision = flowRun.prototype_gate_decision === "approved" ? "approved" : "blocked";
+                  if (!uiScope || (prototypeApproved && prototypeArtifactRef)) {
+                    prototypeGateDecision = "approved";
+                  }
+
+                  return {
+                    flowRunId: String(flowRun.flowRunId),
+                    repoId: String(flowRun.repoId || ""),
+                    stage: String(flowRun.stage || pipeline.currentStage),
+                    createdAt: String(flowRun.createdAt || nowIso()),
+                    readinessPassed: readinessPassed,
+                    specPipeline: pipeline,
+                    ui_scope: uiScope,
+                    prototype_approved: prototypeApproved,
+                    prototype_artifact_ref: prototypeArtifactRef,
+                    prototype_gate_decision: prototypeGateDecision,
+                    prototype_approver: prototypeApprover,
+                    prototype_approved_at: prototypeApprovedAt,
+                  };
+                })
+            : [],
+          flowRunEvents: Array.isArray(raw.flowRunEvents) ? raw.flowRunEvents : [],
+          flowEventSequence: Number.isFinite(raw.flowEventSequence) ? Number(raw.flowEventSequence) : 0,
+        };
+      }
+
+      function createDefaultSpecPipeline() {
+        return {
+          currentStage: SPEC_PIPELINE_STAGES[0],
+          stages: SPEC_PIPELINE_STAGES.map(function (stageName, index) {
+            return {
+              stage: stageName,
+              status: index === 0 ? "in_progress" : "pending",
+              blockingQuestions: [],
+            };
+          }),
+        };
+      }
+
+      function normalizeBlockingQuestion(question) {
+        return {
+          questionId: String(question.questionId),
+          prompt: String(question.prompt || ""),
+          status: question.status === "resolved" ? "resolved" : "open",
+          answer: question.answer ? String(question.answer) : "",
+          createdAt: question.createdAt ? String(question.createdAt) : nowIso(),
+          resolvedAt: question.resolvedAt ? String(question.resolvedAt) : null,
+        };
+      }
+
+      function normalizeSpecPipeline(raw) {
+        var fallback = createDefaultSpecPipeline();
+        if (!raw || typeof raw !== "object") {
+          return fallback;
+        }
+
+        var stages = Array.isArray(raw.stages) ? raw.stages : [];
+        var stageMap = {};
+
+        stages.forEach(function (stage) {
+          if (!stage || !stage.stage) {
+            return;
+          }
+
+          var stageName = String(stage.stage);
+          if (SPEC_PIPELINE_STAGES.indexOf(stageName) === -1) {
+            return;
+          }
+
+          stageMap[stageName] = {
+            stage: stageName,
+            status: String(stage.status || "pending"),
+            blockingQuestions: Array.isArray(stage.blockingQuestions)
+              ? stage.blockingQuestions
+                  .filter(function (question) { return question && question.questionId; })
+                  .map(normalizeBlockingQuestion)
+              : [],
+          };
+        });
+
+        var normalizedStages = SPEC_PIPELINE_STAGES.map(function (stageName, index) {
+          if (stageMap[stageName]) {
+            return stageMap[stageName];
+          }
+
+          return {
+            stage: stageName,
+            status: index === 0 ? "in_progress" : "pending",
+            blockingQuestions: [],
+          };
+        });
+
+        var currentStage = SPEC_PIPELINE_STAGES.indexOf(String(raw.currentStage || "")) >= 0
+          ? String(raw.currentStage)
+          : fallback.currentStage;
+
+        return {
+          currentStage: currentStage,
+          stages: normalizedStages,
         };
       }
 
@@ -725,6 +865,7 @@
         var storage = opts.storage || (typeof window !== "undefined" ? window.localStorage : null);
         var env = opts.env || {};
         var lifecycleEvents = [];
+        var openSockets = [];
 
         if (!storage || typeof storage.getItem !== "function" || typeof storage.setItem !== "function") {
           throw new Error("createControlTowerApp requires a storage with getItem/setItem.");
@@ -733,13 +874,25 @@
         function readDb() {
           var raw = storage.getItem(APP_DB_KEY);
           if (!raw) {
-            return { projects: [], activeRepoId: null, flowRuns: [] };
+            return {
+              projects: [],
+              activeRepoId: null,
+              flowRuns: [],
+              flowRunEvents: [],
+              flowEventSequence: 0,
+            };
           }
 
           try {
             return normalizeDb(JSON.parse(raw));
           } catch (error) {
-            return { projects: [], activeRepoId: null, flowRuns: [] };
+            return {
+              projects: [],
+              activeRepoId: null,
+              flowRuns: [],
+              flowRunEvents: [],
+              flowEventSequence: 0,
+            };
           }
         }
 
@@ -792,6 +945,24 @@
           return db.projects.find(function (item) { return item.repoId === db.activeRepoId; }) || null;
         }
 
+        function findFlowRun(flowRunId) {
+          var db = readDb();
+          var targetId = String(flowRunId || "");
+          var flowRun = db.flowRuns.find(function (item) { return item.flowRunId === targetId; });
+
+          if (!flowRun) {
+            throw new Error("Flow Run not found: " + targetId);
+          }
+
+          return { db: db, flowRun: flowRun };
+        }
+
+        function saveFlowRun(db, flowRun) {
+          flowRun.stage = flowRun.specPipeline.currentStage;
+          writeDb(db);
+          return flowRun;
+        }
+
         function getEnvValue(key, fallback) {
           if (Object.prototype.hasOwnProperty.call(env, key)) {
             return env[key];
@@ -835,20 +1006,39 @@
           return { checks: checks, canStartFlowRun: canStartFlowRun };
         }
 
-        function startFlowRun(options) {
+        function startFlowRun(prototypeOpts) {
           var gate = evaluateReadiness();
           if (!gate.canStartFlowRun) {
             throw new Error("Readiness gate failed. Fix checks before starting Flow Run.");
           }
 
-          var activeProject = getActiveProject();
+          var args = prototypeOpts && typeof prototypeOpts === "object" ? prototypeOpts : {};
+          return createFlowRunFromOrchestration({
+            readinessPassed: true,
+            ui_scope: args.ui_scope,
+            prototype_approved: args.prototype_approved,
+            prototype_artifact_ref: args.prototype_artifact_ref,
+            prototype_approver: args.prototype_approver,
+            prototype_approved_at: args.prototype_approved_at,
+          });
+        }
+
+        function createFlowRunFromOrchestration(input) {
+          var args = input || {};
           var db = readDb();
-          var opts = options && typeof options === "object" ? options : {};
-          var uiScope = Boolean(opts.ui_scope || opts.uiScope);
-          var prototypeApproved = Boolean(opts.prototype_approved);
-          var prototypeArtifactRef = normalizeOptionalString(opts.prototype_artifact_ref);
-          var prototypeApprover = normalizeOptionalString(opts.prototype_approver);
-          var prototypeApprovedAt = normalizeOptionalString(opts.prototype_approved_at);
+          var activeProject = getActiveProject();
+          var repoId = args.repoId ? String(args.repoId) : (activeProject ? activeProject.repoId : "");
+          var readinessPassed = args.readinessPassed === false ? false : true;
+
+          if (!repoId) {
+            throw new Error("Cannot create Flow Run without repo binding.");
+          }
+
+          var uiScope = Boolean(args.ui_scope || args.uiScope);
+          var prototypeApproved = Boolean(args.prototype_approved);
+          var prototypeArtifactRef = normalizeOptionalString(args.prototype_artifact_ref);
+          var prototypeApprover = normalizeOptionalString(args.prototype_approver);
+          var prototypeApprovedAt = normalizeOptionalString(args.prototype_approved_at);
           var prototypeGateDecision = "approved";
 
           if (uiScope && !(prototypeApproved && prototypeArtifactRef)) {
@@ -857,9 +1047,11 @@
 
           var flowRun = {
             flowRunId: makeId("flow"),
-            repoId: activeProject.repoId,
+            repoId: repoId,
             stage: "spec_pipeline",
             createdAt: nowIso(),
+            readinessPassed: readinessPassed,
+            specPipeline: createDefaultSpecPipeline(),
             ui_scope: uiScope,
             prototype_approved: prototypeApproved,
             prototype_artifact_ref: prototypeArtifactRef,
@@ -868,21 +1060,22 @@
             prototype_approved_at: prototypeApprovedAt,
           };
 
-          db.flowRuns.push(normalizeFlowRun(flowRun));
+          db.flowRuns.push(flowRun);
           writeDb(db);
           return db.flowRuns[db.flowRuns.length - 1];
         }
 
         function getFlowRun(flowRunId) {
           var db = readDb();
-          return db.flowRuns.find(function (flowRun) {
-            return flowRun.flowRunId === flowRunId;
+          return db.flowRuns.find(function (fr) {
+            return fr.flowRunId === String(flowRunId || "");
           }) || null;
         }
 
         function updatePrototypeGate(flowRun, updates) {
-          var next = normalizeFlowRun(flowRun);
+          var run = flowRun && typeof flowRun === "object" ? flowRun : {};
           var patch = updates && typeof updates === "object" ? updates : {};
+          var next = Object.assign({}, run);
 
           if (Object.prototype.hasOwnProperty.call(patch, "ui_scope") || Object.prototype.hasOwnProperty.call(patch, "uiScope")) {
             next.ui_scope = Boolean(patch.ui_scope || patch.uiScope);
@@ -909,15 +1102,10 @@
           return next;
         }
 
-        function advanceFlowRunStage(flowRunId, nextStage, updates) {
-          var targetStage = String(nextStage || "").trim();
-          if (!targetStage) {
-            throw new Error("nextStage is required.");
-          }
-
+        function advanceFlowRunStage(flowRunId, targetStage, updates) {
           var db = readDb();
-          var runIndex = db.flowRuns.findIndex(function (flowRun) {
-            return flowRun.flowRunId === flowRunId;
+          var runIndex = db.flowRuns.findIndex(function (fr) {
+            return fr.flowRunId === String(flowRunId || "");
           });
 
           if (runIndex < 0) {
@@ -926,17 +1114,14 @@
 
           var flowRun = updatePrototypeGate(db.flowRuns[runIndex], updates);
 
-          if (targetStage === "issue-plan" && flowRun.ui_scope) {
-            if (!(flowRun.prototype_approved && flowRun.prototype_artifact_ref)) {
-              db.flowRuns[runIndex] = flowRun;
-              writeDb(db);
-              throw new Error("Prototype gate blocked. UI-scoped Flow Runs require prototype_approved=true and prototype_artifact_ref before issue-plan stage.");
-            }
+          if (flowRun.ui_scope && flowRun.prototype_gate_decision === "blocked" && targetStage === "issue-plan") {
+            db.flowRuns[runIndex] = flowRun;
+            writeDb(db);
+            throw new Error("Prototype gate blocked: UI-scoped Flow Run requires approved prototype before advancing to issue-plan.");
+          }
 
+          if (flowRun.ui_scope && targetStage === "issue-plan" && flowRun.prototype_artifact_ref) {
             flowRun.prototype_gate_decision = "approved";
-            if (!flowRun.prototype_approved_at) {
-              flowRun.prototype_approved_at = nowIso();
-            }
           }
 
           flowRun.stage = targetStage;
@@ -980,6 +1165,251 @@
           });
         }
 
+        function listFlowRunEvents(flowRunId) {
+          var targetFlowRunId = String(flowRunId || "").trim();
+          var db = readDb();
+          return db.flowRunEvents
+            .filter(function (item) { return item.flowRunId === targetFlowRunId; })
+            .slice()
+            .sort(function (a, b) { return a.sequence - b.sequence; });
+        }
+
+        function replayFlowRunEvents(flowRunId, lastEventId) {
+          var events = listFlowRunEvents(flowRunId);
+          if (!lastEventId) {
+            return events;
+          }
+
+          var index = events.findIndex(function (item) {
+            return item.eventId === String(lastEventId);
+          });
+
+          if (index < 0) {
+            return events;
+          }
+
+          return events.slice(index + 1);
+        }
+
+        function appendFlowRunEvent(input) {
+          if (!input || !input.flowRunId) {
+            throw new Error("flowRunId is required for flow events.");
+          }
+
+          var targetFlowRunId = String(input.flowRunId);
+          var db = readDb();
+          var flowRunExists = db.flowRuns.some(function (item) {
+            return item.flowRunId === targetFlowRunId;
+          });
+          if (!flowRunExists) {
+            throw new Error("Flow Run is not found: " + targetFlowRunId);
+          }
+
+          var nextSequence = db.flowEventSequence + 1;
+          var event = {
+            eventId: targetFlowRunId + ":evt:" + String(nextSequence),
+            flowRunId: targetFlowRunId,
+            sequence: nextSequence,
+            kind: input.kind ? String(input.kind) : "flow.event",
+            createdAt: nowIso(),
+            ui: {
+              skillProgress: input.skillProgress || null,
+              questionPrompt: input.questionPrompt || null,
+              gateOutcome: input.gateOutcome || null,
+            },
+          };
+
+          db.flowEventSequence = nextSequence;
+          db.flowRunEvents.push(event);
+          writeDb(db);
+
+          openSockets.forEach(function (socket) {
+            if (!socket.closed && socket.flowRunId === targetFlowRunId) {
+              socket.buffer.push(event);
+            }
+          });
+
+          return event;
+        }
+
+        function openFlowRunSocket(flowRunId, options) {
+          var targetFlowRunId = String(flowRunId || "").trim();
+          var opts = options || {};
+          var socket = {
+            flowRunId: targetFlowRunId,
+            closed: false,
+            buffer: replayFlowRunEvents(targetFlowRunId, opts.lastEventId || null),
+            drain: function () {
+              var queued = this.buffer.slice();
+              this.buffer.length = 0;
+              return queued;
+            },
+            close: function () {
+              this.closed = true;
+            },
+          };
+
+          openSockets.push(socket);
+          return socket;
+        }
+
+        function getSpecPipelineStatus(flowRunId) {
+          var found = findFlowRun(flowRunId);
+          var flowRun = found.flowRun;
+          var pipeline = normalizeSpecPipeline(flowRun.specPipeline);
+
+          var stageStatuses = pipeline.stages.map(function (stage) {
+            return {
+              stage: stage.stage,
+              status: stage.status,
+              blockingQuestions: stage.blockingQuestions.map(function (question) {
+                return {
+                  questionId: question.questionId,
+                  prompt: question.prompt,
+                  status: question.status,
+                  answer: question.answer,
+                };
+              }),
+            };
+          });
+
+          var blockingQuestions = [];
+          stageStatuses.forEach(function (stage) {
+            stage.blockingQuestions.forEach(function (question) {
+              if (question.status === "open") {
+                blockingQuestions.push({
+                  stage: stage.stage,
+                  questionId: question.questionId,
+                  prompt: question.prompt,
+                  status: question.status,
+                });
+              }
+            });
+          });
+
+          return {
+            flowRunId: flowRun.flowRunId,
+            repoId: flowRun.repoId,
+            readinessPassed: flowRun.readinessPassed !== false,
+            currentStage: pipeline.currentStage,
+            stages: stageStatuses,
+            blockingQuestions: blockingQuestions,
+          };
+        }
+
+        function addBlockingQuestion(flowRunId, input) {
+          var args = input || {};
+          var stageName = String(args.stage || "");
+          if (SPEC_PIPELINE_STAGES.indexOf(stageName) === -1) {
+            throw new Error("Unknown pipeline stage for blocking question: " + stageName);
+          }
+
+          var prompt = String(args.prompt || "").trim();
+          if (!prompt) {
+            throw new Error("Blocking question prompt is required.");
+          }
+
+          var found = findFlowRun(flowRunId);
+          var db = found.db;
+          var flowRun = found.flowRun;
+          var pipeline = normalizeSpecPipeline(flowRun.specPipeline);
+          var stage = pipeline.stages.find(function (item) { return item.stage === stageName; });
+
+          var blockingQuestion = {
+            questionId: makeId("q"),
+            prompt: prompt,
+            status: "open",
+            answer: "",
+            createdAt: nowIso(),
+            resolvedAt: null,
+          };
+
+          stage.blockingQuestions.push(blockingQuestion);
+          if (stage.status !== "completed") {
+            stage.status = "blocked";
+          }
+
+          flowRun.specPipeline = pipeline;
+          saveFlowRun(db, flowRun);
+          return blockingQuestion;
+        }
+
+        function resolveBlockingQuestion(flowRunId, questionId, answer) {
+          var targetId = String(questionId || "");
+          var found = findFlowRun(flowRunId);
+          var db = found.db;
+          var flowRun = found.flowRun;
+          var pipeline = normalizeSpecPipeline(flowRun.specPipeline);
+          var resolvedQuestion = null;
+
+          pipeline.stages.forEach(function (stage) {
+            stage.blockingQuestions.forEach(function (question) {
+              if (question.questionId !== targetId) {
+                return;
+              }
+
+              question.status = "resolved";
+              question.answer = answer ? String(answer) : "";
+              question.resolvedAt = nowIso();
+              resolvedQuestion = question;
+
+              var hasOpen = stage.blockingQuestions.some(function (item) {
+                return item.status === "open";
+              });
+
+              if (!hasOpen && stage.status !== "completed") {
+                stage.status = stage.stage === pipeline.currentStage ? "in_progress" : "pending";
+              }
+            });
+          });
+
+          if (!resolvedQuestion) {
+            throw new Error("Blocking question not found: " + targetId);
+          }
+
+          flowRun.specPipeline = pipeline;
+          saveFlowRun(db, flowRun);
+          return resolvedQuestion;
+        }
+
+        function advanceSpecPipeline(flowRunId) {
+          var found = findFlowRun(flowRunId);
+          var db = found.db;
+          var flowRun = found.flowRun;
+          var pipeline = normalizeSpecPipeline(flowRun.specPipeline);
+
+          if (flowRun.readinessPassed === false) {
+            throw new Error("Cannot advance stage when Flow Run is not readiness-passed.");
+          }
+
+          var currentIndex = SPEC_PIPELINE_STAGES.indexOf(pipeline.currentStage);
+          if (currentIndex === -1) {
+            throw new Error("Flow Run has invalid current stage.");
+          }
+
+          var currentStage = pipeline.stages[currentIndex];
+          var hasBlocking = currentStage.blockingQuestions.some(function (question) {
+            return question.status === "open";
+          });
+          if (hasBlocking) {
+            currentStage.status = "blocked";
+            flowRun.specPipeline = pipeline;
+            saveFlowRun(db, flowRun);
+            throw new Error("Cannot advance stage while blocking question is open.");
+          }
+
+          currentStage.status = "completed";
+          var nextStage = pipeline.stages[currentIndex + 1];
+          if (nextStage) {
+            nextStage.status = "in_progress";
+            pipeline.currentStage = nextStage.stage;
+          }
+
+          flowRun.specPipeline = pipeline;
+          saveFlowRun(db, flowRun);
+          return getSpecPipelineStatus(flowRun.flowRunId);
+        }
+
         function getAllProjectsView() {
           var active = getActiveProject();
           var projects = listRegisteredProjects().map(function (project) {
@@ -1018,6 +1448,15 @@
           getFlowRun: getFlowRun,
           advanceFlowRunStage: advanceFlowRunStage,
           emitIssuePlanAcceptanceCriteria: emitIssuePlanAcceptanceCriteria,
+          listFlowRunEvents: listFlowRunEvents,
+          replayFlowRunEvents: replayFlowRunEvents,
+          appendFlowRunEvent: appendFlowRunEvent,
+          openFlowRunSocket: openFlowRunSocket,
+          createFlowRunFromOrchestration: createFlowRunFromOrchestration,
+          getSpecPipelineStatus: getSpecPipelineStatus,
+          addBlockingQuestion: addBlockingQuestion,
+          resolveBlockingQuestion: resolveBlockingQuestion,
+          advanceSpecPipeline: advanceSpecPipeline,
           getAllProjectsView: getAllProjectsView,
           triggerAllProjectsLifecycleAction: triggerAllProjectsLifecycleAction,
           getLifecycleEvents: getLifecycleEvents,
@@ -1084,6 +1523,17 @@
       const startFlowRunButton = document.getElementById('start-flow-run');
       const startResult = document.getElementById('start-result');
       const allProjectsView = document.getElementById('all-projects-view');
+      const pipelineStages = document.getElementById('pipeline-stages');
+      const pipelineHint = document.getElementById('pipeline-hint');
+      const pipelineResult = document.getElementById('pipeline-result');
+      const pipelineNextStage = document.getElementById('pipeline-next-stage');
+      const pipelineStageSelect = document.getElementById('pipeline-stage-select');
+      const pipelineQuestionInput = document.getElementById('pipeline-question-input');
+      const pipelineAddQuestion = document.getElementById('pipeline-add-question');
+      const pipelineQuestionSelect = document.getElementById('pipeline-question-select');
+      const pipelineQuestionAnswer = document.getElementById('pipeline-question-answer');
+      const pipelineResolveQuestion = document.getElementById('pipeline-resolve-question');
+      let activeFlowRunId = null;
 
       const bootstrapProjects = () => {
         if (app.listRegisteredProjects().length > 0) {
@@ -1168,10 +1618,84 @@
         });
       };
 
+      const renderSpecPipeline = () => {
+        pipelineStages.innerHTML = '';
+        pipelineResult.textContent = '';
+
+        if (!activeFlowRunId) {
+          pipelineHint.textContent = '尚未啟動 Flow Run。';
+          [
+            pipelineNextStage,
+            pipelineStageSelect,
+            pipelineQuestionInput,
+            pipelineAddQuestion,
+            pipelineQuestionSelect,
+            pipelineQuestionAnswer,
+            pipelineResolveQuestion,
+          ].forEach((element) => {
+            element.disabled = true;
+          });
+          pipelineQuestionSelect.innerHTML = '';
+          return;
+        }
+
+        const status = app.getSpecPipelineStatus(activeFlowRunId);
+        pipelineHint.textContent = `current stage: ${status.currentStage}${status.readinessPassed ? '' : ' · readiness not passed'}`;
+
+        status.stages.forEach((stage) => {
+          const row = document.createElement('div');
+          row.className = 'pipeline-stage';
+
+          const head = document.createElement('div');
+          head.className = 'pipeline-stage-head';
+          head.innerHTML = `<strong>${stage.stage}</strong>`;
+
+          const tag = document.createElement('span');
+          const tagClass = stage.status === 'completed'
+            ? 'done'
+            : stage.status === 'blocked'
+              ? 'blocked'
+              : stage.status === 'in_progress'
+                ? 'active'
+                : 'info';
+          tag.className = `tag ${tagClass}`;
+          tag.textContent = stage.status;
+          head.appendChild(tag);
+          row.appendChild(head);
+
+          const questions = stage.blockingQuestions.filter((question) => question.status === 'open');
+          const detail = document.createElement('div');
+          detail.className = 'pipeline-questions';
+          detail.textContent = questions.length > 0
+            ? `blocking: ${questions.map((question) => question.prompt).join(' | ')}`
+            : 'no open blocking question';
+          row.appendChild(detail);
+
+          pipelineStages.appendChild(row);
+        });
+
+        pipelineQuestionSelect.innerHTML = '';
+        status.blockingQuestions.forEach((question) => {
+          const option = document.createElement('option');
+          option.value = question.questionId;
+          option.textContent = `${question.stage}: ${question.prompt}`;
+          pipelineQuestionSelect.appendChild(option);
+        });
+
+        pipelineNextStage.disabled = false;
+        pipelineStageSelect.disabled = false;
+        pipelineQuestionInput.disabled = false;
+        pipelineAddQuestion.disabled = false;
+        pipelineQuestionSelect.disabled = status.blockingQuestions.length === 0;
+        pipelineQuestionAnswer.disabled = status.blockingQuestions.length === 0;
+        pipelineResolveQuestion.disabled = status.blockingQuestions.length === 0;
+      };
+
       const renderEverything = () => {
         renderRegistry();
         renderReadiness();
         renderAllProjects();
+        renderSpecPipeline();
       };
 
       bootstrapProjects();
@@ -1198,6 +1722,7 @@
       startFlowRunButton.addEventListener('click', () => {
         try {
           const flowRun = app.startFlowRun();
+          activeFlowRunId = flowRun.flowRunId;
           startResult.textContent = `Flow Run started: ${flowRun.flowRunId} (${flowRun.repoId})`;
           startResult.className = 'mini-note';
         } catch (error) {
@@ -1205,6 +1730,67 @@
           startResult.className = 'mini-note error';
         }
         renderReadiness();
+        renderSpecPipeline();
+      });
+
+      pipelineNextStage.addEventListener('click', () => {
+        if (!activeFlowRunId) {
+          return;
+        }
+
+        try {
+          const status = app.advanceSpecPipeline(activeFlowRunId);
+          pipelineResult.textContent = `stage advanced to ${status.currentStage}`;
+        } catch (error) {
+          pipelineResult.textContent = error.message;
+        }
+
+        renderSpecPipeline();
+      });
+
+      pipelineAddQuestion.addEventListener('click', () => {
+        if (!activeFlowRunId) {
+          return;
+        }
+
+        const prompt = pipelineQuestionInput.value.trim();
+        if (!prompt) {
+          pipelineResult.textContent = '請先輸入 blocking question。';
+          return;
+        }
+
+        try {
+          app.addBlockingQuestion(activeFlowRunId, {
+            stage: pipelineStageSelect.value,
+            prompt,
+          });
+          pipelineQuestionInput.value = '';
+          pipelineResult.textContent = 'blocking question 已新增。';
+        } catch (error) {
+          pipelineResult.textContent = error.message;
+        }
+
+        renderSpecPipeline();
+      });
+
+      pipelineResolveQuestion.addEventListener('click', () => {
+        if (!activeFlowRunId || !pipelineQuestionSelect.value) {
+          return;
+        }
+
+        try {
+          app.resolveBlockingQuestion(
+            activeFlowRunId,
+            pipelineQuestionSelect.value,
+            pipelineQuestionAnswer.value.trim(),
+          );
+          pipelineQuestionAnswer.value = '';
+          pipelineResult.textContent = 'blocking question 已標記為 resolved。';
+        } catch (error) {
+          pipelineResult.textContent = error.message;
+        }
+
+        renderSpecPipeline();
       });
     }
   </script>

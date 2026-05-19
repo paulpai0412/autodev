@@ -57,6 +57,252 @@ function runTests() {
     tests.push({ name, fn });
   }
 
+  test("AC3: flow run exposes explicit clarify -> prd -> issue-plan transitions", () => {
+    const app = createControlTowerApp({
+      storage: createMemoryStorage(),
+      env: {
+        githubToken: "ghp_demo",
+        runtimePathExists: true,
+        runtimeConfigExists: true,
+      },
+    });
+
+    app.registerProject({ repoId: "acme/alpha", displayName: "Alpha" });
+    app.switchActiveProject("acme/alpha");
+
+    const flowRun = app.startFlowRun();
+    const stageNames = app
+      .getSpecPipelineStatus(flowRun.flowRunId)
+      .stages.map((stage) => stage.stage);
+
+    assert.equal(stageNames.join("->"), "clarify->prd->issue-plan");
+    assert.equal(app.getSpecPipelineStatus(flowRun.flowRunId).currentStage, "clarify");
+
+    app.advanceSpecPipeline(flowRun.flowRunId);
+    assert.equal(app.getSpecPipelineStatus(flowRun.flowRunId).currentStage, "prd");
+
+    app.advanceSpecPipeline(flowRun.flowRunId);
+    assert.equal(app.getSpecPipelineStatus(flowRun.flowRunId).currentStage, "issue-plan");
+  });
+
+  test("AC4: pipeline emits structured stage status and blocking prompts", () => {
+    const app = createControlTowerApp({
+      storage: createMemoryStorage(),
+      env: {
+        githubToken: "ghp_demo",
+        runtimePathExists: true,
+        runtimeConfigExists: true,
+      },
+    });
+
+    app.registerProject({ repoId: "acme/alpha", displayName: "Alpha" });
+    app.switchActiveProject("acme/alpha");
+    const flowRun = app.startFlowRun();
+
+    const blocking = app.addBlockingQuestion(flowRun.flowRunId, {
+      stage: "clarify",
+      prompt: "Who is the primary operator persona?",
+    });
+
+    const blockedStatus = app.getSpecPipelineStatus(flowRun.flowRunId);
+    const clarify = blockedStatus.stages.find((stage) => stage.stage === "clarify");
+
+    assert.equal(clarify.status, "blocked");
+    assert.equal(Array.isArray(clarify.blockingQuestions), true);
+    assert.equal(clarify.blockingQuestions.length, 1);
+    assert.equal(clarify.blockingQuestions[0].questionId, blocking.questionId);
+    assert.equal(blockedStatus.blockingQuestions.length, 1);
+
+    assert.throws(
+      () => {
+        app.advanceSpecPipeline(flowRun.flowRunId);
+      },
+      /blocking question/i,
+    );
+
+    app.resolveBlockingQuestion(flowRun.flowRunId, blocking.questionId, "Tech lead");
+    const unblockedStatus = app.getSpecPipelineStatus(flowRun.flowRunId);
+    const clarifyAfterResolve = unblockedStatus.stages.find(
+      (stage) => stage.stage === "clarify",
+    );
+
+    assert.equal(clarifyAfterResolve.status, "in_progress");
+    assert.equal(clarifyAfterResolve.blockingQuestions[0].status, "resolved");
+  });
+
+  test("AC5: stage progression is rejected when flow run is not readiness-passed", () => {
+    const app = createControlTowerApp({
+      storage: createMemoryStorage(),
+      env: {
+        githubToken: "",
+        runtimePathExists: false,
+        runtimeConfigExists: false,
+      },
+    });
+
+    app.registerProject({ repoId: "acme/alpha", displayName: "Alpha" });
+    app.switchActiveProject("acme/alpha");
+    const flowRun = app.createFlowRunFromOrchestration({
+      repoId: "acme/alpha",
+      readinessPassed: false,
+    });
+
+    assert.throws(
+      () => {
+        app.advanceSpecPipeline(flowRun.flowRunId);
+      },
+      /readiness-passed/i,
+    );
+  });
+
+  test("AC3: flow event channel emits ordered events with stable event IDs", () => {
+    const app = createControlTowerApp({
+      storage: createMemoryStorage(),
+      env: {
+        githubToken: "ghp_demo",
+        runtimePathExists: true,
+        runtimeConfigExists: true,
+      },
+    });
+
+    app.registerProject({ repoId: "acme/alpha", displayName: "Alpha" });
+    app.switchActiveProject("acme/alpha");
+    const flowRun = app.startFlowRun();
+
+    const socket = app.openFlowRunSocket(flowRun.flowRunId);
+    const event1 = app.appendFlowRunEvent({
+      flowRunId: flowRun.flowRunId,
+      kind: "skill.progress",
+      skillProgress: {
+        skillName: "to-prd",
+        completedSteps: 1,
+        totalSteps: 3,
+        status: "running",
+      },
+    });
+    const event2 = app.appendFlowRunEvent({
+      flowRunId: flowRun.flowRunId,
+      kind: "gate.outcome",
+      gateOutcome: {
+        gateId: "spec_gate",
+        status: "pass",
+        detail: "problem_statement_is_clear",
+      },
+    });
+
+    const live = socket.drain();
+    assert.equal(live.length, 2);
+    assert.equal(live[0].sequence, 1);
+    assert.equal(live[1].sequence, 2);
+    assert.equal(live[0].eventId, event1.eventId);
+    assert.equal(live[1].eventId, event2.eventId);
+
+    const persisted = app.listFlowRunEvents(flowRun.flowRunId);
+    assert.deepEqual(
+      persisted.map((item) => item.eventId),
+      [event1.eventId, event2.eventId],
+    );
+  });
+
+  test("AC4: reconnect replay returns missed events from persisted event store", () => {
+    const app = createControlTowerApp({
+      storage: createMemoryStorage(),
+      env: {
+        githubToken: "ghp_demo",
+        runtimePathExists: true,
+        runtimeConfigExists: true,
+      },
+    });
+
+    app.registerProject({ repoId: "acme/alpha", displayName: "Alpha" });
+    app.switchActiveProject("acme/alpha");
+    const flowRun = app.startFlowRun();
+
+    const event1 = app.appendFlowRunEvent({
+      flowRunId: flowRun.flowRunId,
+      kind: "skill.progress",
+      skillProgress: {
+        skillName: "grill-with-docs",
+        completedSteps: 1,
+        totalSteps: 2,
+        status: "running",
+      },
+    });
+    const event2 = app.appendFlowRunEvent({
+      flowRunId: flowRun.flowRunId,
+      kind: "question.prompt",
+      questionPrompt: {
+        promptId: "q-1",
+        message: "Approve issue plan?",
+        choices: ["approve", "revise"],
+      },
+    });
+    const event3 = app.appendFlowRunEvent({
+      flowRunId: flowRun.flowRunId,
+      kind: "gate.outcome",
+      gateOutcome: {
+        gateId: "ui_prototype_gate",
+        status: "pass",
+        detail: "approved prototype reference recorded",
+      },
+    });
+
+    const replay = app.replayFlowRunEvents(flowRun.flowRunId, event1.eventId);
+    assert.deepEqual(
+      replay.map((item) => item.eventId),
+      [event2.eventId, event3.eventId],
+    );
+
+    const reconnectSocket = app.openFlowRunSocket(flowRun.flowRunId, {
+      lastEventId: event2.eventId,
+    });
+    const missedAtConnect = reconnectSocket.drain();
+    assert.equal(missedAtConnect.length, 1);
+    assert.equal(missedAtConnect[0].eventId, event3.eventId);
+  });
+
+  test("AC5: UI-facing event contract carries progress prompts and gate outcomes", () => {
+    const app = createControlTowerApp({
+      storage: createMemoryStorage(),
+      env: {
+        githubToken: "ghp_demo",
+        runtimePathExists: true,
+        runtimeConfigExists: true,
+      },
+    });
+
+    app.registerProject({ repoId: "acme/alpha", displayName: "Alpha" });
+    app.switchActiveProject("acme/alpha");
+    const flowRun = app.startFlowRun();
+
+    const saved = app.appendFlowRunEvent({
+      flowRunId: flowRun.flowRunId,
+      kind: "flow.snapshot",
+      skillProgress: {
+        skillName: "to-issues",
+        completedSteps: 2,
+        totalSteps: 4,
+        status: "running",
+      },
+      questionPrompt: {
+        promptId: "q-2",
+        message: "Approve DAG issue plan?",
+        choices: ["approve", "request-revision"],
+      },
+      gateOutcome: {
+        gateId: "traceability_gate",
+        status: "pass",
+        detail: "every_acceptance_criterion_maps_to_evidence",
+      },
+    });
+
+    assert.equal(saved.ui.skillProgress.skillName, "to-issues");
+    assert.equal(saved.ui.questionPrompt.promptId, "q-2");
+    assert.equal(saved.ui.gateOutcome.gateId, "traceability_gate");
+    assert.equal(saved.ui.gateOutcome.status, "pass");
+    assert.equal(saved.kind, "flow.snapshot");
+  });
+
   test("AC3: UI-scoped flow run is blocked from issue-plan without approved prototype", () => {
     const app = createControlTowerApp({
       storage: createMemoryStorage(),
