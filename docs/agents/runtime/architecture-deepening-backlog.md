@@ -1,6 +1,6 @@
 # Architecture Deepening Backlog (DB-only control plane)
 
-Status: proposed
+Status: completed (P0/P1/P2 done on 2026-05-20)
 Owner: autodev maintainers
 Scope: branch `db-only-control-plane`
 
@@ -18,6 +18,8 @@ This backlog captures concrete deepening opportunities discovered from current r
 ---
 
 ## 1) Host Adapter Seam consolidation (P0)
+
+Status: completed (2026-05-20)
 
 ### Files
 
@@ -49,9 +51,23 @@ Core modules still carry OpenCode-specific assumptions (`.opencode` runtime path
 - Aligns with `docs/agents/runtime/host-adapter-strategy.md`.
 - Aligns with DB-only spec host-agnostic rule.
 
+### Completion notes (2026-05-20)
+
+- Consolidated typed outcome fallback behind host-neutral helper in `scripts/host_adapter.py`:
+  - added `session_result_field(...)` and removed supervisor-local duplicate fallback logic.
+- Updated `scripts/orchestrator_supervisor.py` to consume the host adapter outcome seam through shared helper instead of local metadata decoding.
+- Kept host adapter registry/factory flow centered in `scripts/orchestrator_sessions.py` and aligned `scripts/autodev_project.py` host resolution to registry-based adapter resolution.
+- Tightened host packaging seam typing in `scripts/autodev_host_packaging.py` so packaging config derives from `HostAdapter` contract directly.
+- Regression status:
+  - `python3 -m pytest tests/scripts/test_orchestrator_supervisor.py -q` passed.
+  - `python3 -m pytest tests/scripts/test_autodev_project.py -q` passed.
+  - `python3 -m pytest tests/scripts -q` passed.
+
 ---
 
 ## 2) Issue intake/dependency parsing deep module (P0)
+
+Status: completed (2026-05-20)
 
 ### Files
 
@@ -80,9 +96,25 @@ Dependency parsing/normalization and selection concerns are split across multipl
 
 - Aligns with DB-only control-plane intake and deterministic selection direction.
 
+### Completion notes (2026-05-20)
+
+- Added deep projection module `scripts/issue_selection_projection.py` to centralize dependency normalization and readiness projection logic:
+  - `dependency_issue_numbers_for_selection(...)`
+  - `resolve_issue_base_branch_from_completed(...)`
+  - `readiness_rank_score(...)`
+- Updated `scripts/orchestrator_selection.py` to route dependency/base-branch/readiness ranking through the shared projection seam while preserving public API and selection behavior.
+- Kept `scripts/issue_dependency.py` as the canonical dependency parser source and retained intake behavior compatibility.
+- Regression status:
+  - `python3 -m pytest tests/scripts/test_issue_packet_intake.py -q` passed.
+  - `python3 -m pytest tests/scripts/test_orchestrator_selection.py -q` passed.
+  - `python3 -m pytest tests/scripts/test_orchestrator_supervisor.py -q` passed.
+  - `python3 -m pytest tests/scripts -q` passed.
+
 ---
 
 ## 3) Supervisor + lifecycle policy deepening (P1)
+
+Status: completed (2026-05-20)
 
 ### Files
 
@@ -112,9 +144,18 @@ Dependency parsing/normalization and selection concerns are split across multipl
 
 - Aligns with DB-only spec single-writer + auditable transition model.
 
+### Completion notes (2026-05-20)
+
+- Added explicit orchestration policy module `scripts/orchestrator_policy.py` and moved role/stage routing plus admission/restore classifiers behind that seam.
+- `scripts/orchestrator_supervisor.py` now delegates reconcile routing, release admission, request stale/alignment guards, and dispatch failure restore strategy to policy helpers instead of embedding all classifier branches inline.
+- Lifecycle invariants continue to flow through `scripts/orchestrator_lifecycle.py` wrappers from supervisor; claim/fence/quarantine/resume behavior remains centralized at lifecycle seam.
+- Regression status: `python3 -m pytest tests/scripts/test_orchestrator_supervisor.py -q` and `python3 -m pytest tests/scripts -q` pass after extraction.
+
 ---
 
 ## 4) Prompt spec modularization (P1)
+
+Status: completed (2026-05-20)
 
 ### Files
 
@@ -136,9 +177,22 @@ Prompt generation currently behaves like a long template surface with string-hea
 - Better locality for prompt contract regressions.
 - Lower brittle string-assert maintenance cost.
 
+### Completion notes (2026-05-20)
+
+- `scripts/orchestrator_requests.py` now exposes structured prompt/request seams:
+  - `PromptSpec` + `build_prompt_spec(...)` with renderer as final step.
+  - `SessionRequestSpec` + `build_session_request_spec(...)` with serialization as final step.
+- Role/stage prompt composition remains split into section helpers (`_bootstrap_prompt_lines`, `_issue_worker_prompt_lines`, `_pr_verifier_prompt_lines`, `_release_root_prompt_lines`, `_recovery_or_selection_prompt_lines`) and rendered only at the end.
+- Added direct spec contract tests in `tests/scripts/test_orchestrator_requests.py` for:
+  - decision-summary last-line rendering,
+  - selected-issue projection through request spec serialization.
+- Regression status: `python3 -m pytest tests/scripts/test_orchestrator_requests.py -q` and full `tests/scripts` suite pass.
+
 ---
 
 ## 5) Control-plane repository seam tightening (P2)
+
+Status: completed (2026-05-20)
 
 ### Files
 
@@ -163,9 +217,23 @@ DB access and domain-level projection semantics are intertwined in one large mod
 
 - Must keep `issues` + `issue_history` as single runtime control-plane truth.
 
+### Completion notes (2026-05-20)
+
+- Added explicit repository seam module `scripts/control_plane_repository.py` and routed `scripts/control_plane_db.py` through it for:
+  - snapshot writes (`update_issue_snapshot`),
+  - history append insert path (`append_history_entry`),
+  - occupancy read models (`count_development_occupancy`, `count_release_occupancy`).
+- Preserved existing `scripts/control_plane_db.py` public API and transaction boundaries while reducing inline SQL coupling in high-churn call paths.
+- DB-only runtime contract remains unchanged: runtime truth stays in SQLite `issues` + `issue_history` only.
+- Regression status:
+  - `python3 -m pytest tests/scripts/test_control_plane_db.py -q` passed.
+  - `python3 -m pytest tests/scripts -q` passed.
+
 ---
 
 ## 6) Project bootstrap vs host packaging split (P2)
+
+Status: completed (2026-05-20)
 
 ### Files
 
@@ -185,6 +253,21 @@ Project bootstrap concerns and host command packaging concerns are still coupled
 
 - Better leverage for multi-host support.
 - Better locality between consumer-project contract vs host UX wiring.
+
+### Completion notes (2026-05-20)
+
+- Added host packaging seam module `scripts/autodev_host_packaging.py` to isolate host adapter command packaging concerns:
+  - `host_packaging_config_from_adapter(...)`,
+  - `resolve_host_packaging_config(...)`,
+  - `command_templates(...)`.
+- Simplified `scripts/autodev_project.py` by delegating:
+  - `_operator_entrypoints()` to host packaging config seam,
+  - `_default_commands_dir()` to host packaging config seam,
+  - `_command_templates()` to host packaging template renderer.
+- Kept bootstrap/doctor/runtime control-plane responsibilities in `autodev_project.py` unchanged while moving host command wiring behind a dedicated seam.
+- Regression status:
+  - `python3 -m pytest tests/scripts/test_autodev_project.py -q` passed.
+  - `python3 -m pytest tests/scripts -q` passed.
 
 ---
 

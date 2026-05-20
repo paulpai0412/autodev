@@ -311,6 +311,32 @@ A verifier pass always moves the issue into `verified` first.
   - expose operator entrypoints in the host's plugin/command model
 - Host-specific runtime metadata belongs in `issue_history.payload_json` or `issues.runtime_context_json`, not in dedicated schema columns.
 
+## Implemented architecture seams (current branch baseline)
+
+This section documents the currently implemented module seams so system docs stay aligned with running code.
+
+- Control-plane DB API seam
+  - `scripts/control_plane_db.py` owns the runtime schema and public DB helpers.
+  - `scripts/control_plane_repository.py` groups low-level snapshot/history/occupancy operations:
+    - `update_issue_snapshot(...)`
+    - `append_history_entry(...)`
+    - `count_development_occupancy(...)`
+    - `count_release_occupancy(...)`
+- Host adapter seam
+  - `scripts/host_adapter.py` defines host-neutral contracts (`SessionStartContext`, `SessionStartResult`, `SessionOutcome`) and shared typed-field fallback helper `session_result_field(...)`.
+  - `scripts/orchestrator_sessions.py` provides adapter registry/resolution (`register_host_adapter_factory`, `host_adapter_factory`, `resolve_host_adapter`, `default_host_adapter`).
+  - `scripts/opencode_host_adapter.py` is the shipped OpenCode adapter implementation.
+- Selection/dependency seam
+  - `scripts/issue_dependency.py` remains the canonical dependency parser.
+  - `scripts/issue_selection_projection.py` centralizes deterministic base-branch/readiness projection:
+    - `dependency_issue_numbers_for_selection(...)`
+    - `resolve_issue_base_branch_from_completed(...)`
+    - `readiness_rank_score(...)`
+  - `scripts/orchestrator_selection.py` consumes these projection helpers while keeping DB-backed selection orchestration.
+- Policy/prompt seams
+  - `scripts/orchestrator_policy.py` centralizes reconcile route/release admission/dispatch validation classifiers.
+  - `scripts/orchestrator_requests.py` builds structured role/stage prompt and request specs (`PromptSpec`, `SessionRequestSpec`).
+
 ## PR ownership model
 
 - `issue_worker` returns a candidate implementation result, not a formal PR result.

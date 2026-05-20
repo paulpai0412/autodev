@@ -108,6 +108,27 @@ The core should consume only normalized outcomes, for example:
 - `resume_hint`
 - `metadata`
 
+## Implemented baseline on this branch
+
+The branch now implements a concrete host seam that matches the strategy:
+
+- Contract module: `scripts/host_adapter.py`
+  - `HostAdapter` protocol
+  - `SessionStartContext`
+  - `SessionStartResult`
+  - `SessionOutcome`
+  - shared typed outcome projection helper `session_result_field(...)`
+- Registry/factory module: `scripts/orchestrator_sessions.py`
+  - `register_host_adapter_factory(...)`
+  - `host_adapter_factory(...)`
+  - `resolve_host_adapter(...)`
+  - `default_host_adapter(...)`
+  - env selector: `AUTODEV_HOST_ADAPTER` (default `opencode`)
+- Shipped adapter: `scripts/opencode_host_adapter.py`
+  - OpenCode-specific launch/read/resume behavior is kept in adapter layer, not in control-plane schema logic.
+- Host packaging seam: `scripts/autodev_host_packaging.py`
+  - command entrypoint and command template packaging are isolated from bootstrap/doctor/runtime control-plane logic.
+
 ## Current extraction targets
 
 These are the main OpenCode-coupled surfaces that should move behind the adapter boundary:

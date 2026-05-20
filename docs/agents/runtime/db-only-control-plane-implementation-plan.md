@@ -40,6 +40,14 @@ This is the branch-local execution ledger for the DB-only rewrite. It exists so 
 - 2026-05-15: Removed `issuePacketPath` as a live supervisor ledger dependency. `scripts/orchestrator_supervisor.py` now rebuilds DB validation and legacy packet hydration without relying on packet-path fields from the runtime ledger shape, while prompt fixtures in `test_orchestrator_requests.py` prove the DB-backed prompt contract no longer needs those path keys. Focused regressions for `test_orchestrator_requests.py`, `test_orchestrator_supervisor.py`, and `test_orchestrator_compact_payload.py` pass together (`117 passed`).
 - 2026-05-15: Completed the final DB-only cleanup slice. `scripts/orchestrator_supervisor.py` no longer accepts `validation_ledger` as an external compatibility input, no longer backfills issue packets from legacy ledger-shaped data, and no longer carries ledger/request JSON read-write helpers. `scripts/control_plane_db.py` now exposes only `current_session_id` as the issue snapshot session pointer; role-specific current-session aliases were removed from runtime helper inputs and normalized rows. Dead artifact-base path helpers were removed from supervisor/selection. Probe script tests were added so the explicit coverage gate now passes. Verification: `python3 -m pytest tests/scripts -q` passes (`230 passed`), and `COVERAGE_FILE=/tmp/opencode/autodev.coverage /tmp/opencode/autodev-coverage-venv/bin/python -m pytest tests/scripts -q --cov=scripts --cov-report=term-missing --cov-fail-under=80` passes with total coverage `81.50%`.
 - 2026-05-15: Completed independent release-worker dispatch. Verifier pass now stops the development loop at `verified`, root `main_orchestrator` prompts no longer launch `release_worker`, and `scripts/orchestrator_supervisor.py release` / `/autodev-release` explicitly claim `verified -> release_pending` before launching a standalone release root session for PR merge/release. Inside that root session, `release_worker` runs as a foreground subagent. Focused regressions for supervisor, request prompts, and command wrappers pass.
+- 2026-05-20: Completed architecture deepening backlog P0/P1/P2 and aligned runtime seams to module boundaries:
+  - P0 host adapter seam: centralized typed outcome projection through `scripts/host_adapter.py::session_result_field(...)`; supervisor now uses shared host-neutral fallback instead of local metadata parsing.
+  - P0 selection/dependency deep module: added `scripts/issue_selection_projection.py` and routed readiness/base-branch dependency projection through shared helpers.
+  - P1 supervisor policy seam: `scripts/orchestrator_policy.py` is the classifier surface for reconcile routing, release admission, dispatch validation, and restore strategy.
+  - P1 prompt spec seam: `scripts/orchestrator_requests.py` now exposes structured `PromptSpec` / `SessionRequestSpec` builders.
+  - P2 control-plane repository seam: `scripts/control_plane_repository.py` groups snapshot/history/occupancy primitives under DB-only truth.
+  - P2 host packaging seam: `scripts/autodev_host_packaging.py` isolates host command packaging from project bootstrap/doctor/runtime control.
+  - Verification: `python3 -m pytest tests/scripts -q` passes (`333 passed`).
 
 ## Branch rules
 
@@ -367,3 +375,14 @@ The branch is ready to merge only when:
 6. verifier-owned PR creation is enforced by code and tests
 7. OpenCode is only one adapter, not a hard dependency of the core runtime
 8. bounded multi-issue concurrency is enforced by code and tests
+
+## Current baseline (post-P0/P1/P2)
+
+When continuing work on this branch, treat the following as already complete and authoritative:
+
+- Host adapter seam (contract/registry/concrete adapter) is in place.
+- Selection/dependency projection seam is in place.
+- Supervisor policy and prompt spec seams are in place.
+- Control-plane repository and host packaging seams are in place.
+
+Next architecture work should build on these seams rather than reintroducing inline cross-cutting logic.
