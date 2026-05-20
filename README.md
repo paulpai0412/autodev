@@ -9,9 +9,29 @@ Standalone autonomous development harness extracted into its own workspace at `~
 - Host-adapter-aware project init, global command install, and doctor tooling
 - Script-level pytest coverage
 
+## Current architecture map (P0/P1/P2 complete)
+
+- **Control-plane truth (DB-only)**
+  - `scripts/control_plane_db.py`: public runtime DB API and schema ownership
+  - `scripts/control_plane_repository.py`: low-level repository seam (snapshot/history/occupancy)
+- **Host adapter seam**
+  - `scripts/host_adapter.py`: host-neutral session contracts (`SessionStartContext`, `SessionStartResult`, `SessionOutcome`)
+  - `scripts/orchestrator_sessions.py`: adapter registry/factory + default resolver (`AUTODEV_HOST_ADAPTER`)
+  - `scripts/opencode_host_adapter.py`: shipped OpenCode adapter implementation
+- **Selection/dependency seam**
+  - `scripts/issue_dependency.py`: canonical dependency parsing primitives
+  - `scripts/issue_selection_projection.py`: readiness/base-branch projection rules
+  - `scripts/orchestrator_selection.py`: DB-backed selection + intake orchestration helpers
+- **Policy/prompt seams**
+  - `scripts/orchestrator_policy.py`: reconcile/dispatch/release admission classifiers
+  - `scripts/orchestrator_requests.py`: role/stage prompt and request spec builders
+- **Supervisor composition layer**
+  - `scripts/orchestrator_supervisor.py`: orchestrator entrypoint that composes lifecycle/selection/policy/request/host seams
+
 ## Documentation
 
 - Chinese user manual: [`docs/autodev-user-manual.zh-TW.md`](docs/autodev-user-manual.zh-TW.md)
+- Runtime architecture one-pager: [`docs/agents/runtime/current-architecture.md`](docs/agents/runtime/current-architecture.md)
 
 ## Consumer project setup
 
