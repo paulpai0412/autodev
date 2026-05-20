@@ -3717,6 +3717,135 @@ def test_release_issue_execution_completed_skips_issue_close_for_local_seeded_is
     assert latest_sync["status"] == "skipped"
 
 
+def test_release_issue_execution_completed_cleans_issue_worktree_and_runtime_context(tmp_path: Path):
+    _ingest_issue_packet_text(tmp_path, "42", SAMPLE_ISSUE_PACKET)
+    issue_worktree = tmp_path / ".opencode" / "runtime" / "issue-worktrees" / "issue-42"
+    issue_worktree.mkdir(parents=True, exist_ok=True)
+
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="release_pending",
+        command_id="cmd-release-pending",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_session_id="ses-release-42",
+    )
+    orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:00:00+08:00",
+        runtime_context={"issue_worktree_path": str(issue_worktree)},
+        worktree_path=str(issue_worktree),
+    )
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="release_result",
+        payload={
+            "status": "success",
+            "merge": {"merged": True, "merged_sha": "abc123"},
+        },
+        updated_at="2026-05-07T17:00:30+08:00",
+    )
+
+    calls: list[list[str]] = []
+
+    config_path = tmp_path / ".autodev.yaml"
+    _ = config_path.write_text('schema_version: "1.0"\nproject:\n  github_repo: example/repo\n', encoding="utf-8")
+
+    def fake_run(command, cwd, check, capture_output, text):
+        command_list = cast(list[str], command)
+        calls.append(command_list)
+        if command_list[:3] == ["git", "worktree", "remove"]:
+            issue_worktree.rmdir()
+        return CompletedProcess(command_list, 0, stdout="", stderr="")
+
+    with patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""), patch(
+        "scripts.orchestrator_lifecycle.subprocess.run",
+        side_effect=fake_run,
+    ):
+        orchestrator_supervisor.release_issue_execution(
+            base_dir=tmp_path,
+            issue_number="42",
+            restore_ready_for_agent=False,
+            final_state="completed",
+            updated_at="2026-05-07T17:01:00+08:00",
+        )
+
+    issue = read_issue(tmp_path, "42")
+    assert issue is not None
+    assert issue["state"] == "completed"
+    assert calls[-1] == ["git", "worktree", "remove", str(issue_worktree), "--force"]
+    runtime_context = json.loads(str(issue["runtime_context_json"]))
+    assert runtime_context.get("issue_worktree_path") == ""
+    assert str(issue.get("worktree_path") or "") == ""
+
+
+def test_release_issue_execution_completed_raises_when_worktree_cleanup_fails(tmp_path: Path):
+    _ingest_issue_packet_text(tmp_path, "42", SAMPLE_ISSUE_PACKET)
+    issue_worktree = tmp_path / ".opencode" / "runtime" / "issue-worktrees" / "issue-42"
+    issue_worktree.mkdir(parents=True, exist_ok=True)
+    config_path = tmp_path / ".autodev.yaml"
+    _ = config_path.write_text('schema_version: "1.0"\nproject:\n  github_repo: example/repo\n', encoding="utf-8")
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="release_pending",
+        command_id="cmd-release-pending",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_session_id="ses-release-42",
+    )
+    orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:00:00+08:00",
+        runtime_context={"issue_worktree_path": str(issue_worktree)},
+        worktree_path=str(issue_worktree),
+    )
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="release_result",
+        payload={
+            "status": "success",
+            "merge": {"merged": True, "merged_sha": "abc123"},
+        },
+        updated_at="2026-05-07T17:00:30+08:00",
+    )
+
+    def fake_run(command, cwd, check, capture_output, text):
+        command_list = cast(list[str], command)
+        if command_list[:3] == ["git", "worktree", "remove"]:
+            return CompletedProcess(command_list, 1, stdout="", stderr="remove failed")
+        return CompletedProcess(command_list, 0, stdout="", stderr="")
+
+    with patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""), patch(
+        "scripts.orchestrator_lifecycle.subprocess.run",
+        side_effect=fake_run,
+    ):
+        try:
+            orchestrator_supervisor.release_issue_execution(
+                base_dir=tmp_path,
+                issue_number="42",
+                restore_ready_for_agent=False,
+                final_state="completed",
+                updated_at="2026-05-07T17:01:00+08:00",
+            )
+        except RuntimeError as error:
+            assert "remove failed" in str(error)
+        else:
+            raise AssertionError("expected release_issue_execution to fail when issue worktree cleanup fails")
+
+    issue = read_issue(tmp_path, "42")
+    latest_admin_action = read_latest_issue_history(tmp_path, "42", entry_type="admin_action")
+    assert issue is not None
+    assert issue["state"] == "release_pending"
+    assert latest_admin_action is not None
+    assert latest_admin_action["command_id"].endswith(":admin-issue-worktree-cleanup-failed")
+    payload = json.loads(str(latest_admin_action["payload_json"] or "{}"))
+    assert payload["decision_type"] == "admin_issue_worktree_cleanup_failure"
+
+
 def test_retry_github_sync_command_rejects_stale_failed_attempt(tmp_path: Path):
     config_path = tmp_path / ".autodev.yaml"
     _ = config_path.write_text('schema_version: "1.0"\nproject:\n  github_repo: example/repo\n', encoding="utf-8")
@@ -4829,7 +4958,104 @@ verifier_manual_qa:
     assert issue["state"] == "verifying"
 
 
-def test_reconcile_verifier_pass_with_browser_gate_evidence_marks_verified(tmp_path: Path):
+def test_reconcile_verifier_pass_with_unit_test_evidence_kind_retries_when_browser_required(tmp_path: Path):
+    issue_packet_text = """schema_version: \"1.0\"
+kind: issue_packet
+line_cap: 80
+
+issue:
+  number: \"42\"
+  title: \"Demo issue\"
+  url: \"https://github.com/example/issues/42\"
+  labels: [ready-for-agent]
+  parent: {type: \"prd\", reference: \"https://github.com/example/issues/1\"}
+
+branch: {name: \"agent/issue-42-demo\", base: \"main\"}
+
+bootstrap_context:
+  required_reads: [\"AGENTS.md\"]
+  context_budget: {checkpoint_warning_at_percent: 45, stop_and_rotate_at_percent: 50}
+  relevant_paths: [\"frontend\"]
+  prior_handoff: \"docs/agents/handoffs/issue-41.yaml\"
+
+verifier_manual_qa:
+  surface: \"browser\"
+  required_gates: [\"diagnostics_and_build_gate\", \"surface_qa_gate\", \"review_gate\"]
+"""
+    issue_packet = parse_issue_packet_text(issue_packet_text, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    _ingest_issue_packet_text(tmp_path, "42", issue_packet_text)
+    ledger["current"] = {"role": "pr_verifier", "stage": "pr_verifier_execution", "status": "queued"}
+    cast(dict[str, str], ledger["artifacts"])["worker_result_ref"] = "docs/agents/worker-results/issue-42.yaml"
+    cast(dict[str, str], ledger["artifacts"])["evidence_packet_ref"] = "docs/agents/evidence/issue-42-pr-77.yaml"
+    attempts = cast(dict[str, int], ledger["attempts"])
+    starting_attempts = attempts["pr_verifier"]
+
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="worker_result",
+        payload={
+            "status": "success",
+            "pr_number": "77",
+            "worker_session_id": "ses-w",
+            "files_changed": [{"path": "frontend/src/App.tsx", "summary": "UI update"}],
+            "failure_kind": "none",
+            "retryable": True,
+        },
+        updated_at="2026-05-07T17:10:00+08:00",
+    )
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="evidence_packet",
+        payload={
+            "status": "pass",
+            "pr_number": "77",
+            "verifier_session_id": "ses-v",
+            "next_recommended_step": "Release it",
+            "failure_kind": "none",
+            "retryable": True,
+            "gates": {
+                "surface_qa_gate": {
+                    "status": "pass",
+                    "evidence_ref": "smoke_test.js 19/19",
+                    "evidence_kind": "unit_test",
+                }
+            },
+        },
+        updated_at="2026-05-07T17:11:00+08:00",
+    )
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="running",
+        command_id="cmd-running",
+        updated_at="2026-05-07T17:09:00+08:00",
+        current_session_id="ses-root-42",
+    )
+
+    updated_ledger, decision, request = reconcile_ledger(
+        ledger,
+        artifact_base_dir=tmp_path,
+        updated_at="2026-05-07T17:11:00+08:00",
+    )
+
+    issue = read_issue(tmp_path, "42")
+
+    assert updated_ledger is not None
+    assert decision["action"] == "delegate_subagent"
+    assert decision["next_role"] == "pr_verifier"
+    assert decision["next_stage"] == "pr_verifier_execution"
+    assert "browser_e2e_gate evidence" in cast(str, decision["summary"])
+    assert "unit_test" in cast(str, decision["summary"])
+    assert request is None
+    assert attempts["pr_verifier"] == starting_attempts + 1
+    assert issue is not None
+    assert issue["state"] == "verifying"
+
+
+
     issue_packet_text = """schema_version: \"1.0\"
 kind: issue_packet
 line_cap: 80
@@ -4885,7 +5111,7 @@ verifier_manual_qa:
             "next_recommended_step": "Release it",
             "failure_kind": "none",
             "retryable": True,
-            "gates": {"surface_qa_gate": {"status": "pass", "evidence_ref": "artifacts/browser-e2e/report.html"}},
+            "gates": {"surface_qa_gate": {"status": "pass", "evidence_ref": "artifacts/browser-e2e/report.html", "evidence_kind": "browser"}},
         },
         updated_at="2026-05-07T17:11:00+08:00",
     )
@@ -6312,6 +6538,133 @@ def test_reconcile_release_human_approval_block_returns_issue_to_verified(tmp_pa
     assert issue["current_session_id"] == ""
 
 
+def test_submit_artifact_release_result_normalizes_human_approval_block_reason(tmp_path: Path) -> None:
+    _ingest_issue_packet_text(tmp_path, "52", SAMPLE_ISSUE_PACKET.replace('"42"', '"52"').replace("issue-42", "issue-52"))
+
+    persisted = orchestrator_supervisor.submit_artifact(
+        base_dir=tmp_path,
+        issue_number="52",
+        artifact_kind="release_result",
+        payload={
+            "status": "blocked",
+            "blocked_reason": "approval_override_mode is none",
+            "next_recommended_step": "wait for approval and retry release",
+            "retryable": True,
+        },
+        updated_at="2026-05-08T10:00:00+08:00",
+    )
+
+    assert persisted["blocked_reason"] == "release_human_approval_missing"
+    assert persisted["failure_kind"] == "human_approval_pending"
+
+    issue = read_issue(tmp_path, "52")
+    artifact_status = _artifact_status(issue)
+    release_snapshot = cast(dict[str, object], artifact_status["release_result"])
+    assert release_snapshot["blocked_reason"] == "release_human_approval_missing"
+    merge_gate = cast(dict[str, object], release_snapshot["merge_gate"])
+    assert merge_gate["approval_state"] == "missing"
+    assert merge_gate["blocked_reason"] == "release_human_approval_missing"
+
+
+def test_submit_artifact_release_result_blocked_requires_next_step(tmp_path: Path) -> None:
+    _ingest_issue_packet_text(tmp_path, "53", SAMPLE_ISSUE_PACKET.replace('"42"', '"53"').replace("issue-42", "issue-53"))
+
+    try:
+        orchestrator_supervisor.submit_artifact(
+            base_dir=tmp_path,
+            issue_number="53",
+            artifact_kind="release_result",
+            payload={
+                "status": "blocked",
+                "blocked_reason": "pr_not_mergeable",
+            },
+            updated_at="2026-05-08T10:01:00+08:00",
+        )
+        assert False, "expected ValueError for missing next_recommended_step"
+    except ValueError as error:
+        assert "next_recommended_step" in str(error)
+
+
+def test_submit_artifact_release_result_normalizes_merge_gate_and_hygiene(tmp_path: Path) -> None:
+    _ingest_issue_packet_text(tmp_path, "54", SAMPLE_ISSUE_PACKET.replace('"42"', '"54"').replace("issue-42", "issue-54"))
+
+    persisted = orchestrator_supervisor.submit_artifact(
+        base_dir=tmp_path,
+        issue_number="54",
+        artifact_kind="release_result",
+        payload={
+            "status": "blocked",
+            "blocked_reason": "required_checks_pending",
+            "next_recommended_step": "wait checks and retry release",
+            "retryable": True,
+        },
+        updated_at="2026-05-08T10:02:00+08:00",
+    )
+
+    merge_gate = cast(dict[str, object], persisted["merge_gate"])
+    assert merge_gate["checks_state"] == "pending"
+    assert merge_gate["mergeability_state"] == "clean"
+    assert merge_gate["approval_state"] == "satisfied"
+
+    workspace_hygiene = cast(dict[str, object], persisted["workspace_hygiene"])
+    assert workspace_hygiene["cleanup_status"] == "pass"
+    assert workspace_hygiene["blocked_reason"] == "none"
+    assert persisted["retryable"] is True
+
+
+def test_submit_artifact_release_result_defaults_retryable_false_for_non_transient_blocker(tmp_path: Path) -> None:
+    _ingest_issue_packet_text(tmp_path, "56", SAMPLE_ISSUE_PACKET.replace('"42"', '"56"').replace("issue-42", "issue-56"))
+
+    persisted = orchestrator_supervisor.submit_artifact(
+        base_dir=tmp_path,
+        issue_number="56",
+        artifact_kind="release_result",
+        payload={
+            "status": "blocked",
+            "blocked_reason": "policy_blocked",
+            "next_recommended_step": "manual policy decision",
+        },
+        updated_at="2026-05-08T10:04:00+08:00",
+    )
+
+    assert persisted["retryable"] is False
+
+
+def test_inspect_control_plane_includes_release_gate_view(tmp_path: Path) -> None:
+    _ingest_issue_packet_text(tmp_path, "55", SAMPLE_ISSUE_PACKET.replace('"42"', '"55"').replace("issue-42", "issue-55"))
+    _submit_artifact(
+        tmp_path,
+        issue_number="55",
+        artifact_kind="release_result",
+        payload={
+            "status": "blocked",
+            "blocked_reason": "pr_not_mergeable",
+            "next_recommended_step": "rebase branch and retry release",
+            "retryable": True,
+        },
+        updated_at="2026-05-08T10:03:00+08:00",
+    )
+
+    output = io.StringIO()
+    with redirect_stdout(output):
+        exit_code = orchestrator_supervisor.main([
+            "inspect",
+            "--base-dir",
+            str(tmp_path),
+            "--issue-number",
+            "55",
+        ])
+
+    payload = cast(dict[str, object], json.loads(output.getvalue()))
+    release_gate = cast(dict[str, object], payload["releaseGate"])
+    merge_gate = cast(dict[str, object], release_gate["merge_gate"])
+
+    assert exit_code == 0
+    assert release_gate["status"] == "blocked"
+    assert release_gate["blocked_reason"] == "pr_not_mergeable"
+    assert merge_gate["mergeability_state"] == "conflicted"
+
+
 def test_reconcile_late_successful_release_result_recovers_failed_issue_to_completed(tmp_path: Path):
     issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
@@ -6723,7 +7076,16 @@ def test_inspect_command_prints_control_plane_snapshot(tmp_path: Path, monkeypat
     issue_column_names = [str(column["name"]) for column in issue_columns]
 
     assert exit_code == 0
-    assert set(payload) == {"schema", "issue", "latestDecision", "latestGitHubSyncAttempt", "releaseChildSession", "latestReleaseChildSession", "releaseBackfill"}
+    assert set(payload) == {
+        "schema",
+        "issue",
+        "latestDecision",
+        "latestGitHubSyncAttempt",
+        "releaseGate",
+        "releaseChildSession",
+        "latestReleaseChildSession",
+        "releaseBackfill",
+    }
     assert schema["dbPath"] == str(tmp_path / ".opencode/runtime/control-plane.sqlite3")
     assert "artifact_refs_json" in issue_column_names
     assert "artifact_status_json" in issue_column_names

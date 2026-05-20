@@ -29,6 +29,7 @@ TransitionIssueState = Callable[..., None]
 ReleaseIssueExecution = Callable[..., None]
 SyncLocalMainAfterReleaseMerge = Callable[..., str]
 CloseGitHubIssueAfterReleaseMerge = Callable[..., str]
+CleanupIssueWorktreeAfterReleaseMerge = Callable[..., str]
 
 
 READY_FOR_AGENT_LABEL = "ready-for-agent"
@@ -350,6 +351,70 @@ def close_github_issue_after_release_merge(
     return error
 
 
+def cleanup_issue_worktree_after_release_merge(
+    *,
+    base_dir: Path,
+    issue_number: str,
+    updated_at: str | None = None,
+) -> str:
+    timestamp = updated_at or ""
+    issue = read_issue(base_dir, issue_number) or {}
+    release_result = read_artifact_fact(base_dir, issue_number, "release_result")
+    if not bool(release_result.get("parse_ok")):
+        return ""
+
+    status = str(release_result.get("status") or "").strip().lower()
+    if status not in {"success", "completed"}:
+        return ""
+
+    merge_payload_raw = release_result.get("merge")
+    merge_payload = cast(dict[str, object], merge_payload_raw) if isinstance(merge_payload_raw, dict) else {}
+    merged = bool(release_result.get("merged")) or bool(merge_payload.get("merged")) or bool(
+        str(merge_payload.get("merged_sha") or "")
+    )
+    if not merged:
+        return ""
+
+    issue_worktree_path = str((read_runtime_context(base_dir, issue_number) or {}).get("issue_worktree_path") or "").strip()
+    if not issue_worktree_path:
+        return ""
+
+    worktree_path = Path(issue_worktree_path)
+    if worktree_path == base_dir:
+        return ""
+
+    if not worktree_path.exists():
+        _ = sync_issue_runtime_context(
+            base_dir,
+            issue_number=issue_number,
+            updated_at=timestamp,
+            runtime_context={"issue_worktree_path": ""},
+            worktree_path="",
+        )
+        return ""
+
+    completed = subprocess.run(
+        ["git", "worktree", "remove", str(worktree_path), "--force"],
+        cwd=base_dir,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        return (completed.stderr or completed.stdout).strip() or (
+            f"failed issue worktree cleanup after release merge for issue #{issue_number}"
+        )
+
+    _ = sync_issue_runtime_context(
+        base_dir,
+        issue_number=issue_number,
+        updated_at=timestamp,
+        runtime_context={"issue_worktree_path": ""},
+        worktree_path="",
+    )
+    return ""
+
+
 def claim_issue_execution(
     *,
     base_dir: Path,
@@ -417,6 +482,7 @@ def release_issue_execution(
     sync_progress_label: SyncProgressLabel,
     sync_local_main_after_release_merge: SyncLocalMainAfterReleaseMerge,
     close_github_issue_after_release_merge: CloseGitHubIssueAfterReleaseMerge,
+    cleanup_issue_worktree_after_release_merge: CleanupIssueWorktreeAfterReleaseMerge,
     transition_state: TransitionIssueState,
     rollback_reason: str = "",
     final_state: str | None = None,
@@ -485,6 +551,24 @@ def release_issue_execution(
                 updated_at=timestamp,
             )
             raise RuntimeError(close_error)
+
+        cleanup_error = cleanup_issue_worktree_after_release_merge(
+            base_dir=base_dir,
+            issue_number=issue_number,
+            updated_at=timestamp,
+        )
+        if cleanup_error:
+            record_admin_decision(
+                base_dir,
+                command_id=f"{command_id}:admin-issue-worktree-cleanup-failed",
+                issue_number=issue_number,
+                decision_type="admin_issue_worktree_cleanup_failure",
+                from_state=current_state,
+                to_state=current_state,
+                reason=cleanup_error,
+                updated_at=timestamp,
+            )
+            raise RuntimeError(cleanup_error)
 
     if target_state == "ready" and current_state in {"ready", "claimed", "dispatching"}:
         clear_issue_execution_claim_projection(base_dir=base_dir, issue_number=issue_number, updated_at=timestamp)

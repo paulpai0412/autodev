@@ -252,10 +252,18 @@ def _artifact_status_snapshot(
             }
         )
     elif artifact_kind == "release_result":
+        merge_gate_raw = parsed.get("merge_gate")
+        merge_gate = cast(dict[str, object], merge_gate_raw) if isinstance(merge_gate_raw, dict) else {}
+        workspace_hygiene_raw = parsed.get("workspace_hygiene")
+        workspace_hygiene = (
+            cast(dict[str, object], workspace_hygiene_raw) if isinstance(workspace_hygiene_raw, dict) else {}
+        )
         snapshot.update(
             {
                 "status": str(parsed.get("status") or ""),
                 "blocked_reason": str(parsed.get("blocked_reason") or ""),
+                "merge_gate": merge_gate,
+                "workspace_hygiene": workspace_hygiene,
             }
         )
     return snapshot
@@ -368,7 +376,97 @@ def _validated_artifact_payload(*, artifact_kind: str, payload: JsonObject) -> J
         if not branch:
             raise ValueError("worker_result payload requires non-empty string field 'branch'")
 
+    if artifact_kind == "release_result":
+        blocked_reason_aliases = {
+            "human_approval_required": "release_human_approval_missing",
+            "approval_override_mode is none": "release_human_approval_missing",
+        }
+        blocked_reason = str(normalized_payload.get("blocked_reason") or "").strip().lower()
+        blocked_reason = blocked_reason_aliases.get(blocked_reason, blocked_reason)
+        if blocked_reason:
+            normalized_payload["blocked_reason"] = blocked_reason
+
+        failure_kind = str(normalized_payload.get("failure_kind") or "").strip().lower()
+        if not failure_kind and blocked_reason:
+            if blocked_reason == "release_human_approval_missing":
+                normalized_payload["failure_kind"] = "human_approval_pending"
+            else:
+                normalized_payload["failure_kind"] = blocked_reason
+
+        if status in {"blocked", "fail", "failed"}:
+            if not blocked_reason:
+                raise ValueError("release_result payload requires non-empty string field 'blocked_reason' when status is blocked/failed")
+            next_recommended_step = str(normalized_payload.get("next_recommended_step") or "").strip()
+            if not next_recommended_step:
+                raise ValueError(
+                    "release_result payload requires non-empty string field 'next_recommended_step' when status is blocked/failed"
+                )
+
+        merge_gate_raw = normalized_payload.get("merge_gate")
+        merge_gate = cast(dict[str, object], merge_gate_raw) if isinstance(merge_gate_raw, dict) else {}
+        checks_state = str(merge_gate.get("checks_state") or "").strip().lower()
+        if not checks_state:
+            checks_state = (
+                "pending"
+                if blocked_reason == "required_checks_pending"
+                else "failed"
+                if blocked_reason == "required_checks_failed"
+                else "passed"
+            )
+        mergeability_state = str(merge_gate.get("mergeability_state") or "").strip().lower()
+        if not mergeability_state:
+            mergeability_state = "conflicted" if blocked_reason == "pr_not_mergeable" else "clean"
+        approval_state = str(merge_gate.get("approval_state") or "").strip().lower()
+        if not approval_state:
+            approval_state = "missing" if blocked_reason == "release_human_approval_missing" else "satisfied"
+        normalized_payload["merge_gate"] = {
+            "checks_state": checks_state,
+            "mergeability_state": mergeability_state,
+            "approval_state": approval_state,
+            "blocked_reason": blocked_reason or "none",
+            "next_action": str(normalized_payload.get("next_recommended_step") or "").strip(),
+        }
+
+        retryable_raw = normalized_payload.get("retryable")
+        if retryable_raw is None:
+            normalized_payload["retryable"] = blocked_reason in TRANSIENT_RELEASE_BLOCKERS or blocked_reason == "release_human_approval_missing"
+
+        workspace_hygiene_raw = normalized_payload.get("workspace_hygiene")
+        workspace_hygiene = (
+            cast(dict[str, object], workspace_hygiene_raw) if isinstance(workspace_hygiene_raw, dict) else {}
+        )
+        cleanup_status = str(workspace_hygiene.get("cleanup_status") or "").strip().lower()
+        if not cleanup_status:
+            cleanup_status = "blocked" if blocked_reason == "workspace_hygiene_failed" else "pass"
+        normalized_payload["workspace_hygiene"] = {
+            "cleanup_status": cleanup_status,
+            "blocked_reason": str(workspace_hygiene.get("blocked_reason") or (blocked_reason if cleanup_status == "blocked" else "none")),
+            "primary_workspace_branch_before": str(workspace_hygiene.get("primary_workspace_branch_before") or ""),
+            "primary_workspace_branch_after": str(workspace_hygiene.get("primary_workspace_branch_after") or ""),
+            "dirty_state_detected": bool(workspace_hygiene.get("dirty_state_detected") or False),
+            "workspace_clean_after": bool(workspace_hygiene.get("workspace_clean_after") or False),
+            "issue_worktree_removed": str(workspace_hygiene.get("issue_worktree_removed") or ""),
+        }
+
     return normalized_payload
+
+
+def _release_gate_view(base_dir: Path, issue_number: str) -> JsonObject:
+    release_result = read_artifact_fact(base_dir, issue_number, "release_result")
+    if not bool(release_result.get("parse_ok")):
+        return {}
+    merge_gate_raw = release_result.get("merge_gate")
+    merge_gate = cast(dict[str, object], merge_gate_raw) if isinstance(merge_gate_raw, dict) else {}
+    workspace_hygiene_raw = release_result.get("workspace_hygiene")
+    workspace_hygiene = cast(dict[str, object], workspace_hygiene_raw) if isinstance(workspace_hygiene_raw, dict) else {}
+    return {
+        "status": str(release_result.get("status") or ""),
+        "blocked_reason": str(release_result.get("blocked_reason") or ""),
+        "failure_kind": str(release_result.get("failure_kind") or ""),
+        "next_recommended_step": str(release_result.get("next_recommended_step") or ""),
+        "merge_gate": merge_gate,
+        "workspace_hygiene": workspace_hygiene,
+    }
 
 
 def _load_session_helpers() -> ModuleType:
@@ -2224,6 +2322,9 @@ def release_issue_execution(
         sync_progress_label=_sync_issue_progress_label,
         sync_local_main_after_release_merge=cast(Callable[..., str], _lifecycle_helpers.sync_local_main_after_release_merge),
         close_github_issue_after_release_merge=_close_github_issue_after_release_merge,
+        cleanup_issue_worktree_after_release_merge=cast(
+            Callable[..., str], _lifecycle_helpers.cleanup_issue_worktree_after_release_merge
+        ),
         transition_state=_transition_issue_state_if_possible,
         rollback_reason=rollback_reason,
         final_state=final_state,
@@ -2906,6 +3007,7 @@ def inspect_control_plane(
         "issue": read_issue(base_dir, issue_number) or {},
         "latestDecision": read_latest_decision(base_dir, issue_number) or {},
         "latestGitHubSyncAttempt": read_latest_github_sync_attempt(base_dir, issue_number) or {},
+        "releaseGate": _release_gate_view(base_dir, issue_number),
         "releaseChildSession": read_release_child_session(base_dir, issue_number),
         "latestReleaseChildSession": read_latest_ref(base_dir, issue_number, "release_child_session"),
         "releaseBackfill": {
