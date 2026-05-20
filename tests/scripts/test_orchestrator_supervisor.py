@@ -102,7 +102,9 @@ from scripts.orchestrator_supervisor import (
     parse_issue_packet_text,
     reconcile_ledger,
     run_issue_packet_intake,
+    select_issue_candidates_for_capacity,
     select_next_issue_packet,
+    select_next_issue_candidate,
     validate_session_request_for_dispatch,
 )
 
@@ -178,6 +180,9 @@ def successful_host_adapter(
             resume_hint=resume_hint,
             resume_command=resume_command or f"opencode --session {session_id}",
             readability_status=readability_status,
+            tui_resume_command="/sessions",
+            stop_continuation_status="root_session_detached",
+            stop_continuation_attempts=0,
             metadata=metadata
             or {"tuiResumeCommand": "/sessions", "stopContinuationStatus": "root_session_detached", "stopContinuationAttempts": 0},
         )
@@ -2127,6 +2132,33 @@ def test_validate_session_request_rejects_stale_revision(tmp_path: Path):
     assert "stale request revision" in error
 
 
+def test_validate_session_request_rejects_stale_issue_or_branch(tmp_path: Path):
+    issue_packet_path = tmp_path / "docs/agents/issue-packets/issue-42.yaml"
+    issue_packet_path.parent.mkdir(parents=True, exist_ok=True)
+    issue_packet_path.write_text(SAMPLE_ISSUE_PACKET, encoding="utf-8")
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    request = build_orchestrator_request(ledger)
+
+    stale_issue_request = cast(dict[str, object], dict(request))
+    stale_issue_request["issueNumber"] = "41"
+    issue_error = validate_session_request_for_dispatch(
+        cast(orchestrator_supervisor.SessionRequest, stale_issue_request),
+        ledger,
+        base_dir=tmp_path,
+    )
+    assert "stale request issue #41" in issue_error
+
+    stale_branch_request = cast(dict[str, object], dict(request))
+    stale_branch_request["branch"] = "agent/issue-42-alt"
+    branch_error = validate_session_request_for_dispatch(
+        cast(orchestrator_supervisor.SessionRequest, stale_branch_request),
+        ledger,
+        base_dir=tmp_path,
+    )
+    assert "stale request branch agent/issue-42-alt" in branch_error
+
+
 def test_validate_session_request_allows_recovery_request_with_selected_next_issue(tmp_path: Path):
     issue_packets_dir = tmp_path / "docs/agents/issue-packets"
     issue_packets_dir.mkdir(parents=True, exist_ok=True)
@@ -2152,18 +2184,9 @@ def test_validate_session_request_allows_recovery_request_with_selected_next_iss
     ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00",)
     ledger["current"] = {"role": "main_orchestrator", "stage": "issue_selection_or_recovery", "status": "queued"}
     ledger["queuedNextIssue"] = {
-        "selectedAt": "2026-05-07T17:20:00+08:00",
-        "reason": "Release worker completed issue #31.",
-        "record": {
-            "issue_number": next_issue_packet.issue_number,
-            "title": next_issue_packet.title,
-            "branch": next_issue_packet.branch,
-            "backing_type": next_issue_packet.backing_type,
-            "prior_handoff": next_issue_packet.prior_handoff,
-            "labels": list(next_issue_packet.labels),
-            "parent_reference": next_issue_packet.parent_reference,
-            "dependencies": list(next_issue_packet.dependencies),
-        },
+        "issue_number": next_issue_packet.issue_number,
+        "branch": next_issue_packet.branch,
+        "base_branch": next_issue_packet.base_branch,
     }
     request = build_session_request(
         ledger,
@@ -2179,7 +2202,84 @@ def test_validate_session_request_allows_recovery_request_with_selected_next_iss
     assert error == ""
     assert request.get("selectedIssueNumber") == "32"
     assert request.get("selectedIssueBranch") == "agent/issue-32-demo"
+    assert "selectedIssueBaseBranch" not in request
     assert "selectedIssuePacketPath" not in request
+
+
+def test_sync_runtime_phase_metadata_clears_stale_queued_next_issue_projection(tmp_path: Path) -> None:
+    orchestrator_supervisor._sync_runtime_phase_metadata(
+        base_dir=tmp_path,
+        issue_number="42",
+        current={"role": "main_orchestrator", "stage": "issue_selection_or_recovery", "status": "queued"},
+        attempts={"main_orchestrator": 1},
+        limits={"main_orchestrator": 3},
+        last_failure={},
+        workflow={},
+        automation={},
+        artifacts={},
+        queued_next_issue={"issue_number": "43", "branch": "agent/issue-43-demo", "base_branch": "main"},
+        updated_at="2026-05-07T17:00:00+08:00",
+    )
+
+    with_queued_next_issue = orchestrator_supervisor.read_runtime_context(tmp_path, "42")
+    assert cast(dict[str, object], with_queued_next_issue).get("queuedNextIssue") is not None
+
+    orchestrator_supervisor._sync_runtime_phase_metadata(
+        base_dir=tmp_path,
+        issue_number="42",
+        current={"role": "main_orchestrator", "stage": "issue_selection_or_recovery", "status": "queued"},
+        attempts={"main_orchestrator": 1},
+        limits={"main_orchestrator": 3},
+        last_failure={},
+        workflow={},
+        automation={},
+        artifacts={},
+        updated_at="2026-05-07T17:01:00+08:00",
+    )
+
+    without_queued_next_issue = orchestrator_supervisor.read_runtime_context(tmp_path, "42")
+    assert "queuedNextIssue" not in cast(dict[str, object], without_queued_next_issue)
+
+
+def test_validate_session_request_allows_recovery_request_with_legacy_record_shaped_queued_next_issue(tmp_path: Path):
+    issue_packets_dir = tmp_path / "docs/agents/issue-packets"
+    issue_packets_dir.mkdir(parents=True, exist_ok=True)
+    issue_31 = issue_packets_dir / "issue-31.yaml"
+    issue_32 = issue_packets_dir / "issue-32.yaml"
+    issue_31.write_text(
+        SAMPLE_ISSUE_PACKET.replace('"42"', '"31"').replace('issue-42', 'issue-31').replace('Demo issue', 'Issue 31').replace('agent/issue-42-demo', 'agent/issue-31-demo'),
+        encoding="utf-8",
+    )
+    issue_32.write_text(
+        SAMPLE_ISSUE_PACKET.replace('"42"', '"32"').replace('issue-42', 'issue-32').replace('Demo issue', 'Issue 32').replace('agent/issue-42-demo', 'agent/issue-32-demo'),
+        encoding="utf-8",
+    )
+
+    issue_packet = parse_issue_packet_text(issue_31.read_text(encoding="utf-8"), "docs/agents/issue-packets/issue-31.yaml")
+    next_issue_packet = parse_issue_packet_text(issue_32.read_text(encoding="utf-8"), "docs/agents/issue-packets/issue-32.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00",)
+    ledger["current"] = {"role": "main_orchestrator", "stage": "issue_selection_or_recovery", "status": "queued"}
+    ledger["queuedNextIssue"] = {
+        "record": {
+            "issue_number": next_issue_packet.issue_number,
+            "branch": next_issue_packet.branch,
+            "base_branch": next_issue_packet.base_branch,
+        }
+    }
+    request = build_session_request(
+        ledger,
+        role="main_orchestrator",
+        stage="issue_selection_or_recovery",
+        reason="main_orchestrator recovery for issue #31",
+        title="Recover or continue after issue #31",
+        decision_summary="Consume preselected issue #32.",
+    )
+
+    error = validate_session_request_for_dispatch(request, ledger, base_dir=tmp_path)
+
+    assert error == ""
+    assert request.get("selectedIssueNumber") == "32"
+    assert request.get("selectedIssueBranch") == "agent/issue-32-demo"
 
 
 def test_reconcile_verifier_fail_routes_back_to_issue_worker(tmp_path: Path):
@@ -2646,8 +2746,8 @@ implementation_notes:
 
     selected = select_next_issue_packet(
         tmp_path,
-        workflow={},
-        current_issue={"number": "30", "parentReference": "https://github.com/example/issues/1"},
+        current_issue_number="30",
+        current_parent_reference="https://github.com/example/issues/1",
     )
 
     assert selected is None
@@ -2668,12 +2768,38 @@ def test_select_next_issue_packet_skips_issue_with_execution_lock(tmp_path: Path
     _ingest_issue_packet_text(tmp_path, "31", (packets_dir / "issue-31.yaml").read_text(encoding="utf-8"))
     selected = select_next_issue_packet(
         tmp_path,
-        workflow={},
-        current_issue={"number": "30", "parentReference": "https://github.com/example/issues/1"},
+        current_issue_number="30",
+        current_parent_reference="https://github.com/example/issues/1",
     )
 
     assert selected is not None
     assert selected.issue_number == "31"
+
+
+def test_select_next_issue_candidate_returns_compact_candidate_shape(tmp_path: Path):
+    packets_dir = tmp_path / "docs/agents/issue-packets"
+    packets_dir.mkdir(parents=True, exist_ok=True)
+    (packets_dir / "issue-30.yaml").write_text(
+        SAMPLE_ISSUE_PACKET.replace('"42"', '"30"').replace('issue-42', 'issue-30').replace('Demo issue', 'Issue 30').replace('agent/issue-42-demo', 'agent/issue-30-demo'),
+        encoding="utf-8",
+    )
+    (packets_dir / "issue-31.yaml").write_text(
+        SAMPLE_ISSUE_PACKET.replace('"42"', '"31"').replace('issue-42', 'issue-31').replace('Demo issue', 'Issue 31').replace('agent/issue-42-demo', 'agent/issue-31-demo'),
+        encoding="utf-8",
+    )
+    _ingest_issue_packet_text(tmp_path, "30", (packets_dir / "issue-30.yaml").read_text(encoding="utf-8"))
+    _ingest_issue_packet_text(tmp_path, "31", (packets_dir / "issue-31.yaml").read_text(encoding="utf-8"))
+
+    selected = select_next_issue_candidate(
+        tmp_path,
+        current_issue_number="30",
+        current_parent_reference="https://github.com/example/issues/1",
+    )
+
+    assert selected is not None
+    assert selected.issue_number == "31"
+    assert selected.branch == "agent/issue-31-demo"
+    assert not hasattr(selected, "title")
 
 
 def test_select_next_issue_packet_skips_issue_marked_in_flight_in_control_plane_db(tmp_path: Path):
@@ -2699,8 +2825,8 @@ def test_select_next_issue_packet_skips_issue_marked_in_flight_in_control_plane_
 
     selected = select_next_issue_packet(
         tmp_path,
-        workflow={},
-        current_issue={"number": "30", "parentReference": "https://github.com/example/issues/1"},
+        current_issue_number="30",
+        current_parent_reference="https://github.com/example/issues/1",
     )
 
     assert selected is None
@@ -2729,8 +2855,8 @@ def test_select_next_issue_packet_skips_issue_marked_quarantined_in_control_plan
 
     selected = select_next_issue_packet(
         tmp_path,
-        workflow={},
-        current_issue={"number": "30", "parentReference": "https://github.com/example/issues/1"},
+        current_issue_number="30",
+        current_parent_reference="https://github.com/example/issues/1",
     )
 
     assert selected is None
@@ -2757,8 +2883,8 @@ def test_select_next_issue_packet_prefers_highest_db_ranked_ready_issue(tmp_path
 
     selected = select_next_issue_packet(
         tmp_path,
-        workflow={},
-        current_issue={"number": "30", "parentReference": "https://github.com/example/issues/1"},
+        current_issue_number="30",
+        current_parent_reference="https://github.com/example/issues/1",
     )
 
     assert selected is not None
@@ -2793,8 +2919,8 @@ def test_select_next_issue_packet_downgrades_stale_db_rank_for_now_ineligible_is
 
     selected = select_next_issue_packet(
         tmp_path,
-        workflow={},
-        current_issue={"number": "30", "parentReference": "https://github.com/example/issues/1"},
+        current_issue_number="30",
+        current_parent_reference="https://github.com/example/issues/1",
     )
     issue = orchestrator_supervisor.read_issue(tmp_path, "32")
 
@@ -2820,8 +2946,8 @@ def test_select_next_issue_packet_skips_db_packet_when_local_file_is_missing(tmp
 
     selected = select_next_issue_packet(
         tmp_path,
-        workflow={},
-        current_issue={"number": "30", "parentReference": "https://github.com/example/issues/1"},
+        current_issue_number="30",
+        current_parent_reference="https://github.com/example/issues/1",
     )
 
     assert selected is not None
@@ -2831,8 +2957,8 @@ def test_select_next_issue_packet_skips_db_packet_when_local_file_is_missing(tmp
 
     selected_after_delete = select_next_issue_packet(
         tmp_path,
-        workflow={},
-        current_issue={"number": "30", "parentReference": "https://github.com/example/issues/1"},
+        current_issue_number="30",
+        current_parent_reference="https://github.com/example/issues/1",
     )
     issue_31 = orchestrator_supervisor.read_issue(tmp_path, "31")
 
@@ -2992,19 +3118,59 @@ def test_select_issue_packets_for_capacity_respects_development_slot_limit(tmp_p
 
     assert orchestrator_supervisor.select_issue_packets_for_capacity(
         tmp_path,
-        workflow={},
-        current_issue={"number": "30", "parentReference": "https://github.com/example/issues/1"},
+        current_issue_number="30",
+        current_parent_reference="https://github.com/example/issues/1",
         development_capacity=1,
     ) == []
 
     selected = orchestrator_supervisor.select_issue_packets_for_capacity(
         tmp_path,
-        workflow={},
-        current_issue={"number": "30", "parentReference": "https://github.com/example/issues/1"},
+        current_issue_number="30",
+        current_parent_reference="https://github.com/example/issues/1",
         development_capacity=2,
     )
 
     assert [packet.issue_number for packet in selected] == ["32"]
+
+
+def test_select_issue_candidates_for_capacity_respects_development_slot_limit(tmp_path: Path):
+    packets_dir = tmp_path / "docs/agents/issue-packets"
+    packets_dir.mkdir(parents=True, exist_ok=True)
+    for issue_number in ("30", "31", "32"):
+        packet_text = (
+            SAMPLE_ISSUE_PACKET.replace('"42"', f'"{issue_number}"')
+            .replace('issue-42', f'issue-{issue_number}')
+            .replace('Demo issue', f'Issue {issue_number}')
+            .replace('agent/issue-42-demo', f'agent/issue-{issue_number}-demo')
+        )
+        packet_path = packets_dir / f"issue-{issue_number}.yaml"
+        packet_path.write_text(packet_text, encoding="utf-8")
+        _ingest_issue_packet_text(tmp_path, issue_number, packet_text)
+
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="31",
+        state="running",
+        command_id="cmd-running-31",
+        updated_at="2026-05-07T17:00:00+08:00",
+    )
+
+    assert select_issue_candidates_for_capacity(
+        tmp_path,
+        current_issue_number="30",
+        current_parent_reference="https://github.com/example/issues/1",
+        development_capacity=1,
+    ) == []
+
+    selected = select_issue_candidates_for_capacity(
+        tmp_path,
+        current_issue_number="30",
+        current_parent_reference="https://github.com/example/issues/1",
+        development_capacity=2,
+    )
+
+    assert [candidate.issue_number for candidate in selected] == ["32"]
+    assert [candidate.branch for candidate in selected] == ["agent/issue-32-demo"]
 
 
 def test_select_issue_packets_for_capacity_does_not_count_release_pending_against_development(tmp_path: Path):
@@ -3039,8 +3205,8 @@ def test_select_issue_packets_for_capacity_does_not_count_release_pending_agains
 
     selected = orchestrator_supervisor.select_issue_packets_for_capacity(
         tmp_path,
-        workflow={},
-        current_issue={"number": "30", "parentReference": "https://github.com/example/issues/1"},
+        current_issue_number="30",
+        current_parent_reference="https://github.com/example/issues/1",
         development_capacity=1,
     )
 
@@ -4005,6 +4171,7 @@ def test_dispatch_session_request_retries_without_source_session_on_prefill_erro
                 SessionStartResult(
                     status="error",
                     error="Bad Request: This model does not support assistant message prefill. The conversation must end with a user message.",
+                    retry_without_source_session=True,
                     metadata={"retryWithoutSourceSession": True},
                 )
             )
@@ -4017,6 +4184,7 @@ def test_dispatch_session_request_retries_without_source_session_on_prefill_erro
                 return SessionStartResult(
                     status="error",
                     error="Bad Request: This model does not support assistant message prefill. The conversation must end with a user message.",
+                    retry_without_source_session=True,
                     metadata={"retryWithoutSourceSession": True},
                 )
             return SessionStartResult(
@@ -4025,6 +4193,9 @@ def test_dispatch_session_request_retries_without_source_session_on_prefill_erro
                 resume_hint="resume in host",
                 resume_command="opencode --session ses-retried",
                 readability_status="verified_same_repo_probe",
+                tui_resume_command="/sessions",
+                stop_continuation_status="root_session_detached",
+                stop_continuation_attempts=0,
                 metadata={"tuiResumeCommand": "/sessions", "stopContinuationStatus": "root_session_detached", "stopContinuationAttempts": 0},
             )
 
@@ -4316,18 +4487,9 @@ def test_dispatch_allows_main_orchestrator_recovery_for_failed_issue_without_cla
         updated_at="2026-05-07T17:00:00+08:00",
     )
     queued_next_issue: dict[str, object] = {
-        "selectedAt": "2026-05-07T17:10:00+08:00",
-        "reason": "Continue recovery on the current failed issue.",
-        "record": {
-            "issue_number": "42",
-            "title": "Demo issue",
-            "branch": "agent/issue-42-demo",
-            "backing_type": "github",
-            "prior_handoff": "docs/agents/handoffs/issue-41.yaml",
-            "labels": ["ready-for-agent"],
-            "parent_reference": "https://github.com/example/issues/1",
-            "dependencies": [],
-        },
+        "issue_number": "42",
+        "branch": "agent/issue-42-demo",
+        "base_branch": "main",
     }
     orchestrator_supervisor._sync_runtime_phase_metadata(
         base_dir=tmp_path,
@@ -4642,94 +4804,6 @@ next_recommended_step: \"Release it\"
     assert decision["next_role"] == "pr_verifier"
     assert cast(dict[str, object], updated_ledger["lastFailure"])["kind"] == "contract_invalid"
     assert "ended without recording evidence_packet in SQLite" in cast(str, decision["summary"])
-
-
-def test_reconcile_verifier_keeps_recently_queued_dispatch_without_evidence(tmp_path: Path):
-    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
-    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
-    ledger["current"] = {"role": "pr_verifier", "stage": "pr_verifier_execution", "status": "queued"}
-    cast(dict[str, str], ledger["artifacts"])["evidence_packet_ref"] = "docs/agents/evidence/issue-42-pr-77.yaml"
-
-    orchestrator_supervisor.ensure_issue_row(tmp_path, issue_number="42", updated_at="2026-05-07T17:09:00+08:00")
-    orchestrator_supervisor._record_runtime_transition_history(
-        base_dir=tmp_path,
-        issue_number="42",
-        recorded_at="2026-05-07T17:11:00+08:00",
-        from_role="issue_worker",
-        from_stage="issue_worker_execution",
-        to_role="pr_verifier",
-        to_stage="pr_verifier_execution",
-        reason="Issue worker succeeded and queued pr_verifier.",
-    )
-
-    attempts = cast(dict[str, int], ledger["attempts"])
-    attempts["pr_verifier"] = 1
-
-    with patch("scripts.orchestrator_supervisor._read_db_artifact_fact", return_value={}):
-        updated_ledger, decision, request = reconcile_ledger(
-            ledger,
-            artifact_base_dir=tmp_path,
-            updated_at="2026-05-07T17:11:10+08:00",
-        )
-
-    assert updated_ledger is not None
-    assert decision["action"] == "no_change"
-    assert decision["next_role"] == "pr_verifier"
-    assert request is None
-    assert attempts["pr_verifier"] == 1
-    assert "is queued and SQLite has not recorded evidence_packet yet" in cast(str, decision["summary"])
-
-
-def test_reconcile_verifier_uses_history_fallback_when_artifact_snapshot_missing(tmp_path: Path):
-    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
-    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
-    ledger["current"] = {"role": "pr_verifier", "stage": "pr_verifier_execution", "status": "queued"}
-    cast(dict[str, str], ledger["artifacts"])["evidence_packet_ref"] = "docs/agents/evidence/issue-42-pr-77.yaml"
-
-    _submit_artifact(
-        tmp_path,
-        issue_number="42",
-        artifact_kind="evidence_packet",
-        payload={
-            "status": "pass",
-            "pr_number": "77",
-            "verifier_session_id": "ses-v",
-            "next_recommended_step": "Release it",
-            "failure_kind": "none",
-            "retryable": True,
-            "gates": {"surface_qa_gate": {"status": "pass", "evidence_ref": "db:evidence:42"}},
-        },
-        updated_at="2026-05-07T17:11:00+08:00",
-    )
-    orchestrator_supervisor.upsert_issue_state(
-        tmp_path,
-        issue_number="42",
-        state="running",
-        command_id="cmd-running",
-        updated_at="2026-05-07T17:09:00+08:00",
-        current_session_id="ses-root-42",
-    )
-
-    with patch("scripts.orchestrator_supervisor._read_db_artifact_fact", return_value={}):
-        updated_ledger, decision, request = reconcile_ledger(
-            ledger,
-            artifact_base_dir=tmp_path,
-            updated_at="2026-05-07T17:11:00+08:00",
-        )
-
-    issue = read_issue(tmp_path, "42")
-    latest_pr_opened = read_latest_issue_history(tmp_path, "42", entry_type="pr_opened")
-
-    assert updated_ledger is not None
-    assert decision["action"] == "release_waiting"
-    assert request is None
-    assert cast(dict[str, object], updated_ledger["lastFailure"])["kind"] == "none"
-    assert issue is not None
-    assert issue["state"] == "verified"
-    assert issue["current_session_id"] == "ses-v"
-    assert latest_pr_opened is not None
-    assert latest_pr_opened["status"] == "opened"
-    assert '"pr_number": "77"' in str(latest_pr_opened["body_text"])
 
 
 def test_reconcile_verifier_pass_without_evidence_pr_number_retries_verifier(tmp_path: Path):
@@ -5804,10 +5878,10 @@ def test_record_dispatch_result_history_does_not_collide_on_shared_source_sessio
 
     assert latest_42 is not None
     assert latest_43 is not None
-    assert latest_42["issueNumber"] == "42"
-    assert latest_42["error"] == "dispatch failed for 42"
-    assert latest_43["issueNumber"] == "43"
-    assert latest_43["error"] == "dispatch failed for 43"
+    assert latest_42.get("issueNumber") == "42"
+    assert latest_42.get("error") == "dispatch failed for 42"
+    assert latest_43.get("issueNumber") == "43"
+    assert latest_43.get("error") == "dispatch failed for 43"
 
 
 def test_start_issue_records_ready_rollback_reason_on_dispatch_error(tmp_path: Path):
@@ -6226,18 +6300,9 @@ def test_reconcile_recovery_consumes_persisted_selected_next_issue_before_resele
     ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00",)
     ledger["current"] = {"role": "main_orchestrator", "stage": "issue_selection_or_recovery", "status": "queued"}
     ledger["queuedNextIssue"] = {
-        "selectedAt": "2026-05-07T17:20:00+08:00",
-        "reason": "Release worker completed issue #31.",
-        "record": {
-            "issue_number": selected_issue_packet.issue_number,
-            "title": selected_issue_packet.title,
-            "branch": selected_issue_packet.branch,
-            "backing_type": selected_issue_packet.backing_type,
-            "prior_handoff": selected_issue_packet.prior_handoff,
-            "labels": list(selected_issue_packet.labels),
-            "parent_reference": selected_issue_packet.parent_reference,
-            "dependencies": list(selected_issue_packet.dependencies),
-        },
+        "issue_number": selected_issue_packet.issue_number,
+        "branch": selected_issue_packet.branch,
+        "base_branch": selected_issue_packet.base_branch,
     }
     orchestrator_supervisor.upsert_issue_state(
         tmp_path,
@@ -6295,18 +6360,9 @@ def test_reconcile_recovery_discards_persisted_selected_issue_when_it_is_no_long
     ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00",)
     ledger["current"] = {"role": "main_orchestrator", "stage": "issue_selection_or_recovery", "status": "queued"}
     ledger["queuedNextIssue"] = {
-        "selectedAt": "2026-05-07T17:20:00+08:00",
-        "reason": "Release worker completed issue #31.",
-        "record": {
-            "issue_number": stale_selected_issue_packet.issue_number,
-            "title": stale_selected_issue_packet.title,
-            "branch": stale_selected_issue_packet.branch,
-            "backing_type": stale_selected_issue_packet.backing_type,
-            "prior_handoff": stale_selected_issue_packet.prior_handoff,
-            "labels": list(stale_selected_issue_packet.labels),
-            "parent_reference": stale_selected_issue_packet.parent_reference,
-            "dependencies": list(stale_selected_issue_packet.dependencies),
-        },
+        "issue_number": stale_selected_issue_packet.issue_number,
+        "branch": stale_selected_issue_packet.branch,
+        "base_branch": stale_selected_issue_packet.base_branch,
     }
     orchestrator_supervisor.upsert_issue_state(
         tmp_path,

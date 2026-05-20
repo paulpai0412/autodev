@@ -17,10 +17,11 @@ from typing import cast
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from scripts import autodev_host_packaging
 from scripts.control_plane_db import canonical_control_plane_base_dir, ensure_control_plane_db
 from scripts.orchestrator_supervisor import show_latest_session
 from scripts.control_plane_db import list_issues
-from scripts.orchestrator_sessions import default_host_adapter
+from scripts.orchestrator_sessions import resolve_host_adapter
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -61,104 +62,25 @@ TRACKED_RUNTIME_BLOCK_PREFIX = "tracked autodev runtime files must be removed fr
 
 
 def _host_adapter():
-    return default_host_adapter()
+    return resolve_host_adapter()
 
 
 def _operator_entrypoints() -> dict[str, str]:
-    entrypoints = _host_adapter().operator_entrypoints()
-    return {str(key): str(value) for key, value in entrypoints.items()}
+    return autodev_host_packaging.host_packaging_config_from_adapter(
+        adapter=_host_adapter(),
+        fallback_commands_dir=Path.home() / ".config/opencode/commands",
+    ).entrypoints
 
 
 def _default_commands_dir() -> Path:
-    commands_dir = _host_adapter().capabilities().get("commands_dir")
-    if isinstance(commands_dir, str) and commands_dir:
-        return Path(commands_dir).expanduser()
-    return Path.home() / ".config/opencode/commands"
+    return autodev_host_packaging.host_packaging_config_from_adapter(
+        adapter=_host_adapter(),
+        fallback_commands_dir=Path.home() / ".config/opencode/commands",
+    ).commands_dir
 
 
 def _command_templates() -> dict[str, str]:
-    autodev_home = f'${{AUTODEV_HOME:-{ROOT}}}'
-    entrypoints = _operator_entrypoints()
-    start_filename = entrypoints.get("start", "autodev-start.md")
-    reconcile_filename = entrypoints.get("reconcile", "autodev-reconcile.md")
-    release_filename = entrypoints.get("release", "autodev-release.md")
-    inspect_filename = entrypoints.get("inspect", "autodev-show-session.md")
-    doctor_filename = entrypoints.get("doctor", "autodev-doctor.md")
-    return {
-        start_filename: f"""---
-description: Start autodev workflow for the current project and issue number
-agent: build
-subtask: false
----
-
-Run autodev for issue number `$ARGUMENTS` in the current project.
-
-1. Execute:
-!`AUTODEV_HOME="{autodev_home}" PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" start --project-root "$PWD" --issue-number "$1"`
-2. Report the DB-backed dispatch result, current root session, and next recommended action from the command output.
-
-Notes:
-- This is an autodev-owned global command. It discovers the target project from the current directory.
-- Override `AUTODEV_HOME` first if the shared workflow repo is not installed at `~/apps/autodev`.
-- Entrypoint: `scripts/autodev_project.py start`.
-""",
-        reconcile_filename: f"""---
-description: Reconcile autodev runtime state for the current project
-agent: build
-subtask: false
----
-
-Run:
-!`AUTODEV_HOME="{autodev_home}" PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" reconcile --project-root "$PWD"`
-
-Report the supervisor decision and whether it requires a subagent or fresh main orchestrator session.
-
-Set `AUTODEV_HOME` first if the shared workflow repo is not installed at `~/apps/autodev`.
-""",
-        release_filename: f"""---
-description: Launch independent autodev release worker for PR merge
-agent: build
-subtask: false
----
-
-Run the independent release path for issue number `$ARGUMENTS` in the current project. If no issue number is provided, autodev selects the first verified issue waiting for release.
-
-Run:
-!`AUTODEV_HOME="{autodev_home}" PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" release --project-root "$PWD" --issue-number "$1"`
-
-Report the DB-backed release dispatch result and the release_worker session to resume.
-
-Notes:
-- This is separate from `/autodev-reconcile` so human PR approval waits do not block development scheduling.
-- Entrypoint: `scripts/autodev_project.py release`.
-""",
-        inspect_filename: f"""---
-description: Show the latest autodev root session for the current project
-agent: build
-subtask: false
----
-
-Run:
-!`AUTODEV_HOME="{autodev_home}" PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" show-session --project-root "$PWD"`
-
-Report how to inspect or resume the latest root session.
-
-Set `AUTODEV_HOME` first if the shared workflow repo is not installed at `~/apps/autodev`.
-""",
-        doctor_filename: f"""---
-description: Check whether the current project is ready for autodev
-agent: build
-subtask: false
----
-
-Run:
-!`AUTODEV_HOME="{autodev_home}" PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" doctor --project-root "$PWD"`
-
-Report any missing config, runtime state, or command install problems.
-
-Set `AUTODEV_HOME` first if the shared workflow repo is not installed at `~/apps/autodev`.
-""",
-    }
+    return autodev_host_packaging.command_templates(root=ROOT, entrypoints=_operator_entrypoints())
 
 
 @dataclass

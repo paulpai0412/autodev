@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 import subprocess
+from datetime import datetime
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol
 
 from scripts.control_plane_db import available_development_slots, completed_issue_numbers, ingest_issue_packet, issue_rows_with_packets, issues_in_states, read_issue, read_issue_packet, read_latest_history_entry, ready_issues_for_selection, upsert_issue_ranking
+from scripts.issue_selection_projection import (
+    dependency_issue_numbers_for_selection as projection_dependency_issue_numbers_for_selection,
+    readiness_rank_score,
+    resolve_issue_base_branch_from_completed,
+)
 
 
 JsonObject = dict[str, object]
@@ -26,13 +33,13 @@ class IssuePacketRecord(Protocol):
     raw_text: str
 
 
+@dataclass(frozen=True)
+class IssueSelectionCandidate:
+    issue_number: str
+    branch: str
+
+
 DEFAULT_ISSUE_INTAKE_SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts/issue_packet_intake.py"
-READY_FOR_AGENT_LABEL = "ready-for-agent"
-AGENT_DISPATCHING_LABEL = "agent-dispatching"
-AGENT_IN_PROGRESS_LABEL = "agent-in-progress"
-QUARANTINED_LABEL = "quarantined"
-
-
 def _stackable_dependency_branch(base_dir: Path, issue_number: str) -> str:
     issue = read_issue(base_dir, issue_number)
     if issue is None:
@@ -54,12 +61,13 @@ def resolve_issue_base_branch(
     default_base_branch: str,
     dependency_issue_numbers: Callable[[str, list[str]], list[str]],
 ) -> str:
-    dependency_numbers = dependency_issue_numbers(issue_number, dependencies)
     completed = completed_issue_numbers(base_dir)
-    unresolved = [number for number in dependency_numbers if number not in completed]
-    if not unresolved:
-        return default_base_branch or "main"
-    return ""
+    return resolve_issue_base_branch_from_completed(
+        issue_number=issue_number,
+        dependencies=dependencies,
+        default_base_branch=default_base_branch,
+        completed_issue_numbers=completed,
+    )
 
 
 def sync_issue_packet_to_db(
@@ -92,101 +100,85 @@ def completed_issue_numbers_from_control_plane(base_dir: Path) -> set[str]:
     return completed_issue_numbers(base_dir)
 
 
-def select_next_issue_packet(
+def _selection_timestamp() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def select_next_issue_candidate(
     base_dir: Path,
     *,
-    workflow: dict[str, str],
-    current_issue: dict[str, str],
-    completed_issue_numbers_func: Callable[[Path], set[str]],
-    parse_issue_packet_text: Callable[[str, str], IssuePacketRecord],
-    sync_issue_packet_to_db_func: Callable[..., None],
+    current_issue_number: str,
+    current_parent_reference: str,
     issue_packet_record_from_json: Callable[[dict[str, object]], IssuePacketRecord | None],
     dependency_issue_numbers: Callable[[str, list[str]], list[str]],
-    now: NowFunc,
     development_capacity: int | None = None,
-) -> IssuePacketRecord | None:
-    selected_packets = select_issue_packets_for_capacity(
+) -> IssueSelectionCandidate | None:
+    selected_packets = select_issue_candidates_for_capacity(
         base_dir,
-        workflow=workflow,
-        current_issue=current_issue,
-        completed_issue_numbers_func=completed_issue_numbers_func,
-        parse_issue_packet_text=parse_issue_packet_text,
-        sync_issue_packet_to_db_func=sync_issue_packet_to_db_func,
+        current_issue_number=current_issue_number,
+        current_parent_reference=current_parent_reference,
         issue_packet_record_from_json=issue_packet_record_from_json,
         dependency_issue_numbers=dependency_issue_numbers,
-        now=now,
         development_capacity=development_capacity,
     )
     return selected_packets[0] if selected_packets else None
 
 
-def select_issue_packets_for_capacity(
+def select_issue_candidates_for_capacity(
     base_dir: Path,
     *,
-    workflow: dict[str, str],
-    current_issue: dict[str, str],
-    completed_issue_numbers_func: Callable[[Path], set[str]],
-    parse_issue_packet_text: Callable[[str, str], IssuePacketRecord],
-    sync_issue_packet_to_db_func: Callable[..., None],
+    current_issue_number: str,
+    current_parent_reference: str,
     issue_packet_record_from_json: Callable[[dict[str, object]], IssuePacketRecord | None],
     dependency_issue_numbers: Callable[[str, list[str]], list[str]],
-    now: NowFunc,
     development_capacity: int | None = None,
-) -> list[IssuePacketRecord]:
-    del parse_issue_packet_text
-    del sync_issue_packet_to_db_func
-    del workflow
-    completed = completed_issue_numbers_func(base_dir)
+) -> list[IssueSelectionCandidate]:
+    completed = completed_issue_numbers(base_dir)
     runtime_states = {
         issue["issue_number"]: issue["state"]
         for issue in issues_in_states(base_dir, ["claimed", "dispatching", "running", "verifying", "quarantined"])
     }
-    current_number = current_issue.get("number", "")
-    current_parent = current_issue.get("parentReference", "")
+    current_number = current_issue_number
+    current_parent = current_parent_reference
     packet_by_issue_number: dict[str, IssuePacketRecord] = {}
-    selected_packets: list[IssuePacketRecord] = []
+    selected_packets: list[IssueSelectionCandidate] = []
+    timestamp = _selection_timestamp()
     for row in issue_rows_with_packets(base_dir):
         packet = issue_packet_record_from_json(read_issue_packet(base_dir, str(row.get("issue_number") or "")))
         if packet is None:
             continue
         packet_by_issue_number[packet.issue_number] = packet
-        rank_score = -1.0
         if packet.issue_number == current_number:
             _ = upsert_issue_ranking(
                 base_dir,
                 issue_number=packet.issue_number,
-                rank_score=rank_score,
+                rank_score=-1.0,
                 lane="default",
-                updated_at=now(None),
+                updated_at=timestamp,
             )
             continue
-        if (
-            READY_FOR_AGENT_LABEL in packet.labels
-            and runtime_states.get(packet.issue_number) in {None, "ready", "failed", "completed"}
-            and AGENT_DISPATCHING_LABEL not in packet.labels
-            and AGENT_IN_PROGRESS_LABEL not in packet.labels
-            and QUARANTINED_LABEL not in packet.labels
-            and (not current_parent or packet.parent_reference == current_parent)
-        ):
-            base_branch = resolve_issue_base_branch(
-                base_dir,
-                issue_number=packet.issue_number,
-                dependencies=packet.dependencies,
-                default_base_branch=packet.base_branch,
-                dependency_issue_numbers=dependency_issue_numbers,
-            )
-            if base_branch:
-                try:
-                    numeric_issue = int(packet.issue_number)
-                except ValueError:
-                    numeric_issue = 10**9
-                rank_score = float(10**6 - numeric_issue)
+        base_branch = resolve_issue_base_branch(
+            base_dir,
+            issue_number=packet.issue_number,
+            dependencies=packet.dependencies,
+            default_base_branch=packet.base_branch,
+            dependency_issue_numbers=dependency_issue_numbers,
+        )
+        rank_score = readiness_rank_score(
+            issue_number=packet.issue_number,
+            labels=packet.labels,
+            runtime_state=runtime_states.get(packet.issue_number),
+            parent_reference=packet.parent_reference,
+            current_parent_reference=current_parent,
+            base_branch=base_branch,
+            current_issue_number=current_number,
+        )
         _ = upsert_issue_ranking(
             base_dir,
             issue_number=packet.issue_number,
             rank_score=rank_score,
             lane="default",
-            updated_at=now(None),
+            updated_at=timestamp,
         )
 
     ready_limit = available_development_slots(base_dir, development_capacity) if development_capacity is not None else None
@@ -194,22 +186,69 @@ def select_issue_packets_for_capacity(
         issue_number = str(row.get("issue_number") or "")
         packet = packet_by_issue_number.get(issue_number)
         if packet is not None:
-            selected_packets.append(packet)
+            selected_packets.append(IssueSelectionCandidate(issue_number=packet.issue_number, branch=packet.branch))
     return selected_packets
+
+
+def select_next_issue_packet(
+    base_dir: Path,
+    *,
+    current_issue_number: str,
+    current_parent_reference: str,
+    issue_packet_record_from_json: Callable[[dict[str, object]], IssuePacketRecord | None],
+    dependency_issue_numbers: Callable[[str, list[str]], list[str]],
+    development_capacity: int | None = None,
+) -> IssuePacketRecord | None:
+    candidate = select_next_issue_candidate(
+        base_dir,
+        current_issue_number=current_issue_number,
+        current_parent_reference=current_parent_reference,
+        issue_packet_record_from_json=issue_packet_record_from_json,
+        dependency_issue_numbers=dependency_issue_numbers,
+        development_capacity=development_capacity,
+    )
+    if candidate is None:
+        return None
+    return issue_packet_record_from_json(read_issue_packet(base_dir, candidate.issue_number))
+
+
+def select_issue_packets_for_capacity(
+    base_dir: Path,
+    *,
+    current_issue_number: str,
+    current_parent_reference: str,
+    issue_packet_record_from_json: Callable[[dict[str, object]], IssuePacketRecord | None],
+    dependency_issue_numbers: Callable[[str, list[str]], list[str]],
+    development_capacity: int | None = None,
+) -> list[IssuePacketRecord]:
+    candidates = select_issue_candidates_for_capacity(
+        base_dir,
+        current_issue_number=current_issue_number,
+        current_parent_reference=current_parent_reference,
+        issue_packet_record_from_json=issue_packet_record_from_json,
+        dependency_issue_numbers=dependency_issue_numbers,
+        development_capacity=development_capacity,
+    )
+    packets: list[IssuePacketRecord] = []
+    for candidate in candidates:
+        packet = issue_packet_record_from_json(read_issue_packet(base_dir, candidate.issue_number))
+        if packet is not None:
+            packets.append(packet)
+    return packets
+
+
+def dependency_issue_numbers_for_selection(issue_number: str, dependencies: list[str]) -> list[str]:
+    return projection_dependency_issue_numbers_for_selection(issue_number, dependencies)
 
 
 def run_issue_packet_intake(
     base_dir: Path,
     *,
     read_project_github_repo: Callable[[Path], str],
-    parse_issue_packet_text: Callable[[str, str], IssuePacketRecord],
-    sync_issue_packet_to_db_func: Callable[..., None],
     run: Callable[..., subprocess.CompletedProcess[str]],
 ) -> bool:
     script_path = DEFAULT_ISSUE_INTAKE_SCRIPT_PATH
     repo = read_project_github_repo(base_dir)
-    del parse_issue_packet_text
-    del sync_issue_packet_to_db_func
     command = [
         "python3",
         str(script_path),

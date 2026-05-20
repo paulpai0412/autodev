@@ -328,3 +328,61 @@ def test_build_prompt_for_github_backed_issue_keeps_github_issue_language() -> N
 
     assert "This issue is GitHub-backed." in prompt
     assert "Apply the normal GitHub issue close/update workflow" in prompt
+
+
+def test_build_prompt_spec_renders_decision_summary_as_last_line() -> None:
+    ledger = cast(dict[str, object], {
+        "issue": {"number": "42", "branch": "agent/issue-42-demo"},
+        "workflow": {"workflowPolicyPath": "docs/agents/autonomous-development-workflow.yaml"},
+        "artifacts": {},
+    })
+
+    spec = orchestrator_requests.build_prompt_spec(
+        ledger,
+        role="main_orchestrator",
+        stage="orchestrator_bootstrap",
+        decision_summary="summary tail check",
+        default_supervisor_doc_path="docs/agents/runtime/nonstop-supervisor-loop.md",
+        default_release_result_template_path="docs/agents/release-result-template.yaml",
+    )
+
+    rendered = spec.render()
+    assert rendered.splitlines()[-1] == "Decision summary: summary tail check"
+
+
+def test_build_session_request_spec_projects_selected_issue_fields() -> None:
+    ledger = cast(dict[str, object], {
+        "issue": {
+            "number": "31",
+            "branch": "agent/issue-31-demo",
+            "baseBranch": "main",
+        },
+        "workflow": {
+            "workflowPolicyPath": "docs/agents/autonomous-development-workflow.yaml",
+        },
+        "artifacts": {},
+        "queuedNextIssue": {
+            "issue_number": "32",
+            "branch": "agent/issue-32-demo",
+            "base_branch": "main",
+        },
+        "history": [],
+        "updatedAt": "2026-05-07T17:00:00+08:00",
+    })
+
+    spec = orchestrator_requests.build_session_request_spec(
+        ledger,
+        role="main_orchestrator",
+        stage="issue_selection_or_recovery",
+        reason="recover",
+        title="Recover",
+        decision_summary="resume",
+        now=lambda _value: "2026-05-07T17:00:00+08:00",
+        root_session_agent=lambda _ledger: "build",
+        build_prompt=lambda _ledger, _role, _stage, _summary: "prompt",
+    )
+    payload = spec.to_json()
+
+    assert payload["selectedIssueNumber"] == "32"
+    assert payload["selectedIssueBranch"] == "agent/issue-32-demo"
+    assert "selectedIssueBaseBranch" not in payload

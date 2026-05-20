@@ -322,6 +322,7 @@ class OpenCodeHostAdapter(HostAdapter):
                 status="error",
                 launch_title=launch_title,
                 error=error_text,
+                retry_without_source_session=retry_without_source_session,
                 metadata={"retryWithoutSourceSession": retry_without_source_session},
             )
         readable, readability_detail = probe_same_repo_session_readability(
@@ -346,6 +347,10 @@ class OpenCodeHostAdapter(HostAdapter):
             resume_hint=f"Open /sessions in OpenCode TUI and switch to {session_id}, or run opencode --session {session_id}.",
             resume_command=f"opencode --session {session_id}",
             readability_status="verified_same_repo_probe",
+            tui_resume_command="/sessions",
+            stop_continuation_status="root_session_detached",
+            stop_continuation_attempts=0,
+            execution_mode="root_session",
             metadata={"stopContinuationStatus": "root_session_detached", "stopContinuationAttempts": 0, "command": command},
         )
 
@@ -357,16 +362,21 @@ class OpenCodeHostAdapter(HostAdapter):
     def start_child_role(self, role: str, context: SessionStartContext) -> SessionStartResult:
         result = self.start_root_session(context)
         metadata = dict(result.metadata)
-        metadata["executionMode"] = "foreground_child_role"
+        execution_mode = "foreground_child_role"
+        metadata["executionMode"] = execution_mode
         metadata["childRole"] = role
+        child_session_id = ""
+        child_session_status = ""
         if result.status == "success" and result.session_id:
             child_summary = wait_for_child_session_summary(
                 result.session_id,
                 directory=str(context.workdir),
             )
             if child_summary is not None:
-                metadata["childSessionID"] = str(child_summary.get("session_id") or "")
-                metadata["childSessionStatus"] = str(child_summary.get("latest_assistant_status") or "")
+                child_session_id = str(child_summary.get("session_id") or "")
+                child_session_status = str(child_summary.get("latest_assistant_status") or "")
+                metadata["childSessionID"] = child_session_id
+                metadata["childSessionStatus"] = child_session_status
                 metadata["childSessionSummary"] = child_summary
         return SessionStartResult(
             status=result.status,
@@ -376,6 +386,14 @@ class OpenCodeHostAdapter(HostAdapter):
             resume_hint=result.resume_hint,
             resume_command=result.resume_command,
             readability_status=result.readability_status,
+            retry_without_source_session=result.retry_without_source_session,
+            tui_resume_command=result.tui_resume_command,
+            stop_continuation_status=result.stop_continuation_status,
+            stop_continuation_attempts=result.stop_continuation_attempts,
+            execution_mode=execution_mode,
+            child_role=role,
+            child_session_id=child_session_id,
+            child_session_status=child_session_status,
             metadata=metadata,
         )
 

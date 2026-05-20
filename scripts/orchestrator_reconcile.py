@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-from datetime import datetime
 from pathlib import Path
 from typing import Callable, Protocol, cast
 from uuid import uuid4
@@ -12,9 +10,6 @@ from uuid import uuid4
 JsonObject = dict[str, object]
 ReconcileResult = tuple[JsonObject, JsonObject, JsonObject | None]
 
-PR_VERIFIER_QUEUE_GRACE_SECONDS = 90
-
-
 def _set_artifact_ref(artifacts: dict[str, str], semantic_key: str, value: str) -> None:
     artifacts[semantic_key] = value
 
@@ -22,36 +17,6 @@ def _set_artifact_ref(artifacts: dict[str, str], semantic_key: str, value: str) 
 def _stored_fact(artifacts: dict[str, str], entry_type: str, read_artifact_fact: Callable[[str], dict[str, object]]) -> dict[str, object]:
     _ = artifacts
     return read_artifact_fact(entry_type)
-
-
-def _fact_from_latest_history_entry(row: dict[str, object] | None) -> dict[str, object]:
-    if not isinstance(row, dict):
-        return {}
-    payload_raw = row.get("payload_json")
-    payload: dict[str, object] = {}
-    if isinstance(payload_raw, str) and payload_raw.strip():
-        try:
-            decoded = json.loads(payload_raw)
-        except json.JSONDecodeError:
-            decoded = None
-        if isinstance(decoded, dict):
-            payload = cast(dict[str, object], decoded)
-    status = str(payload.get("status") or row.get("status") or "")
-    if not status:
-        return {}
-    snapshot: dict[str, object] = {
-        "parse_ok": True,
-        "source": "history_fallback",
-        "status": status,
-        "observed_at": str(row.get("created_at") or ""),
-        "history_id": row.get("history_id"),
-        "command_id": str(row.get("command_id") or ""),
-    }
-    session_id = str(row.get("session_id") or "")
-    if session_id:
-        snapshot["verifier_session_id"] = session_id
-    snapshot.update(payload)
-    return snapshot
 
 
 def _extract_pr_number_from_fact(fact: dict[str, object]) -> str:
@@ -187,37 +152,6 @@ def _browser_e2e_gate_deficiency(evidence_packet: dict[str, object]) -> str:
     return "missing browser_e2e evidence contract fields"
 
 
-def _parse_iso8601(value: str) -> datetime | None:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value)
-    except ValueError:
-        return None
-
-
-def _is_recent_pr_verifier_queue_transition(
-    row: dict[str, object] | None,
-    *,
-    now_iso: str,
-    max_age_seconds: int,
-) -> bool:
-    if not isinstance(row, dict):
-        return False
-    if str(row.get("role") or "") != "pr_verifier":
-        return False
-    if str(row.get("stage") or "") != "pr_verifier_execution":
-        return False
-    if str(row.get("status") or "") != "queued":
-        return False
-
-    created_at = _parse_iso8601(str(row.get("created_at") or ""))
-    now = _parse_iso8601(now_iso)
-    if created_at is None or now is None:
-        return False
-    return (now - created_at).total_seconds() <= max_age_seconds
-
-
 class IssuePacketRecord(Protocol):
     issue_number: str
     title: str
@@ -228,6 +162,11 @@ class IssuePacketRecord(Protocol):
     labels: list[str]
     parent_reference: str
     dependencies: list[str]
+
+
+class IssueSelectionCandidate(Protocol):
+    issue_number: str
+    branch: str
 
 
 def queue_transition(
@@ -370,7 +309,8 @@ def queue_orchestrator_recovery(
     updated_at: str,
     summary: str,
     release_issue_execution: Callable[..., None],
-    select_next_issue_packet: Callable[..., IssuePacketRecord | None],
+    select_next_issue_candidate: Callable[..., IssueSelectionCandidate | None],
+    load_issue_packet_from_db: Callable[[Path, str], IssuePacketRecord | None],
     handoff_to_selected_issue: Callable[..., tuple[JsonObject, JsonObject, JsonObject]],
     request_for_transition_func: Callable[..., JsonObject],
     queue_transition_func: Callable[..., None],
@@ -385,26 +325,21 @@ def queue_orchestrator_recovery(
             restore_ready_for_agent=False,
             final_state=final_state,
         )
-    selected_issue = select_next_issue_packet(
+    selected_candidate = select_next_issue_candidate(
         base_dir,
-        workflow=cast(dict[str, str], ledger["workflow"]),
-        current_issue=current_issue,
+        current_issue_number=current_issue.get("number", ""),
+        current_parent_reference=current_issue.get("parentReference", ""),
     )
-    if selected_issue is not None:
+    selected_issue: IssuePacketRecord | None = None
+    if selected_candidate is not None:
+        selected_issue = load_issue_packet_from_db(base_dir, selected_candidate.issue_number)
+        if selected_issue is None:
+            selected_candidate = None
+    if selected_candidate is not None and selected_issue is not None:
         ledger["queuedNextIssue"] = {
-            "selectedAt": updated_at,
-            "reason": summary,
-            "record": {
-                "issue_number": selected_issue.issue_number,
-                "title": selected_issue.title,
-                "branch": selected_issue.branch,
-                "base_branch": selected_issue.base_branch,
-                "backing_type": selected_issue.backing_type,
-                "prior_handoff": selected_issue.prior_handoff,
-                "labels": list(selected_issue.labels),
-                "parent_reference": selected_issue.parent_reference,
-                "dependencies": list(selected_issue.dependencies),
-            },
+            "issue_number": selected_issue.issue_number,
+            "branch": selected_issue.branch,
+            "base_branch": selected_issue.base_branch,
         }
         next_summary = f"{summary} Continue automatically with issue #{selected_issue.issue_number}."
         return handoff_to_selected_issue(
@@ -594,7 +529,6 @@ def reconcile_pr_verifier(
     read_issue: Callable[[Path, str], JsonObject | None],
     read_issue_packet: Callable[[Path, str], JsonObject],
     read_artifact_fact: Callable[[str], dict[str, object]],
-    read_latest_history_entry: Callable[[str], dict[str, object] | None],
     record_pr_opened: Callable[..., dict[str, object]],
     record_current_verifier_session: Callable[..., None],
     transition_issue_state_if_possible: Callable[..., None],
@@ -608,29 +542,6 @@ def reconcile_pr_verifier(
     current_issue_state = str(issue_state.get("state") or "") if issue_state else ""
     persisted_evidence = _stored_fact(artifacts, "evidence_packet", read_artifact_fact)
     if not bool(persisted_evidence.get("parse_ok")):
-        persisted_evidence = _fact_from_latest_history_entry(read_latest_history_entry("evidence_packet"))
-    if not bool(persisted_evidence.get("parse_ok")):
-        latest_runtime_transition = read_latest_history_entry("runtime_transition")
-        if current.get("status") == "queued" and _is_recent_pr_verifier_queue_transition(
-            latest_runtime_transition,
-            now_iso=updated_at,
-            max_age_seconds=PR_VERIFIER_QUEUE_GRACE_SECONDS,
-        ):
-            summary = (
-                f"pr_verifier for issue #{issue['number']} is queued and SQLite has not recorded evidence_packet yet. "
-                "Keep the queued dispatch state unchanged."
-            )
-            return (
-                ledger,
-                {
-                    "action": "no_change",
-                    "next_role": current.get("role") or "pr_verifier",
-                    "next_stage": current.get("stage") or "pr_verifier_execution",
-                    "summary": summary,
-                    "request_title": "",
-                },
-                None,
-            )
         summary = (
             f"pr_verifier for issue #{issue['number']} ended without recording evidence_packet in SQLite. "
             "Retry the verifier once before recovery."

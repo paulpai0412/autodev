@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compatibility wrapper that delegates legacy bootstrap calls into DB-backed startup."""
+"""DB-backed bootstrap entrypoint for root orchestrator startup."""
 
 from __future__ import annotations
 
@@ -13,8 +13,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.control_plane_db import read_issue_packet
-from scripts.orchestrator_supervisor import parse_issue_packet_text, start_issue
-DEFAULT_WORKFLOW_POLICY_PATH = "docs/agents/autonomous-development-workflow.yaml"
+from scripts.orchestrator_supervisor import start_issue
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,11 +66,9 @@ def run_orchestrator_bootstrap(
     *,
     base_dir: Path,
     issue_number: str,
-    workflow_policy_path: str = DEFAULT_WORKFLOW_POLICY_PATH,
     source_session_id: str = "orchestrator-bootstrap",
     updated_at: str | None = None,
 ) -> RunnerResult:
-    del workflow_policy_path
     resolved_issue_number = resolve_issue_number(issue_number, base_dir=base_dir)
     payload = read_issue_packet(base_dir, resolved_issue_number)
     if not payload:
@@ -102,11 +99,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Consumer project root containing the SQLite control plane",
     )
     _ = parser.add_argument("--source-session-id", default="orchestrator-bootstrap", help="Source session id to record when dispatching immediately")
-    _ = parser.add_argument(
-        "--workflow-policy-path",
-        default=DEFAULT_WORKFLOW_POLICY_PATH,
-        help="Canonical workflow policy ref for authoritative_refs",
-    )
     _ = parser.add_argument("--updated-at", help="Fixed timestamp for deterministic updates")
     return parser
 
@@ -120,7 +112,6 @@ def main(argv: list[str] | None = None) -> int:
             base_dir=base_dir,
             issue_number=normalized_issue_number,
             source_session_id=cast(str, args.source_session_id),
-            workflow_policy_path=cast(str, args.workflow_policy_path),
             updated_at=cast(str | None, args.updated_at),
         )
     except (ValueError, RuntimeError) as error:

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 from typing import cast
+
+from scripts.issue_dependency import dependency_issue_numbers, parse_issue_numbers
 
 
 @dataclass
@@ -204,28 +205,11 @@ def _extract_nested_list(text: str, block_name: str, nested_key: str) -> list[st
 
 
 def _parse_issue_numbers(text: str) -> list[str]:
-    return [match.group(1) for match in re.finditer(r"(?i)issue\s*#(\d+)", text)]
+    return parse_issue_numbers(text)
 
 
 def _dependency_issue_numbers(issue_number: str, dependencies: list[str]) -> list[str]:
-    numbers: list[str] = []
-    for dependency in dependencies:
-        lowered = dependency.lower()
-        blocked_match = re.search(r"blocked by(?:\s+issue)?\s*#(\d+)", lowered)
-        if blocked_match:
-            blocked_by = blocked_match.group(1)
-            if blocked_by != issue_number and blocked_by not in numbers:
-                numbers.append(blocked_by)
-            continue
-        if not any(token in lowered for token in ["released", "closed", "complete", "depends on", "requires"]):
-            continue
-        for found in _parse_issue_numbers(dependency):
-            if found != issue_number and found not in numbers:
-                numbers.append(found)
-        for found in re.findall(r"(?<!\w)#(\d+)", dependency):
-            if found != issue_number and found not in numbers:
-                numbers.append(found)
-    return numbers
+    return dependency_issue_numbers(issue_number, dependencies)
 
 
 def _extract_inline_mapping_value(text: str, prefix: str, key: str) -> str:

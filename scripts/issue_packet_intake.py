@@ -19,6 +19,7 @@ if __package__ in {None, ""}:
 
 from scripts.control_plane_db import ingest_issue_packet
 from scripts.autodev_project import doctor_project
+from scripts.issue_dependency import infer_dependency_lines
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -56,13 +57,7 @@ def infer_parent_reference(issue: GitHubIssue) -> str:
 
 
 def infer_dependencies(issue: GitHubIssue) -> list[str]:
-    dependencies: list[str] = []
-    for line in issue.body.splitlines():
-        stripped = line.strip()
-        if re.search(r"(?i)depends on|blocked by|requires issue", stripped):
-            if not re.match(r"^#{1,6}\s", stripped):
-                dependencies.append(stripped)
-    return dependencies or ["none"]
+    return infer_dependency_lines(issue.body)
 
 
 def infer_base_branch(issue: GitHubIssue) -> str:
@@ -392,7 +387,6 @@ def build_parser() -> argparse.ArgumentParser:
     _ = parser.add_argument("--repo", default=DEFAULT_REPO, help="GitHub repo name for gh issue list")
     _ = parser.add_argument("--issues-json", help="Path to a JSON fixture with gh issue list output")
     _ = parser.add_argument("--project-root", default=".", help="Consumer project root or a nested path inside it")
-    _ = parser.add_argument("--output-dir", help="Deprecated compatibility flag; DB-backed intake ignores packet file output")
     return parser
 
 

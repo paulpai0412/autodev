@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from scripts import control_plane_repository
 from scripts.issue_state_machine import is_known_issue_state, require_transition
 
 
@@ -134,12 +135,10 @@ def _update_issue_snapshot(
     issue_number: str,
     updates: dict[str, Any],
 ) -> None:
-    if not updates:
-        return
-    assignments = ", ".join(f"{column} = ?" for column in updates)
-    connection.execute(
-        f"UPDATE issues SET {assignments} WHERE issue_number = ?",
-        list(updates.values()) + [issue_number],
+    control_plane_repository.update_issue_snapshot(
+        connection,
+        issue_number=issue_number,
+        updates=updates,
     )
 
 
@@ -193,7 +192,11 @@ def _merge_runtime_context(
     if artifact_status is not None:
         merged["artifact_status"] = artifact_status
     if runtime_context is not None:
-        merged.update(runtime_context)
+        for key, value in runtime_context.items():
+            if value is None:
+                merged.pop(str(key), None)
+            else:
+                merged[str(key)] = value
     return merged
 
 
@@ -336,47 +339,25 @@ def _append_history_entry(
         return existing_history_id
 
     try:
-        cursor = connection.execute(
-            """
-            INSERT INTO issue_history (
-                issue_number,
-                entry_type,
-                role,
-                stage,
-                status,
-                session_id,
-                request_id,
-                command_id,
-                from_state,
-                to_state,
-                summary,
-                payload_json,
-                body_text,
-                content_hash,
-                created_at,
-                unique_key,
-                session_seq
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                issue_number,
-                entry_type,
-                role,
-                stage,
-                status,
-                session_id,
-                request_id,
-                command_id,
-                from_state,
-                to_state,
-                summary,
-                _json_dumps(payload or {}),
-                body_text,
-                content_hash,
-                created_at,
-                unique_key,
-                session_seq,
-            ),
+        history_id = control_plane_repository.append_history_entry(
+            connection,
+            issue_number=issue_number,
+            entry_type=entry_type,
+            created_at=created_at,
+            role=role,
+            stage=stage,
+            status=status,
+            session_id=session_id,
+            request_id=request_id,
+            command_id=command_id,
+            from_state=from_state,
+            to_state=to_state,
+            summary=summary,
+            payload_json=_json_dumps(payload or {}),
+            body_text=body_text,
+            content_hash=content_hash,
+            unique_key=unique_key,
+            session_seq=session_seq,
         )
     except sqlite3.IntegrityError:
         if unique_key:
@@ -394,10 +375,6 @@ def _append_history_entry(
             if existing is not None:
                 return int(existing["history_id"])
         raise
-    history_id_raw = cursor.lastrowid
-    if history_id_raw is None:
-        raise RuntimeError("failed to insert issue_history row")
-    history_id = int(history_id_raw)
     if update_issue_last_history:
         _update_issue_last_history_ref(
             connection,
@@ -561,7 +538,12 @@ def development_issues(base_dir: Path) -> list[dict[str, Any]]:
 
 
 def development_slot_occupancy(base_dir: Path) -> int:
-    return len(development_issues(base_dir))
+    ensure_control_plane_db(base_dir)
+    with _connection(base_dir) as connection:
+        return control_plane_repository.count_development_occupancy(
+            connection,
+            states=DEVELOPMENT_SLOT_STATES,
+        )
 
 
 def available_development_slots(base_dir: Path, capacity: int) -> int:
@@ -571,17 +553,7 @@ def available_development_slots(base_dir: Path, capacity: int) -> int:
 def release_slot_occupancy(base_dir: Path) -> int:
     ensure_control_plane_db(base_dir)
     with _connection(base_dir) as connection:
-        rows = connection.execute(
-            """
-            SELECT * FROM issues
-            WHERE state = 'release_pending'
-              AND current_role = 'main_orchestrator'
-              AND current_stage = 'release_root_execution'
-              AND (current_status != '' OR current_session_id != '')
-            ORDER BY issue_number ASC
-            """
-        ).fetchall()
-    return len(rows)
+        return control_plane_repository.count_release_occupancy(connection)
 
 
 def available_release_slots(base_dir: Path, capacity: int) -> int:

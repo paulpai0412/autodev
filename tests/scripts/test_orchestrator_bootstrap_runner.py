@@ -7,7 +7,7 @@ from pytest import CaptureFixture, MonkeyPatch
 
 import scripts.orchestrator_bootstrap_runner as orchestrator_bootstrap_runner
 from scripts.control_plane_db import ingest_issue_packet, read_issue_packet
-from scripts.orchestrator_supervisor import parse_issue_packet_text
+from scripts.orchestrator_artifacts import parse_issue_packet_text
 from scripts.orchestrator_bootstrap_runner import resolve_issue_number, run_orchestrator_bootstrap
 
 

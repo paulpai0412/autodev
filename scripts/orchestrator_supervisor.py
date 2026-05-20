@@ -56,7 +56,13 @@ from scripts.control_plane_db import (
     upsert_issue_state,
     claim_issue_if_ready,
 )
-from scripts.host_adapter import HostAdapter, SessionStartContext
+from scripts.host_adapter import HostAdapter, SessionStartContext, session_result_field
+from scripts.orchestrator_artifacts import (
+    _is_successful_release_status,
+    issue_packet_record_from_json,
+    issue_packet_record_to_json,
+    parse_issue_packet_text,
+)
 
 
 JsonObject = dict[str, object]
@@ -86,6 +92,11 @@ class IssuePacketRecord(Protocol):
     parent_reference: str
     dependencies: list[str]
     raw_text: str
+
+
+class IssueSelectionCandidate(Protocol):
+    issue_number: str
+    branch: str
 
 
 def _normalize_requested_issue_number(issue_number: str) -> str:
@@ -198,27 +209,6 @@ def _issue_dispatch_workdir(*, base_dir: Path, issue_number: str, branch: str, b
         if path.exists():
             return path
     return base_dir
-
-
-def _load_artifact_helpers() -> ModuleType:
-    module_path = Path(__file__).with_name("orchestrator_artifacts.py")
-    spec = importlib.util.spec_from_file_location("orchestrator_artifacts", module_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load artifact helpers from {module_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-_artifact_helpers = _load_artifact_helpers()
-_dependency_issue_numbers = cast(Callable[[str, list[str]], list[str]], _artifact_helpers._dependency_issue_numbers)
-_extract_nested_scalar = cast(Callable[[str, str, str], str], _artifact_helpers._extract_nested_scalar)
-_is_successful_release_status = cast(Callable[[str], bool], _artifact_helpers._is_successful_release_status)
-_parse_issue_numbers = cast(Callable[[str], list[str]], _artifact_helpers._parse_issue_numbers)
-issue_packet_record_from_json = cast(Callable[[dict[str, object]], IssuePacketRecord | None], _artifact_helpers.issue_packet_record_from_json)
-issue_packet_record_to_json = cast(Callable[[IssuePacketRecord], JsonObject], _artifact_helpers.issue_packet_record_to_json)
-parse_issue_packet_text = cast(Callable[[str, str], IssuePacketRecord], _artifact_helpers.parse_issue_packet_text)
 
 
 def _artifact_status_snapshot(
@@ -537,6 +527,20 @@ def _load_reconcile_helpers() -> ModuleType:
 
 
 _reconcile_helpers = _load_reconcile_helpers()
+
+
+def _load_policy_helpers() -> ModuleType:
+    module_path = Path(__file__).with_name("orchestrator_policy.py")
+    spec = importlib.util.spec_from_file_location("orchestrator_policy", module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load policy helpers from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_policy_helpers = _load_policy_helpers()
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1685,15 +1689,8 @@ def _sync_runtime_phase_to_control_plane_state(
     current: dict[str, str],
     updated_at: str,
 ) -> None:
-    desired_state = ""
-    if current["role"] == "main_orchestrator" and current["stage"] == "orchestrator_bootstrap":
-        desired_state = "running"
-    elif current["role"] == "issue_worker":
-        desired_state = "running"
-    elif current["role"] == "pr_verifier":
-        desired_state = "verifying"
-    elif current["role"] == "main_orchestrator" and current["stage"] == "release_root_execution":
-        desired_state = "release_pending"
+    runtime_target_state = cast(Callable[[dict[str, str]], str], _policy_helpers.runtime_target_state)
+    desired_state = runtime_target_state(current)
 
     if not desired_state:
         return
@@ -1739,9 +1736,13 @@ def _sync_runtime_phase_metadata(
     queued_next_issue: dict[str, object] | None = None,
     updated_at: str,
 ) -> None:
-    runtime_context: dict[str, object] = {}
+    runtime_context: dict[str, object] | None = None
     if queued_next_issue:
-        runtime_context["queuedNextIssue"] = queued_next_issue
+        runtime_context = {"queuedNextIssue": queued_next_issue}
+    else:
+        existing_runtime_context = read_runtime_context(base_dir, issue_number)
+        if isinstance(existing_runtime_context, dict) and "queuedNextIssue" in existing_runtime_context:
+            runtime_context = {"queuedNextIssue": None}
     _ = sync_issue_runtime_context(
         base_dir,
         issue_number=issue_number,
@@ -1876,24 +1877,24 @@ def reconcile_workspace_from_db(
     started_issues: list[JsonObject] = []
     capacity = _development_capacity()
     current_issue = {"number": "", "parentReference": ""}
-    ready_packets = select_issue_packets_for_capacity(
+    ready_candidates = select_issue_candidates_for_capacity(
         base_dir,
-        workflow={},
-        current_issue=current_issue,
+        current_issue_number=current_issue["number"],
+        current_parent_reference=current_issue["parentReference"],
         development_capacity=capacity,
     )
     free_slots = available_development_slots(base_dir, capacity)
-    for packet in ready_packets[:free_slots]:
+    for candidate in ready_candidates[:free_slots]:
         session_result = start_issue(
             base_dir=base_dir,
-            issue_number=packet.issue_number,
+            issue_number=candidate.issue_number,
             source_session_id=source_session_id,
             updated_at=timestamp,
         )
         started_issues.append(
             {
-                "issue_number": packet.issue_number,
-                "branch": packet.branch,
+                "issue_number": candidate.issue_number,
+                "branch": candidate.branch,
                 "session_result": session_result,
             }
         )
@@ -1956,19 +1957,20 @@ def reconcile_workspace_from_db(
 
 
 def _select_release_issue_number(base_dir: Path, requested_issue_number: str | None) -> str:
-    if requested_issue_number:
-        return _normalize_requested_issue_number(requested_issue_number)
-    verified = list_issues(base_dir, states=["verified"])
-    if verified:
-        return str(verified[0].get("issue_number") or "")
+    select_release_issue_number = cast(Callable[..., str], _policy_helpers.select_release_issue_number)
+    normalized_request = _normalize_requested_issue_number(requested_issue_number) if requested_issue_number else None
+    verified = [str(issue.get("issue_number") or "") for issue in list_issues(base_dir, states=["verified"]) if str(issue.get("issue_number") or "")]
     idle_release_pending = [
         issue
         for issue in list_issues(base_dir, states=["release_pending"])
         if not str(issue.get("current_session_id") or "") and not str(issue.get("current_status") or "")
     ]
-    if idle_release_pending:
-        return str(idle_release_pending[0].get("issue_number") or "")
-    raise RuntimeError("no verified issue is waiting for independent release; provide --issue-number after approval is ready")
+    idle_release_pending_numbers = [str(issue.get("issue_number") or "") for issue in idle_release_pending if str(issue.get("issue_number") or "")]
+    return select_release_issue_number(
+        requested_issue_number=normalized_request,
+        verified_issue_numbers=verified,
+        idle_release_pending_issue_numbers=idle_release_pending_numbers,
+    )
 
 
 def start_release(
@@ -2015,7 +2017,13 @@ def start_release(
         from_state=state,
         to_state="release_pending",
     )
-    if state == "verified":
+    release_admission_decision = cast(Callable[..., str], _policy_helpers.release_admission_decision)
+    admission = release_admission_decision(
+        state=state,
+        current_session_id=current_session_id,
+        current_status=current_status,
+    )
+    if admission == "transition_to_release_pending":
         _transition_issue_state_if_possible(
             base_dir=base_dir,
             issue_number=selected_issue_number,
@@ -2026,10 +2034,9 @@ def start_release(
             from_state="verified",
             current_session_id="",
         )
-    elif state == "release_pending":
-        if current_session_id or current_status:
-            raise RuntimeError(f"issue #{selected_issue_number} already has an active release_worker session fence")
-    else:
+    elif admission == "reject_active_fence":
+        raise RuntimeError(f"issue #{selected_issue_number} already has an active release_worker session fence")
+    elif admission == "reject_invalid_state":
         raise RuntimeError(f"issue #{selected_issue_number} is {state or 'unknown'}; only verified or idle release_pending issues can be released")
 
     refreshed_issue = read_issue(base_dir, selected_issue_number)
@@ -2202,39 +2209,94 @@ def _completed_issue_numbers(base_dir: Path) -> set[str]:
     return completed_func(base_dir)
 
 
-def select_next_issue_packet(base_dir: Path, *, workflow: dict[str, str], current_issue: dict[str, str]) -> IssuePacketRecord | None:
+def _queued_next_issue_fields(ledger: JsonObject) -> tuple[str, str, str]:
+    queued_next_issue = cast(dict[str, object], ledger.get("queuedNextIssue", {}))
+    issue_number = str(queued_next_issue.get("issue_number") or "")
+    branch = str(queued_next_issue.get("branch") or "")
+    base_branch = str(queued_next_issue.get("base_branch") or "")
+    if issue_number:
+        return issue_number, branch, base_branch
+
+    queued_next_issue_record = cast(dict[str, object], queued_next_issue.get("record", {}))
+    return (
+        str(queued_next_issue_record.get("issue_number") or ""),
+        str(queued_next_issue_record.get("branch") or ""),
+        str(queued_next_issue_record.get("base_branch") or ""),
+    )
+
+
+def _dependency_issue_numbers(issue_number: str, dependencies: list[str]) -> list[str]:
+    resolver = cast(Callable[[str, list[str]], list[str]], _selection_helpers.dependency_issue_numbers_for_selection)
+    return resolver(issue_number, dependencies)
+
+
+def select_next_issue_packet(
+    base_dir: Path,
+    *,
+    current_issue_number: str,
+    current_parent_reference: str,
+) -> IssuePacketRecord | None:
     select_packet = cast(Callable[..., IssuePacketRecord | None], _selection_helpers.select_next_issue_packet)
     return select_packet(
         base_dir,
-        workflow=workflow,
-        current_issue=current_issue,
-        completed_issue_numbers_func=_completed_issue_numbers,
-        parse_issue_packet_text=parse_issue_packet_text,
-        sync_issue_packet_to_db_func=_sync_issue_packet_to_db,
+        current_issue_number=current_issue_number,
+        current_parent_reference=current_parent_reference,
         issue_packet_record_from_json=issue_packet_record_from_json,
         dependency_issue_numbers=_dependency_issue_numbers,
-        now=_now,
+    )
+
+
+def select_next_issue_candidate(
+    base_dir: Path,
+    *,
+    current_issue_number: str,
+    current_parent_reference: str,
+) -> IssueSelectionCandidate | None:
+    select_candidate = cast(Callable[..., IssueSelectionCandidate | None], _selection_helpers.select_next_issue_candidate)
+    return select_candidate(
+        base_dir,
+        current_issue_number=current_issue_number,
+        current_parent_reference=current_parent_reference,
+        issue_packet_record_from_json=issue_packet_record_from_json,
+        dependency_issue_numbers=_dependency_issue_numbers,
     )
 
 
 def select_issue_packets_for_capacity(
     base_dir: Path,
     *,
-    workflow: dict[str, str],
-    current_issue: dict[str, str],
+    current_issue_number: str,
+    current_parent_reference: str,
     development_capacity: int | None,
 ) -> list[IssuePacketRecord]:
     select_packets = cast(Callable[..., list[IssuePacketRecord]], _selection_helpers.select_issue_packets_for_capacity)
     return select_packets(
         base_dir,
-        workflow=workflow,
-        current_issue=current_issue,
-        completed_issue_numbers_func=_completed_issue_numbers,
-        parse_issue_packet_text=parse_issue_packet_text,
-        sync_issue_packet_to_db_func=_sync_issue_packet_to_db,
+        current_issue_number=current_issue_number,
+        current_parent_reference=current_parent_reference,
         issue_packet_record_from_json=issue_packet_record_from_json,
         dependency_issue_numbers=_dependency_issue_numbers,
-        now=_now,
+        development_capacity=development_capacity,
+    )
+
+
+def select_issue_candidates_for_capacity(
+    base_dir: Path,
+    *,
+    current_issue_number: str,
+    current_parent_reference: str,
+    development_capacity: int | None,
+) -> list[IssueSelectionCandidate]:
+    select_candidates = cast(
+        Callable[..., list[IssueSelectionCandidate]],
+        _selection_helpers.select_issue_candidates_for_capacity,
+    )
+    return select_candidates(
+        base_dir,
+        current_issue_number=current_issue_number,
+        current_parent_reference=current_parent_reference,
+        issue_packet_record_from_json=issue_packet_record_from_json,
+        dependency_issue_numbers=_dependency_issue_numbers,
         development_capacity=development_capacity,
     )
 
@@ -2255,8 +2317,6 @@ def run_issue_packet_intake(base_dir: Path) -> bool:
     return run_intake(
         base_dir,
         read_project_github_repo=_read_project_github_repo,
-        parse_issue_packet_text=parse_issue_packet_text,
-        sync_issue_packet_to_db_func=_sync_issue_packet_to_db,
         run=subprocess.run,
     )
 
@@ -2517,50 +2577,32 @@ def validate_session_request_for_dispatch(
     base_dir: Path,
 ) -> str:
     issue = cast(dict[str, str], ledger["issue"])
-    queued_next_issue = cast(dict[str, object], ledger.get("queuedNextIssue", {}))
-    queued_next_issue_record = cast(dict[str, object], queued_next_issue.get("record", {}))
+    queued_issue_number, queued_issue_branch, _queued_issue_base_branch = _queued_next_issue_fields(ledger)
     selected_issue_number = str(request.get("selectedIssueNumber") or "")
     selected_issue_branch = str(request.get("selectedIssueBranch") or "")
-    if request["issueNumber"] != issue.get("number"):
-        return f"stale request issue #{request['issueNumber']} does not match ledger issue #{issue.get('number', '')}"
-    if request["branch"] != issue.get("branch"):
-        return f"stale request branch {request['branch']} does not match ledger branch {issue.get('branch', '')}"
-
     ledger_revision = str(ledger.get("ledgerRevision") or ledger.get("updatedAt") or "")
-    request_revision = request.get("createdForLedgerRevision", "")
-    if request_revision and ledger_revision and request_revision != ledger_revision:
-        return f"stale request revision {request_revision} does not match ledger revision {ledger_revision}"
-
-    queued_issue_number = str(queued_next_issue_record.get("issue_number") or "")
-    queued_issue_branch = str(queued_next_issue_record.get("branch") or "")
-    if selected_issue_number or selected_issue_branch:
-        if not queued_issue_number:
-            return "stale selected issue request no longer matches queued next issue state"
-        if selected_issue_number != queued_issue_number:
-            return f"stale selected issue #{selected_issue_number} does not match queued next issue #{queued_issue_number}"
-        if selected_issue_branch and selected_issue_branch != queued_issue_branch:
-            return f"stale selected issue branch {selected_issue_branch} does not match queued next issue branch {queued_issue_branch}"
-
+    request_revision = str(request.get("createdForLedgerRevision", ""))
     completed = _completed_issue_numbers(base_dir)
-    is_selected_issue_recovery_request = (
-        request.get("role") == "main_orchestrator"
-        and request.get("stage") == "issue_selection_or_recovery"
-        and bool(selected_issue_number)
-    )
-    if request["issueNumber"] in completed and not is_selected_issue_recovery_request:
-        return f"issue #{request['issueNumber']} is already completed or released; refusing to dispatch stale request"
-
-    if is_selected_issue_recovery_request:
-        return ""
-
     packet = _load_issue_packet_from_db(base_dir, request["issueNumber"])
-    if packet is None:
-        return f"issue packet not recorded in SQLite for issue #{request['issueNumber']}"
-    if READY_FOR_AGENT_LABEL not in packet.labels:
-        return f"issue #{request['issueNumber']} is not ready-for-agent; refusing to dispatch"
-    if packet.issue_number != request["issueNumber"]:
-        return f"stored issue packet belongs to issue #{packet.issue_number}, not request issue #{request['issueNumber']}"
-    return ""
+    validate_dispatch_admission = cast(Callable[..., str], _policy_helpers.validate_dispatch_admission)
+    return validate_dispatch_admission(
+        request_issue_number=request["issueNumber"],
+        request_branch=request["branch"],
+        ledger_issue_number=issue.get("number", ""),
+        ledger_branch=issue.get("branch", ""),
+        request_revision=request_revision,
+        ledger_revision=ledger_revision,
+        queued_issue_number=queued_issue_number,
+        queued_issue_branch=queued_issue_branch,
+        selected_issue_number=selected_issue_number,
+        selected_issue_branch=selected_issue_branch,
+        role=str(request.get("role") or ""),
+        stage=str(request.get("stage") or ""),
+        issue_is_completed=request["issueNumber"] in completed,
+        packet_exists=packet is not None,
+        packet_is_ready_for_agent=bool(packet and READY_FOR_AGENT_LABEL in packet.labels),
+        packet_issue_number=str(packet.issue_number) if packet else "",
+    )
 
 
 def _validation_ledger_from_db(*, base_dir: Path, issue_number: str) -> JsonObject | None:
@@ -2615,7 +2657,11 @@ def _dispatch_request_via_db(
     else:
         runtime_issue = read_issue(base_dir, request["issueNumber"])
         runtime_state = str(runtime_issue.get("state") or "") if runtime_issue else ""
-        is_bootstrap_dispatch = request.get("role") == "main_orchestrator" and request.get("stage") == "orchestrator_bootstrap"
+        classify_bootstrap_dispatch = cast(Callable[..., bool], _policy_helpers.is_bootstrap_dispatch)
+        is_bootstrap_dispatch = classify_bootstrap_dispatch(
+            role=str(request.get("role") or ""),
+            stage=str(request.get("stage") or ""),
+        )
         if is_bootstrap_dispatch:
             if runtime_issue is None:
                 _ = ensure_issue_row(base_dir, issue_number=request["issueNumber"], state="claimed", updated_at=dispatch_timestamp)
@@ -2693,7 +2739,12 @@ def _dispatch_request_via_db(
                     f"Resume the active root session with {resume_link}. "
                     f"GitHub running-label sync failed and may need retry: {sync_error}"
                 )
-        if isinstance(root_session_id, str) and root_session_id and request.get("role") == "main_orchestrator" and request.get("stage") == "release_root_execution":
+        classify_release_root_execution = cast(Callable[..., bool], _policy_helpers.is_release_root_execution)
+        is_release_root_dispatch = classify_release_root_execution(
+            role=str(request.get("role") or ""),
+            stage=str(request.get("stage") or ""),
+        )
+        if isinstance(root_session_id, str) and root_session_id and is_release_root_dispatch:
             recorded_at = str(session_result.get("recordedAt") or dispatch_timestamp)
             _ = upsert_issue_state(
                 base_dir,
@@ -2714,9 +2765,14 @@ def _dispatch_request_via_db(
     if session_result.get("status") != "success":
         current_issue_state = read_issue(base_dir, request["issueNumber"])
         current_state = str(current_issue_state.get("state") or "") if current_issue_state else ""
-        if current_state not in {"completed", "failed"}:
+        dispatch_restore_strategy = cast(Callable[..., str], _policy_helpers.dispatch_restore_strategy)
+        restore_strategy = dispatch_restore_strategy(
+            failure_restore_state=failure_restore_state,
+            current_state=current_state,
+        )
+        if restore_strategy != "skip":
             failure_updated_at = str(session_result.get("recordedAt") or dispatch_timestamp)
-            if failure_restore_state == "quarantined":
+            if restore_strategy == "quarantined":
                 clear_issue_execution_claim_projection(
                     base_dir=base_dir,
                     issue_number=request["issueNumber"],
@@ -2738,7 +2794,7 @@ def _dispatch_request_via_db(
                     command_id=f"{dispatch_command_id}:quarantine-labels",
                     updated_at=failure_updated_at,
                 )
-            elif failure_restore_state == "release_pending":
+            elif restore_strategy == "release_pending":
                 _ = upsert_issue_state(
                     base_dir,
                     issue_number=request["issueNumber"],
@@ -2834,7 +2890,7 @@ def dispatch_session_request(
             start_result = adapter.start_child_role("release_worker", retry_context)
         else:
             start_result = adapter.start_root_session(retry_context)
-    stop_attempts_raw = start_result.metadata.get("stopContinuationAttempts")
+    stop_attempts_raw = session_result_field(start_result, "stop_continuation_attempts", "stopContinuationAttempts", 0)
     stop_attempts = (
         int(stop_attempts_raw)
         if isinstance(stop_attempts_raw, (int, float, str)) and not isinstance(stop_attempts_raw, bool)
@@ -2854,10 +2910,10 @@ def dispatch_session_request(
             "error": start_result.error,
             "rootSessionID": start_result.session_id,
             "sessionReadabilityStatus": start_result.readability_status,
-            "executionMode": str(start_result.metadata.get("executionMode") or "root_session"),
-            "childRole": str(start_result.metadata.get("childRole") or ""),
-            "childSessionID": str(start_result.metadata.get("childSessionID") or ""),
-            "childSessionStatus": str(start_result.metadata.get("childSessionStatus") or ""),
+            "executionMode": str(session_result_field(start_result, "execution_mode", "executionMode", "root_session") or "root_session"),
+            "childRole": str(session_result_field(start_result, "child_role", "childRole", "") or ""),
+            "childSessionID": str(session_result_field(start_result, "child_session_id", "childSessionID", "") or ""),
+            "childSessionStatus": str(session_result_field(start_result, "child_session_status", "childSessionStatus", "") or ""),
             "recordedAt": timestamp,
         }
     root_session_id = start_result.session_id
@@ -2872,16 +2928,16 @@ def dispatch_session_request(
         "stage": request["stage"],
         "issueNumber": request["issueNumber"],
         "branch": request["branch"],
-        "tuiResumeCommand": str(start_result.metadata.get("tuiResumeCommand") or "/sessions"),
+        "tuiResumeCommand": str(session_result_field(start_result, "tui_resume_command", "tuiResumeCommand", "/sessions") or "/sessions"),
         "cliOpenCommand": start_result.resume_command,
         "recommendedAction": start_result.resume_hint,
         "sessionReadabilityStatus": start_result.readability_status,
-        "stopContinuationStatus": str(start_result.metadata.get("stopContinuationStatus") or "root_session_detached"),
+        "stopContinuationStatus": str(session_result_field(start_result, "stop_continuation_status", "stopContinuationStatus", "root_session_detached") or "root_session_detached"),
         "stopContinuationAttempts": stop_attempts,
-        "executionMode": str(start_result.metadata.get("executionMode") or "root_session"),
-        "childRole": str(start_result.metadata.get("childRole") or ""),
-        "childSessionID": str(start_result.metadata.get("childSessionID") or ""),
-        "childSessionStatus": str(start_result.metadata.get("childSessionStatus") or ""),
+        "executionMode": str(session_result_field(start_result, "execution_mode", "executionMode", "root_session") or "root_session"),
+        "childRole": str(session_result_field(start_result, "child_role", "childRole", "") or ""),
+        "childSessionID": str(session_result_field(start_result, "child_session_id", "childSessionID", "") or ""),
+        "childSessionStatus": str(session_result_field(start_result, "child_session_status", "childSessionStatus", "") or ""),
         "recordedAt": timestamp,
     }
 
@@ -3422,7 +3478,8 @@ def _queue_orchestrator_recovery(
         updated_at=updated_at,
         summary=summary,
         release_issue_execution=release_issue_execution,
-        select_next_issue_packet=select_next_issue_packet,
+        select_next_issue_candidate=select_next_issue_candidate,
+        load_issue_packet_from_db=_load_issue_packet_from_db,
         handoff_to_selected_issue=_handoff_to_selected_issue,
         request_for_transition_func=_request_for_transition,
         queue_transition_func=_queue_transition,
@@ -3442,9 +3499,7 @@ def _consume_queued_next_issue(
     updated_at: str,
     summary: str,
 ) -> tuple[JsonObject, SupervisorDecision, SessionRequest] | None:
-    queued_next_issue = cast(dict[str, object], ledger.get("queuedNextIssue", {}))
-    queued_next_issue_record = cast(dict[str, object], queued_next_issue.get("record", {}))
-    issue_number = str(queued_next_issue_record.get("issue_number") or "")
+    issue_number, _issue_branch, _issue_base_branch = _queued_next_issue_fields(ledger)
     if not issue_number:
         return None
     selected_issue = _load_issue_packet_from_db(base_dir, issue_number)
@@ -3452,23 +3507,26 @@ def _consume_queued_next_issue(
         return None
     if issue_number in _completed_issue_numbers(base_dir):
         return None
-    revalidated_issue = select_next_issue_packet(
+    revalidated_candidate = select_next_issue_candidate(
         base_dir,
-        workflow=cast(dict[str, str], ledger["workflow"]),
-        current_issue=cast(dict[str, str], ledger["issue"]),
+        current_issue_number=str(cast(dict[str, str], ledger["issue"]).get("number", "")),
+        current_parent_reference=str(cast(dict[str, str], ledger["issue"]).get("parentReference", "")),
     )
-    if revalidated_issue is None:
+    if revalidated_candidate is None:
         ledger.pop("queuedNextIssue", None)
         return None
-    if revalidated_issue.issue_number != selected_issue.issue_number:
+    if revalidated_candidate.issue_number != selected_issue.issue_number:
         ledger.pop("queuedNextIssue", None)
+        revalidated_issue = _load_issue_packet_from_db(base_dir, revalidated_candidate.issue_number)
+        if revalidated_issue is None:
+            return None
         next_ledger, decision, request = _handoff_to_selected_issue(
             ledger,
             selected_issue=revalidated_issue,
             base_dir=base_dir,
             updated_at=updated_at,
             summary=(
-                f"Queued next issue #{selected_issue.issue_number} is no longer ready. Continue automatically with revalidated issue #{revalidated_issue.issue_number}."
+                f"Queued next issue #{selected_issue.issue_number} is no longer ready. Continue automatically with revalidated issue #{revalidated_candidate.issue_number}."
             ),
         )
         return next_ledger, decision, request
@@ -3602,7 +3660,7 @@ def reconcile_ledger(
                 from_state="running",
             )
 
-        if current["role"] == "main_orchestrator" and current["stage"] == "orchestrator_bootstrap":
+        def _route_orchestrator_bootstrap() -> tuple[JsonObject, JsonObject, JsonObject | None]:
             reconcile_orchestrator_bootstrap = cast(Callable[..., tuple[JsonObject, JsonObject, JsonObject | None]], _reconcile_helpers.reconcile_orchestrator_bootstrap)
             next_ledger, decision, request = reconcile_orchestrator_bootstrap(
                 ledger,
@@ -3614,9 +3672,9 @@ def reconcile_ledger(
                 subagent_decision_func=_subagent_decision,
             )
             _sync_runtime_phase_metadata(base_dir=base_dir, issue_number=_ledger_issue_number(next_ledger, issue["number"]), current=cast(dict[str, str], next_ledger["current"]), attempts=cast(dict[str, int], next_ledger.get("attempts", {})), limits=cast(dict[str, int], next_ledger.get("limits", {})), last_failure=cast(dict[str, object], next_ledger.get("lastFailure", {})), workflow=cast(dict[str, object], next_ledger.get("workflow", {})), automation=cast(dict[str, object], next_ledger.get("automation", {})), artifacts=cast(dict[str, object], next_ledger.get("artifacts", {})), queued_next_issue=cast(dict[str, object], next_ledger.get("queuedNextIssue", {})), updated_at=timestamp)
-            return next_ledger, cast(SupervisorDecision, cast(object, decision)), cast(SessionRequest | None, cast(object, request))
+            return next_ledger, decision, request
 
-        if current["role"] == "issue_worker":
+        def _route_issue_worker() -> tuple[JsonObject, JsonObject, JsonObject | None]:
             reconcile_issue_worker = cast(Callable[..., tuple[JsonObject, JsonObject, JsonObject | None]], _reconcile_helpers.reconcile_issue_worker)
             next_ledger, decision, request = reconcile_issue_worker(
                 ledger,
@@ -3640,9 +3698,9 @@ def reconcile_ledger(
                 subagent_decision_func=_subagent_decision,
             )
             _sync_runtime_phase_metadata(base_dir=base_dir, issue_number=_ledger_issue_number(next_ledger, issue["number"]), current=cast(dict[str, str], next_ledger["current"]), attempts=cast(dict[str, int], next_ledger.get("attempts", {})), limits=cast(dict[str, int], next_ledger.get("limits", {})), last_failure=cast(dict[str, object], next_ledger.get("lastFailure", {})), workflow=cast(dict[str, object], next_ledger.get("workflow", {})), automation=cast(dict[str, object], next_ledger.get("automation", {})), artifacts=cast(dict[str, object], next_ledger.get("artifacts", {})), queued_next_issue=cast(dict[str, object], next_ledger.get("queuedNextIssue", {})), updated_at=timestamp)
-            return next_ledger, cast(SupervisorDecision, cast(object, decision)), cast(SessionRequest | None, cast(object, request))
+            return next_ledger, decision, request
 
-        if current["role"] == "pr_verifier":
+        def _route_pr_verifier() -> tuple[JsonObject, JsonObject, JsonObject | None]:
             reconcile_pr_verifier = cast(Callable[..., tuple[JsonObject, JsonObject, JsonObject | None]], _reconcile_helpers.reconcile_pr_verifier)
             next_ledger, decision, request = reconcile_pr_verifier(
                 ledger,
@@ -3659,11 +3717,6 @@ def reconcile_ledger(
                     base_dir=artifact_lookup_base_dir,
                     issue_number=issue["number"],
                     artifact_kind=entry_type,
-                ),
-                read_latest_history_entry=lambda entry_type: read_latest_history_entry(
-                    artifact_lookup_base_dir,
-                    issue_number=issue["number"],
-                    entry_type=entry_type,
                 ),
                 record_pr_opened=record_pr_opened,
                 record_current_verifier_session=_record_current_verifier_session,
@@ -3687,9 +3740,9 @@ def reconcile_ledger(
                     updated_at=timestamp,
                 )
             _sync_runtime_phase_metadata(base_dir=base_dir, issue_number=_ledger_issue_number(next_ledger, issue["number"]), current=cast(dict[str, str], next_ledger["current"]), attempts=cast(dict[str, int], next_ledger.get("attempts", {})), limits=cast(dict[str, int], next_ledger.get("limits", {})), last_failure=cast(dict[str, object], next_ledger.get("lastFailure", {})), workflow=cast(dict[str, object], next_ledger.get("workflow", {})), automation=cast(dict[str, object], next_ledger.get("automation", {})), artifacts=cast(dict[str, object], next_ledger.get("artifacts", {})), queued_next_issue=cast(dict[str, object], next_ledger.get("queuedNextIssue", {})), updated_at=timestamp)
-            return next_ledger, cast(SupervisorDecision, cast(object, decision)), cast(SessionRequest | None, cast(object, request))
+            return next_ledger, decision, request
 
-        if current["role"] == "main_orchestrator" and current["stage"] == "release_root_execution":
+        def _route_release_root_execution() -> tuple[JsonObject, JsonObject, JsonObject | None]:
             reconcile_release_worker = cast(Callable[..., tuple[JsonObject, JsonObject, JsonObject | None]], _reconcile_helpers.reconcile_release_worker)
             next_ledger, decision, request = reconcile_release_worker(
                 ledger,
@@ -3716,9 +3769,9 @@ def reconcile_ledger(
                 subagent_decision_func=_subagent_decision,
             )
             _sync_runtime_phase_metadata(base_dir=base_dir, issue_number=_ledger_issue_number(next_ledger, issue["number"]), current=cast(dict[str, str], next_ledger["current"]), attempts=cast(dict[str, int], next_ledger.get("attempts", {})), limits=cast(dict[str, int], next_ledger.get("limits", {})), last_failure=cast(dict[str, object], next_ledger.get("lastFailure", {})), workflow=cast(dict[str, object], next_ledger.get("workflow", {})), automation=cast(dict[str, object], next_ledger.get("automation", {})), artifacts=cast(dict[str, object], next_ledger.get("artifacts", {})), queued_next_issue=cast(dict[str, object], next_ledger.get("queuedNextIssue", {})), updated_at=timestamp)
-            return next_ledger, cast(SupervisorDecision, cast(object, decision)), cast(SessionRequest | None, cast(object, request))
+            return next_ledger, decision, request
 
-        if current["role"] == "main_orchestrator" and current["stage"] == "issue_selection_or_recovery":
+        def _route_issue_selection_or_recovery() -> tuple[JsonObject, JsonObject, JsonObject | None]:
             queued_next_issue_result = _consume_queued_next_issue(
                 ledger,
                 base_dir=base_dir,
@@ -3730,7 +3783,7 @@ def reconcile_ledger(
             if queued_next_issue_result is not None:
                 next_ledger, decision, request = queued_next_issue_result
                 _sync_runtime_phase_metadata(base_dir=base_dir, issue_number=_ledger_issue_number(next_ledger, issue["number"]), current=cast(dict[str, str], next_ledger["current"]), attempts=cast(dict[str, int], next_ledger.get("attempts", {})), limits=cast(dict[str, int], next_ledger.get("limits", {})), last_failure=cast(dict[str, object], next_ledger.get("lastFailure", {})), workflow=cast(dict[str, object], next_ledger.get("workflow", {})), automation=cast(dict[str, object], next_ledger.get("automation", {})), artifacts=cast(dict[str, object], next_ledger.get("artifacts", {})), queued_next_issue=cast(dict[str, object], next_ledger.get("queuedNextIssue", {})), updated_at=timestamp)
-                return next_ledger, cast(SupervisorDecision, cast(object, decision)), cast(SessionRequest | None, cast(object, request))
+                return next_ledger, cast(JsonObject, cast(object, decision)), cast(JsonObject | None, cast(object, request))
             reconcile_issue_selection_or_recovery = cast(Callable[..., tuple[JsonObject, JsonObject, JsonObject | None] | None], _reconcile_helpers.reconcile_issue_selection_or_recovery)
             recovery_result = reconcile_issue_selection_or_recovery(
                 ledger,
@@ -3751,34 +3804,39 @@ def reconcile_ledger(
             if recovery_result is not None:
                 next_ledger, decision, request = recovery_result
                 _sync_runtime_phase_metadata(base_dir=base_dir, issue_number=_ledger_issue_number(next_ledger, issue["number"]), current=cast(dict[str, str], next_ledger["current"]), attempts=cast(dict[str, int], next_ledger.get("attempts", {})), limits=cast(dict[str, int], next_ledger.get("limits", {})), last_failure=cast(dict[str, object], next_ledger.get("lastFailure", {})), workflow=cast(dict[str, object], next_ledger.get("workflow", {})), automation=cast(dict[str, object], next_ledger.get("automation", {})), artifacts=cast(dict[str, object], next_ledger.get("artifacts", {})), queued_next_issue=cast(dict[str, object], next_ledger.get("queuedNextIssue", {})), updated_at=timestamp)
-                return next_ledger, cast(SupervisorDecision, cast(object, decision)), cast(SessionRequest | None, cast(object, request))
+                return next_ledger, decision, request
+            return _route_no_change()
 
-        no_change_decision = cast(Callable[..., tuple[JsonObject, JsonObject, JsonObject | None]], _reconcile_helpers.no_change_decision)
-        next_ledger, decision, request = no_change_decision(
-            ledger,
+        def _route_no_change() -> tuple[JsonObject, JsonObject, JsonObject | None]:
+            no_change_decision = cast(Callable[..., tuple[JsonObject, JsonObject, JsonObject | None]], _reconcile_helpers.no_change_decision)
+            next_ledger, decision, request = no_change_decision(
+                ledger,
+                current=current,
+                updated_at=timestamp,
+                bump_ledger_revision=_bump_ledger_revision,
+            )
+            _sync_runtime_phase_metadata(base_dir=base_dir, issue_number=_ledger_issue_number(next_ledger, issue["number"]), current=cast(dict[str, str], next_ledger["current"]), attempts=cast(dict[str, int], next_ledger.get("attempts", {})), limits=cast(dict[str, int], next_ledger.get("limits", {})), last_failure=cast(dict[str, object], next_ledger.get("lastFailure", {})), workflow=cast(dict[str, object], next_ledger.get("workflow", {})), automation=cast(dict[str, object], next_ledger.get("automation", {})), artifacts=cast(dict[str, object], next_ledger.get("artifacts", {})), queued_next_issue=cast(dict[str, object], next_ledger.get("queuedNextIssue", {})), updated_at=timestamp)
+            return next_ledger, decision, request
+
+        dispatch_reconcile_route = cast(Callable[..., tuple[JsonObject, JsonObject, JsonObject | None]], _policy_helpers.dispatch_reconcile_route)
+        next_ledger, decision, request = dispatch_reconcile_route(
             current=current,
-            updated_at=timestamp,
-            bump_ledger_revision=_bump_ledger_revision,
+            handlers={
+                "orchestrator_bootstrap": _route_orchestrator_bootstrap,
+                "issue_worker": _route_issue_worker,
+                "pr_verifier": _route_pr_verifier,
+                "release_root_execution": _route_release_root_execution,
+                "issue_selection_or_recovery": _route_issue_selection_or_recovery,
+                "no_change": _route_no_change,
+            },
         )
-        _sync_runtime_phase_metadata(base_dir=base_dir, issue_number=_ledger_issue_number(next_ledger, issue["number"]), current=cast(dict[str, str], next_ledger["current"]), attempts=cast(dict[str, int], next_ledger.get("attempts", {})), limits=cast(dict[str, int], next_ledger.get("limits", {})), last_failure=cast(dict[str, object], next_ledger.get("lastFailure", {})), workflow=cast(dict[str, object], next_ledger.get("workflow", {})), automation=cast(dict[str, object], next_ledger.get("automation", {})), artifacts=cast(dict[str, object], next_ledger.get("artifacts", {})), queued_next_issue=cast(dict[str, object], next_ledger.get("queuedNextIssue", {})), updated_at=timestamp)
-        return next_ledger, cast(SupervisorDecision, cast(object, decision)), cast(SessionRequest | None, cast(object, request))
+        return (
+            next_ledger,
+            cast(SupervisorDecision, cast(object, decision)),
+            cast(SessionRequest | None, cast(object, request)),
+        )
     finally:
         pass
-
-
-def _resolve_db_issue_number_for_legacy_command(
-    *,
-    base_dir: Path,
-    requested_issue_number: str | None = None,
-) -> str:
-    if requested_issue_number:
-        return _normalize_requested_issue_number(requested_issue_number)
-    active_issues = list_issues(base_dir, require_current_session=False)
-    if len(active_issues) == 1:
-        return str(active_issues[0].get("issue_number") or "")
-    if not active_issues:
-        raise ValueError("no issue found in SQLite control plane; provide --issue-number")
-    raise ValueError("multiple issues found in SQLite control plane; provide --issue-number")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3967,10 +4025,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if cast(str, args.command) == "dispatch":
         base_dir = Path(cast(str, getattr(args, "base_dir", "."))).resolve()
-        issue_number = _resolve_db_issue_number_for_legacy_command(
-            base_dir=base_dir,
-            requested_issue_number=cast(str | None, getattr(args, "issue_number", None)),
-        )
+        issue_number = _normalize_requested_issue_number(cast(str, args.issue_number))
         request_row = read_latest_history_entry(base_dir, issue_number=issue_number, entry_type="dispatch_request")
         if request_row is None:
             raise ValueError(f"no DB-backed dispatch_request found for issue #{issue_number}")
@@ -4062,10 +4117,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if cast(str, args.command) == "redispatch-quarantined":
         base_dir = Path(cast(str, getattr(args, "base_dir", "."))).resolve()
-        issue_number = _resolve_db_issue_number_for_legacy_command(
-            base_dir=base_dir,
-            requested_issue_number=cast(str | None, getattr(args, "issue_number", None)),
-        )
+        issue_number = _normalize_requested_issue_number(cast(str, args.issue_number))
         issue = read_issue(base_dir, issue_number)
         if issue is None:
             raise ValueError(f"unknown issue #{issue_number}")

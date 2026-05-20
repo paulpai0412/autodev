@@ -162,7 +162,8 @@ def test_main_discovers_consumer_project_from_project_root(tmp_path: Path, capsy
     assert packet["issue_number"] == "42"
 
 
-def test_main_requires_consumer_project_root(tmp_path: Path, capsys):
+def test_main_requires_consumer_project_root(tmp_path: Path, capsys, monkeypatch):
+    monkeypatch.chdir(tmp_path)
     fixture_path = tmp_path / "issues.json"
     fixture_path.write_text(
         json.dumps(

@@ -8,9 +8,10 @@ from pytest import CaptureFixture
 
 from scripts.control_plane_db import ingest_issue_packet, read_issue, sync_issue_runtime_context, transition_issue_state, upsert_issue_ranking, upsert_issue_state
 from scripts import orchestrator_monitor
+from scripts.orchestrator_artifacts import parse_issue_packet_text
 from scripts.orchestrator_monitor import collect_monitor_events, main, run_monitor_watch
 import scripts.orchestrator_supervisor as orchestrator_supervisor
-from scripts.orchestrator_supervisor import create_initial_ledger, parse_issue_packet_text, reconcile_ledger
+from scripts.orchestrator_supervisor import create_initial_ledger, reconcile_ledger
 
 
 SAMPLE_ISSUE_PACKET = """schema_version: "1.0"

@@ -297,6 +297,10 @@ def test_open_code_host_adapter_start_child_role_marks_foreground_child_mode(mon
 
     assert result.status == "success"
     assert result.session_id == "ses-child"
+    assert result.execution_mode == "foreground_child_role"
+    assert result.child_role == "release_worker"
+    assert result.child_session_id == "ses-grandchild"
+    assert result.child_session_status == "stop"
     assert result.metadata["executionMode"] == "foreground_child_role"
     assert result.metadata["childRole"] == "release_worker"
     assert result.metadata["childSessionID"] == "ses-grandchild"

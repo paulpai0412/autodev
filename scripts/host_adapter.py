@@ -30,6 +30,14 @@ class SessionStartResult:
     resume_hint: str = ""
     resume_command: str = ""
     readability_status: str = ""
+    retry_without_source_session: bool = False
+    tui_resume_command: str = "/sessions"
+    stop_continuation_status: str = "root_session_detached"
+    stop_continuation_attempts: int = 0
+    execution_mode: str = "root_session"
+    child_role: str = ""
+    child_session_id: str = ""
+    child_session_status: str = ""
     metadata: dict[str, object] = field(default_factory=dict)
 
     @property
@@ -41,6 +49,8 @@ class SessionStartResult:
         by launching a fresh root session without source-session affinity.
         """
 
+        if self.retry_without_source_session:
+            return True
         value = self.metadata.get("retryWithoutSourceSession")
         return bool(value)
 
@@ -55,6 +65,16 @@ class SessionOutcome:
     error: str = ""
     resume_hint: str = ""
     metadata: dict[str, object] = field(default_factory=dict)
+
+
+def session_result_field(result: object, attr_name: str, metadata_key: str, default: object) -> object:
+    value = getattr(result, attr_name, default)
+    if value != default and value not in ("", 0, False, None):
+        return value
+    metadata = getattr(result, "metadata", {})
+    if isinstance(metadata, dict):
+        return metadata.get(metadata_key, default)
+    return default
 
 
 class HostAdapter(Protocol):

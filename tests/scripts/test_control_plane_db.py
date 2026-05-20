@@ -859,3 +859,27 @@ def test_release_child_session_projection_round_trips_through_snapshot_helpers(t
     assert release_child_session["childSessionID"] == "ses-release-worker-42"
     assert latest_ref["history_id"] == history_id
     assert latest_ref["childSessionStatus"] == "stop"
+
+
+def test_sync_issue_runtime_context_removes_key_when_runtime_context_value_is_none(tmp_path: Path):
+    ensure_control_plane_db(tmp_path)
+
+    _ = sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-11T10:00:00+08:00",
+        runtime_context={"queuedNextIssue": {"issue_number": "42", "branch": "agent/issue-42-demo", "base_branch": "main"}},
+    )
+
+    with_queued = read_runtime_context(tmp_path, "42")
+    assert with_queued.get("queuedNextIssue") is not None
+
+    _ = sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-11T10:01:00+08:00",
+        runtime_context={"queuedNextIssue": None},
+    )
+
+    without_queued = read_runtime_context(tmp_path, "42")
+    assert "queuedNextIssue" not in without_queued
