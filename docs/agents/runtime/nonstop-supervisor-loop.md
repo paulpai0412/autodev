@@ -77,6 +77,7 @@ Reconcile must treat SQLite artifact facts as authoritative and avoid runtime YA
 - The main orchestrator waits for each child call to finish before deciding next stage.
 - Only next-issue handoff or explicit recovery may create a new root session.
 - For release-root execution, monitor/inspect should be able to observe the latest foreground child trace through the projected `release_child_session` snapshot, without treating that projection as a new lifecycle owner.
+- After `orchestrator_supervisor.py release` (or `/autodev-release`) succeeds, the caller session must treat release execution as detached to the independent release root session: use `inspect`/`reconcile` for observation only, and do not manually launch another `release_worker` from the caller session.
 
 ## Stop conditions for this loop
 

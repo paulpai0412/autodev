@@ -120,35 +120,43 @@ def _evidence_has_browser_e2e_gate(evidence_packet: dict[str, object]) -> bool:
 
     surface_gate_raw = gates_raw.get("surface_qa_gate")
 
-    # Preferred contract: surface_qa_gate is an object with status + evidence_ref.
+    # Preferred contract: surface_qa_gate is an object with status + evidence_ref + evidence_kind.
+    # evidence_kind must be "browser" to confirm real browser execution (not headless unit tests).
     if isinstance(surface_gate_raw, dict):
         surface_gate = cast(dict[str, object], surface_gate_raw)
         status = str(surface_gate.get("status") or "").strip().lower()
         evidence_ref = str(surface_gate.get("evidence_ref") or "").strip()
-        return status == "pass" and bool(evidence_ref)
+        evidence_kind = str(surface_gate.get("evidence_kind") or "").strip().lower()
+        if status == "pass" and bool(evidence_ref) and evidence_kind == "browser":
+            return True
+        # Backward-compatible: dict surface_qa_gate without evidence_kind falls through to legacy check.
 
-    # Backward-compatible contract: legacy flat gate strings.
-    if isinstance(surface_gate_raw, str):
-        if surface_gate_raw.strip().lower() != "pass":
-            return False
+    # Backward-compatible contract: legacy flat gate strings, or dict surface_qa_gate missing evidence_kind.
+    surface_gate_pass = False
+    if isinstance(surface_gate_raw, dict):
+        surface_gate = cast(dict[str, object], surface_gate_raw)
+        surface_gate_pass = str(surface_gate.get("status") or "").strip().lower() == "pass"
+    elif isinstance(surface_gate_raw, str):
+        surface_gate_pass = surface_gate_raw.strip().lower() == "pass"
 
-        browser_gate_raw = gates_raw.get("browser_e2e_gate")
-        browser_gate_pass = False
-        if isinstance(browser_gate_raw, str):
-            browser_gate_pass = browser_gate_raw.strip().lower() == "pass"
-        elif isinstance(browser_gate_raw, dict):
-            browser_gate = cast(dict[str, object], browser_gate_raw)
-            browser_gate_pass = str(browser_gate.get("status") or "").strip().lower() == "pass"
+    if not surface_gate_pass:
+        return False
 
-        browser_evidence_raw = evidence_packet.get("browser_e2e_evidence")
-        has_browser_evidence = isinstance(browser_evidence_raw, dict) and bool(browser_evidence_raw)
+    browser_gate_raw = gates_raw.get("browser_e2e_gate")
+    browser_gate_pass = False
+    if isinstance(browser_gate_raw, str):
+        browser_gate_pass = browser_gate_raw.strip().lower() == "pass"
+    elif isinstance(browser_gate_raw, dict):
+        browser_gate = cast(dict[str, object], browser_gate_raw)
+        browser_gate_pass = str(browser_gate.get("status") or "").strip().lower() == "pass"
 
-        artifact_manifest_raw = evidence_packet.get("artifact_manifest")
-        has_manifest = isinstance(artifact_manifest_raw, list) and len(artifact_manifest_raw) > 0
+    browser_evidence_raw = evidence_packet.get("browser_e2e_evidence")
+    has_browser_evidence = isinstance(browser_evidence_raw, dict) and bool(browser_evidence_raw)
 
-        return browser_gate_pass and (has_browser_evidence or has_manifest)
+    artifact_manifest_raw = evidence_packet.get("artifact_manifest")
+    has_manifest = isinstance(artifact_manifest_raw, list) and len(artifact_manifest_raw) > 0
 
-    return False
+    return browser_gate_pass and (has_browser_evidence or has_manifest)
 
 
 def _browser_e2e_gate_deficiency(evidence_packet: dict[str, object]) -> str:
@@ -168,6 +176,13 @@ def _browser_e2e_gate_deficiency(evidence_packet: dict[str, object]) -> str:
     evidence_ref = str(surface_gate.get("evidence_ref") or "").strip()
     if not evidence_ref:
         return "missing key: gates.surface_qa_gate.evidence_ref (non-empty string)"
+
+    evidence_kind = str(surface_gate.get("evidence_kind") or "").strip().lower()
+    if evidence_kind != "browser":
+        return (
+            f"invalid value: gates.surface_qa_gate.evidence_kind must be 'browser' "
+            f"(got {evidence_kind!r}); smoke_test or unit_test is not accepted as browser_e2e evidence"
+        )
 
     return "missing browser_e2e evidence contract fields"
 
@@ -667,7 +682,8 @@ def reconcile_pr_verifier(
             deficiency = _browser_e2e_gate_deficiency(persisted_evidence)
             summary = (
                 f"Verifier for issue #{issue['number']} reported pass without required browser_e2e_gate evidence in evidence_packet "
-                f"({deficiency}). Retry pr_verifier with gates.surface_qa_gate set to {{status: 'pass', evidence_ref: '<non-empty>'}} "
+                f"({deficiency}). Retry pr_verifier with gates.surface_qa_gate set to "
+                "{status: 'pass', evidence_ref: '<non-empty>', evidence_kind: 'browser'} "
                 "or provide legacy-compatible browser_e2e evidence fields before acceptance."
             )
             set_failure_func(ledger, kind="contract_invalid", summary=summary, retryable=True)
@@ -1027,8 +1043,16 @@ def reconcile_release_worker(
         )
 
     blocked_reason = cast(str, persisted_release.get("blocked_reason") or "none")
+    blocked_reason = blocked_reason.strip().lower()
+    if blocked_reason in {"human_approval_required", "approval_override_mode is none"}:
+        blocked_reason = "release_human_approval_missing"
     retryable = cast(bool | None, persisted_release.get("retryable"))
-    failure_kind = cast(str, persisted_release.get("failure_kind") or blocked_reason or "release_blocked")
+    failure_kind = cast(str, persisted_release.get("failure_kind") or "").strip().lower()
+    if not failure_kind:
+        if blocked_reason == "release_human_approval_missing":
+            failure_kind = "human_approval_pending"
+        else:
+            failure_kind = blocked_reason or "release_blocked"
     summary = cast(str, persisted_release.get("next_recommended_step") or "")
     set_failure_func(
         ledger,

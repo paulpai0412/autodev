@@ -332,6 +332,7 @@ A verifier pass always moves the issue into `verified` first.
 - The runtime may hand verified issues to a dedicated release coordinator, merge worker, or scheduled release sweep.
 - A release handler claims work from `verified` and then moves the issue into `release_pending` when release ownership actually begins; the shipped OpenCode command surface exposes this as `/autodev-release [issue-number]`.
 - The shipped OpenCode release path uses an independent release root session whose role/stage is `main_orchestrator/release_root_execution`; inside that root session, `release_worker` runs as a foreground child role.
+- Once `/autodev-release` (or `orchestrator_supervisor.py release`) returns a successful dispatch, the caller session is observer-only for that issue: it must track progress via `inspect`/`reconcile` and must not manually start another `release_worker` outside the independent release root session.
 - The supervisor must preserve the full child-session fact in `issue_history.payload_json` and may additionally project the latest release child trace into the issue snapshot for operator visibility.
 - Human approval requirements, merge windows, and deployment policy belong to the release mechanism, not to the development loop.
 - When approval is missing, the issue remains releasable without blocking development on the next issue.

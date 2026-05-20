@@ -12,3 +12,7 @@ venv/
 .playwright-mcp/
 issue*-modal-*.png
 issue*-snapshot-*.yml
+# autodev runtime state
+.opencode/runtime/*
+.opencode/runtime/control-plane.sqlite3
+!.opencode/runtime/.gitkeep

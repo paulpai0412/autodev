@@ -168,12 +168,13 @@ def build_prompt(
             f"You are the pr_verifier subagent for issue #{issue['number']}.",
             "Read the DB-backed issue packet context and the persisted worker_result context before touching anything else.",
             "Persist verifier acceptance or failure as an evidence_packet via submit-artifact instead of writing YAML files.",
-            "Evidence payload contract: prefer gates.surface_qa_gate as an object {status: 'pass', evidence_ref: '<non-empty>'}. Legacy flat gate strings are accepted only when browser_e2e evidence fields are also present.",
+            "Evidence payload contract: gates.surface_qa_gate must be an object {status: 'pass', evidence_ref: '<non-empty>', evidence_kind: 'browser'} when browser_e2e_gate is required. Flat gate strings are not accepted.",
             'Run pr_verifier with load_skills containing "review-work" for every verification run.',
             "If the worker changed web UI or static HTML surface files, browser_e2e_gate is mandatory before status=pass.",
             'When browser_e2e_gate is mandatory, include both "browser-qa" and "e2e-testing" in pr_verifier load_skills before executing checks.',
-            "For mandatory browser_e2e_gate runs, execute a real browser flow (happy path plus one refusal/error path), check console/network failures, and include compact evidence refs in the evidence_packet.",
-            "Do not mark status=pass when browser_e2e_gate applies but was not executed; submit blocked or fail with failure_kind and retryable.",
+            "For mandatory browser_e2e_gate runs, execute a real browser flow using Playwright (happy path plus one refusal/error path), check console/network failures, and include compact evidence refs in the evidence_packet.",
+            "Set gates.surface_qa_gate.evidence_kind to 'browser' only when a real browser was launched. smoke_test or unit_test execution does not qualify as browser evidence.",
+            "If Playwright is unavailable or the browser flow fails, submit status=blocked with failure_kind='browser_e2e_unavailable' and retryable=true. Do not downgrade to smoke_test and claim status=pass.",
             "After acceptance passes, create or record the formal PR and include pr_number in the evidence_packet payload.",
             f"When creating the formal PR, use head branch {issue['branch']} and base branch {issue.get('baseBranch') or 'main'}; include base_branch in the evidence_packet payload.",
             "Do not stop, summarize, or report verification progress until the evidence_packet payload is stored in SQLite.",
@@ -200,6 +201,10 @@ def build_prompt(
             "Read the release runtime controls from the DB-backed control-plane context and treat them as the source of truth for merge approval override.",
             'If `approval_override_mode` is `"bypass_approval"`, skip only the human approval requirement while still enforcing verifier pass, required checks, PR mergeability, review gate, diagnostics/build gate, surface QA gate, and workspace hygiene.',
             'When bypassing approval, record `merge_approval_mode`, `human_approval_skipped`, `override_source`, and `override_scope` in the release result summary or metadata fields.',
+            "Before merge, enforce local convergence in this order: `git fetch origin --prune` -> `git switch main` -> `git pull --ff-only origin main`; if any step fails, report blocked and do not merge.",
+            "Evaluate merge gates explicitly and persist them in release_result.merge_gate: checks_state (pending|failed|passed), mergeability_state (conflicted|clean), approval_state (missing|satisfied), blocked_reason, next_action.",
+            "Use remote GitHub PR merge as the single merge authority; do not merge main by local push.",
+            "After merge succeeds, run workspace hygiene and persist release_result.workspace_hygiene with cleanup_status plus branch/dirty/worktree cleanup fields.",
             (
                 f"Current release override: approval_override_mode={approval_override_mode or 'none'}, override_source={override_source}, human_approval_skipped={'true' if human_approval_skipped else 'false'}."
                 if approval_override_mode or human_approval_skipped or override_source != 'none'
@@ -209,6 +214,7 @@ def build_prompt(
             "If release is blocked or fails, include blocked_reason, failure_kind, retryable, and next_recommended_step in the submitted payload.",
             "Respect required checks, mergeability, approval policy, and workspace hygiene.",
             "After the foreground release_worker subagent stores release_result in SQLite, return control to the supervisor/release command result; do not launch another root session.",
+            "If the release command already returned success to a different caller session, that caller is observer-only: it may inspect/reconcile but must not manually launch another release_worker.",
         ]
     else:
         lines = common + [

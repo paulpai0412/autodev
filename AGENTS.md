@@ -37,6 +37,7 @@
 ## Workflow rules agents are likely to miss
 - `main_orchestrator` is orchestration-only. It validates contracts and routes work; it does **not** implement issue scope or perform final issue QA itself.
 - `issue_worker` and `pr_verifier` run as subagents inside the current root orchestrator session, and the root should launch them synchronously with `run_in_background: false`. `release_worker` runs as a synchronous foreground subagent inside an independent release root session claimed by the release command. Fresh root-session dispatch is only for `main_orchestrator` bootstrap/recovery handoff and the dedicated release root-session entrypoint.
+- After `orchestrator_supervisor.py release` (or `/autodev-release`) returns success, the caller session must treat release execution as detached to the independent release root session: only observe via `inspect`/`reconcile`, and **must not** manually launch another `release_worker` from the caller session.
 - On this branch, development scheduling is bounded and issue-scoped: multiple issues may progress concurrently, but the same issue must never have more than one active root orchestrator or development path.
 - `scripts/orchestrator_bootstrap_runner.py` and `scripts/orchestrator_supervisor.py` are now coupled through the SQLite control-plane schema and DB-backed dispatch/reconcile flow. Breaking issue/history field expectations will break bootstrap and recovery.
 
@@ -58,3 +59,17 @@
 - `docs/agents/autonomous-development-workflow.yaml` for role boundaries, gates, and bounded issue-scoped concurrency policy.
 - `docs/agents/issue-tracker.md` for GitHub tracker commands and verifier/release evidence rules.
 - `scripts/autodev_project.py` for consumer project init, global command install, and doctor checks.
+
+<!-- AUTODEV:BEGIN -->
+## Autodev
+
+This project is connected to the shared autodev workflow.
+
+- Project config: `.autodev.yaml`
+- Workflow source: `/home/timmypai/apps/autodev`
+- Main workflow policy: `/home/timmypai/apps/autodev/docs/agents/autonomous-development-workflow.yaml`
+- Runtime state: `.opencode/runtime/control-plane.sqlite3`
+- SQLite is the only runtime control-plane source of truth; local YAML/JSON artifacts are not required for progress.
+
+Do not copy workflow implementation, templates, commands, or runner scripts into this repo.
+<!-- AUTODEV:END -->

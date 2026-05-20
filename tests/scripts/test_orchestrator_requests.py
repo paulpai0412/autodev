@@ -152,6 +152,11 @@ def test_build_prompt_for_release_worker_mentions_release_approval_override() ->
     assert "human approval requirement" in prompt
     assert "merge_approval_mode" in prompt
     assert "override_scope" in prompt
+    assert "git fetch origin --prune" in prompt
+    assert "git pull --ff-only origin main" in prompt
+    assert "release_result.merge_gate" in prompt
+    assert "release_result.workspace_hygiene" in prompt
+    assert "single merge authority" in prompt
     assert "return control to the supervisor/release command result" in prompt
     assert "Do not perform the merge/close workflow directly from the release root shell" in prompt
     assert "return control to the main_orchestrator root session" not in prompt
@@ -183,7 +188,7 @@ def test_build_prompt_for_pr_verifier_requires_evidence_packet_before_completion
 
     assert "Persist verifier acceptance or failure as an evidence_packet via submit-artifact" in prompt
     assert "Evidence payload contract" in prompt
-    assert "surface_qa_gate as an object {status: 'pass', evidence_ref: '<non-empty>'}" in prompt
+    assert "gates.surface_qa_gate must be an object {status: 'pass', evidence_ref: '<non-empty>', evidence_kind: 'browser'}" in prompt
     assert "Do not stop, summarize, or report verification progress until the evidence_packet payload is stored in SQLite" in prompt
     assert "Immediately after submit-artifact for evidence_packet, run inspect" in prompt
     assert "Inspect command: python3 scripts/orchestrator_supervisor.py inspect --base-dir" in prompt

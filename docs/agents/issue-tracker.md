@@ -37,6 +37,7 @@ When running inside this clone, `gh` can also infer the repository from `git rem
 - Artifact bodies that remain as historical projections should stay compact: issue packet bodies <=80 lines, handoffs <=35 lines, evidence payload projections <=60 lines, checkpoints <=80 lines, and worker results <=80 lines.
 - Raw evidence is index-only in repo docs and main-agent context; keep full logs/traces/screenshots in external artifact bundles referenced by manifest IDs.
 - A `release_worker` may merge and close only after verifier-owned evidence passes, the PR is mergeable, required checks pass, and human merge approval policy is satisfied; otherwise it must report blocked.
+- `issue_worker` must never execute the final branch/PR merge. If a worker step attempts merge or reports merge conflict, treat it as blocked implementation feedback and keep merge ownership on `release_worker`.
 - Default merge approval mode is `human_required`.
 - Autonomous workflow start may explicitly set `approval_override_mode: bypass_approval` for that workflow run only.
 - `bypass_approval` may bypass only `human_merge_approval_policy_satisfied`; it must not bypass verifier pass, required checks, PR mergeability, review gate, diagnostics/build gate, or surface QA gate.
@@ -55,6 +56,32 @@ When running inside this clone, `gh` can also infer the repository from `git rem
 - `scripts/issue_packet_intake.py` is the supported bridge from live GitHub `ready-for-agent` issues into SQLite-backed intake inputs.
 - Supervisor recovery may invoke that intake script automatically when no eligible next issue is already present in DB-backed intake state.
 - Intake fallback is best-effort: if `gh` auth fails, GitHub is unreachable, or no eligible issue is returned, the supervisor must keep the result compact in SQLite-backed runtime state and avoid inventing a next issue.
+
+### Merge failure handling policy
+
+Use the following rules whenever merge-related failures happen:
+
+1. `issue_worker` merge-related failures
+   - If `issue_worker` hits local `git merge` conflicts, merge aborts, or tries to perform final PR merge, it must not force-resolve by bypassing tests or rewriting unrelated history.
+   - The worker must stop and submit a compact blocked `worker_result` with a clear root cause and minimal conflict summary.
+   - The issue stays in development flow (`running`/`verifying` path) until code is rebased/synced and verifier acceptance can resume.
+   - Ownership does not change: final merge authority remains on `release_worker` only.
+
+2. `release_worker` merge-related failures
+   - If PR mergeability fails (conflicts, required checks pending/failing, approval policy unmet), `release_worker` must submit blocked `release_result` and must not close the issue.
+   - The issue remains `release_pending` until a retry command or reconcile path resolves the blocking condition.
+   - `release_worker` may retry only after the blocking condition is explicitly cleared (for example: conflict resolved in source branch, checks green, approval satisfied or allowed override).
+
+3. Mandatory failure fields (compact)
+   - Any merge failure summary recorded in DB-backed runtime state or tracker comments should include: `merge_owner`, `merge_stage`, `failure_class`, `blocked_reason`, `next_action`.
+
+4. Recommended `blocked_reason` enums for merge failures
+   - `worker_merge_not_allowed`
+   - `worker_local_merge_conflict`
+   - `release_pr_not_mergeable`
+   - `release_required_checks_failed`
+   - `release_required_checks_pending`
+   - `release_human_approval_missing`
 
 ### Post-merge workspace hygiene comment template
 
