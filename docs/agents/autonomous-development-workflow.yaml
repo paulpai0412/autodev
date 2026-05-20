@@ -295,12 +295,15 @@ issue_selection:
     - dependency_topological_order
     - oldest_ready_issue_first
   execution:
-    mode: serial_single_issue
-    allow_parallel_ready_issues: false
+    mode: bounded_multi_issue
+    allow_parallel_ready_issues: true
+    capacity_source: AUTODEV_DEVELOPMENT_CAPACITY
+    scheduler_entrypoint: scripts/orchestrator_supervisor.py reconcile-workspace
     rationale:
-      - one_issue_one_branch_one_commit_one_pr
-      - fresh_worker_and_verifier_session_per_issue
-      - release_worker_cleanup_tracks_one_selected_issue_at_a_time
+      - selection_is_db_derived_from_issues_and_issue_history
+      - duplicate_start_for_same_issue_is_blocked_by_ready_to_claimed_fence
+      - verified_or_release_waiting_issues_do_not_block_unrelated_ready_issues
+      - independent_release_capacity_does_not_reduce_development_capacity
   on_no_ready_issue:
     - run_prd_phase_completeness_audit
   skip_when:

@@ -133,7 +133,6 @@ sequenceDiagram
 | `--issue-number` | 是 | 無 | 指定 issue |
 | `--base-dir` | 否 | `.` | consumer project root |
 | `--source-session-id` | 否 | `orchestrator-bootstrap` | dispatch 來源標記 |
-| `--workflow-policy-path` | 否 | `docs/agents/autonomous-development-workflow.yaml` | policy ref |
 | `--updated-at` | 否 | 無 | deterministic timestamp |
 
 ### 4.5 `scripts/issue_packet_intake.py`
@@ -143,7 +142,6 @@ sequenceDiagram
 | `--repo` | 否 | `AUTODEV_GITHUB_REPO` 或 `paulpai0412/autodev` | GitHub issue 來源 repo |
 | `--issues-json` | 否 | 無 | 本地 fixture JSON |
 | `--project-root` | 否 | `.` | consumer project root |
-| `--output-dir` | 否 | 無 | deprecated compatibility flag（DB-backed intake 忽略輸出） |
 
 ## 5. 環境變數設定
 

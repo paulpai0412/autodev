@@ -364,10 +364,8 @@ AUTODEV_GITHUB_REPO=<owner/repo> PYTHONPATH=. python3 scripts/issue_packet_intak
 若要用 fixture JSON 做本地測試：
 
 ```bash
-PYTHONPATH=. python3 scripts/issue_packet_intake.py --issues-json /path/to/issues.json --output-dir /tmp/issue-packets
+PYTHONPATH=. python3 scripts/issue_packet_intake.py --issues-json /path/to/issues.json
 ```
-
-其中 `--output-dir` 已是 deprecated compatibility flag；DB-backed intake 會忽略它，不再輸出 issue packet 檔案。
 
 ### 5.2 啟動指定 issue（高階 wrapper，建議用）
 
