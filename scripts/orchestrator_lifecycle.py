@@ -653,35 +653,76 @@ def sync_project_fields_projection(
             )
         return ""
 
+    runtime_context = read_runtime_context(base_dir, issue_number) or {}
+    option_map_payload = runtime_context.get("github_project_field_option_ids")
+    option_map = option_map_payload if isinstance(option_map_payload, dict) else {}
+    state_options_payload = option_map.get("state")
+    state_options = state_options_payload if isinstance(state_options_payload, dict) else {}
+    pr_workflow_options_payload = option_map.get("pr_workflow")
+    pr_workflow_options = pr_workflow_options_payload if isinstance(pr_workflow_options_payload, dict) else {}
+
     for field_id, field_value in fields.items():
         field_id = str(field_id or "").strip()
         field_value = str(field_value or "").strip()
         if not field_id:
             continue
-        mutation = (
-            "mutation($project:ID!,$item:ID!,$field:ID!,$value:String!){updateProjectV2ItemFieldValue(input:{projectId:$project,itemId:$item,fieldId:$field,value:{text:$value}}){projectV2Item{id}}}"
-        )
-        update = run(
-            [
-                "gh",
-                "api",
-                "graphql",
-                "-f",
-                f"query={mutation}",
-                "-F",
-                f"project={project_id}",
-                "-F",
-                f"item={item_id}",
-                "-F",
-                f"field={field_id}",
-                "-F",
-                f"value={field_value}",
-            ],
-            cwd=base_dir,
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+        option_id = ""
+        if field_value:
+            if field_id == str((read_runtime_context(base_dir, issue_number) or {}).get("github_project_field_ids", {}).get("state", "")).strip():
+                option_id = str(state_options.get(field_value, "")).strip()
+            elif field_id == str((read_runtime_context(base_dir, issue_number) or {}).get("github_project_field_ids", {}).get("pr_workflow", "")).strip():
+                option_id = str(pr_workflow_options.get(field_value, "")).strip()
+
+        if option_id:
+            mutation = (
+                "mutation($project:ID!,$item:ID!,$field:ID!,$option: String!){updateProjectV2ItemFieldValue(input:{projectId:$project,itemId:$item,fieldId:$field,value:{singleSelectOptionId:$option}}){projectV2Item{id}}}"
+            )
+            update = run(
+                [
+                    "gh",
+                    "api",
+                    "graphql",
+                    "-f",
+                    f"query={mutation}",
+                    "-F",
+                    f"project={project_id}",
+                    "-F",
+                    f"item={item_id}",
+                    "-F",
+                    f"field={field_id}",
+                    "-F",
+                    f"option={option_id}",
+                ],
+                cwd=base_dir,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        else:
+            mutation = (
+                "mutation($project:ID!,$item:ID!,$field:ID!,$value:String!){updateProjectV2ItemFieldValue(input:{projectId:$project,itemId:$item,fieldId:$field,value:{text:$value}}){projectV2Item{id}}}"
+            )
+            update = run(
+                [
+                    "gh",
+                    "api",
+                    "graphql",
+                    "-f",
+                    f"query={mutation}",
+                    "-F",
+                    f"project={project_id}",
+                    "-F",
+                    f"item={item_id}",
+                    "-F",
+                    f"field={field_id}",
+                    "-F",
+                    f"value={field_value}",
+                ],
+                cwd=base_dir,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
         if update.returncode != 0:
             error = (update.stderr or update.stdout).strip() or (
                 f"gh api graphql project field update failed with exit code {update.returncode}"
