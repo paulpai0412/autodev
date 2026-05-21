@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import cast
 
@@ -430,6 +431,68 @@ def test_collect_monitor_events_reports_stale_heartbeat(tmp_path: Path):
     )
 
     assert any(event["rule_id"] == "ROOT_HEARTBEAT_STALLED" for event in events)
+
+
+def test_collect_monitor_events_uses_env_root_heartbeat_timeout_when_param_omitted(tmp_path: Path):
+    previous = os.environ.get("AUTODEV_ROOT_HEARTBEAT_TIMEOUT_SECONDS")
+    os.environ["AUTODEV_ROOT_HEARTBEAT_TIMEOUT_SECONDS"] = "1800"
+    try:
+        issue_packet_path = tmp_path / "docs/agents/issue-packets/issue-42.yaml"
+        issue_packet_path.parent.mkdir(parents=True, exist_ok=True)
+        issue_packet_path.write_text(_issue_packet_text("42"), encoding="utf-8")
+        issue_packet = parse_issue_packet_text(issue_packet_path.read_text(encoding="utf-8"), "docs/agents/issue-packets/issue-42.yaml")
+        ledger = create_initial_ledger(issue_packet=issue_packet, primary_workspace_root=str(tmp_path), updated_at="2026-05-07T17:00:00+08:00")
+        cast(dict[str, object], ledger["current"]).update({"role": "issue_worker", "stage": "issue_worker_execution", "status": "queued"})
+        transition_issue_state(
+            tmp_path,
+            issue_number="42",
+            to_state="claimed",
+            command_id="cmd-claim",
+            scheduler_id="scheduler:test",
+            reason="claim",
+            updated_at="2026-05-07T17:00:00+08:00",
+            from_state="ready",
+        )
+        transition_issue_state(
+            tmp_path,
+            issue_number="42",
+            to_state="dispatching",
+            command_id="cmd-dispatch",
+            scheduler_id="scheduler:test",
+            reason="dispatch",
+            updated_at="2026-05-07T17:01:00+08:00",
+            from_state="claimed",
+        )
+        transition_issue_state(
+            tmp_path,
+            issue_number="42",
+            to_state="running",
+            command_id="cmd-run",
+            scheduler_id="scheduler:test",
+            reason="run",
+            updated_at="2026-05-07T17:02:00+08:00",
+            from_state="dispatching",
+        )
+        _sync_runtime_phase(
+            tmp_path,
+            "42",
+            role="issue_worker",
+            stage="issue_worker_execution",
+            status="queued",
+            updated_at="2026-05-07T17:02:00+08:00",
+        )
+
+        events = collect_monitor_events(
+            base_dir=tmp_path,
+            now="2026-05-07T17:20:01+08:00",
+        )
+    finally:
+        if previous is None:
+            os.environ.pop("AUTODEV_ROOT_HEARTBEAT_TIMEOUT_SECONDS", None)
+        else:
+            os.environ["AUTODEV_ROOT_HEARTBEAT_TIMEOUT_SECONDS"] = previous
+
+    assert not any(event["rule_id"] == "ROOT_HEARTBEAT_STALLED" for event in events)
 
 
 def test_collect_monitor_events_uses_wall_clock_when_now_is_omitted(tmp_path: Path, monkeypatch):

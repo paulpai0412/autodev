@@ -12,7 +12,7 @@ from typing import Any
 from typing import cast
 
 from scripts.control_plane_db import control_plane_db_path, development_slot_occupancy, list_issues, read_issue, ready_issues_for_selection, release_slot_occupancy
-from scripts.orchestrator_supervisor import ROOT_HEARTBEAT_TIMEOUT_SECONDS
+from scripts.orchestrator_supervisor import root_heartbeat_timeout_seconds
 
 
 JsonObject = dict[str, object]
@@ -133,9 +133,10 @@ def collect_monitor_events(
     base_dir: Path,
     issue_number: str | None = None,
     now: str | None = None,
-    heartbeat_timeout_seconds: int = ROOT_HEARTBEAT_TIMEOUT_SECONDS,
+    heartbeat_timeout_seconds: int | None = None,
     selection_timeout_seconds: int = 300,
 ) -> list[JsonObject]:
+    effective_heartbeat_timeout_seconds = heartbeat_timeout_seconds if heartbeat_timeout_seconds is not None else root_heartbeat_timeout_seconds()
     runtime_issue = _select_monitored_issue(base_dir=base_dir, issue_number=issue_number)
     events: list[JsonObject] = []
 
@@ -199,7 +200,7 @@ def collect_monitor_events(
     issue_time = _parse_timestamp(str(runtime_issue.get("updated_at") or runtime_issue.get("last_event_at") or ""))
 
     if current_role in {"issue_worker", "pr_verifier", "release_worker"} and current_status == "queued" and runtime_state in {"running", "verifying"} and now_time and last_event_time:
-        if now_time - last_event_time > timedelta(seconds=heartbeat_timeout_seconds):
+        if now_time - last_event_time > timedelta(seconds=effective_heartbeat_timeout_seconds):
             events.append(
                 _build_event(
                     rule_id="ROOT_HEARTBEAT_STALLED",
@@ -210,7 +211,7 @@ def collect_monitor_events(
                         "current_role": current_role,
                         "last_event_at": str(runtime_issue.get("last_event_at") or ""),
                         "now": effective_now,
-                        "heartbeat_timeout_seconds": heartbeat_timeout_seconds,
+                        "heartbeat_timeout_seconds": effective_heartbeat_timeout_seconds,
                     },
                 )
             )
@@ -225,7 +226,7 @@ def collect_monitor_events(
         and dispatching_time
     and _artifact_fact_missing(issue=runtime_issue, artifact_key=_current_role_artifact_key(current_role, current_stage))
     ):
-        if now_time - dispatching_time > timedelta(seconds=heartbeat_timeout_seconds):
+        if now_time - dispatching_time > timedelta(seconds=effective_heartbeat_timeout_seconds):
             events.append(
                 _build_event(
                     rule_id="DISPATCH_STALLED",
@@ -235,7 +236,7 @@ def collect_monitor_events(
                         "issue_number": monitored_issue_number,
                         "dispatching_at": str(runtime_issue.get("dispatching_at") or runtime_issue.get("updated_at") or ""),
                         "now": effective_now,
-                        "heartbeat_timeout_seconds": heartbeat_timeout_seconds,
+                        "heartbeat_timeout_seconds": effective_heartbeat_timeout_seconds,
                     },
                 )
             )
@@ -402,7 +403,7 @@ def build_parser() -> argparse.ArgumentParser:
     _ = parser.add_argument(
         "--heartbeat-timeout-seconds",
         type=int,
-        default=ROOT_HEARTBEAT_TIMEOUT_SECONDS,
+        default=root_heartbeat_timeout_seconds(),
         help="Stale running-session threshold",
     )
     _ = parser.add_argument(
