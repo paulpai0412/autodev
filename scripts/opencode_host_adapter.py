@@ -331,14 +331,27 @@ class OpenCodeHostAdapter(HostAdapter):
             root_session_id=session_id,
         )
         if not readable:
-            if process.poll() is None:
-                process.terminate()
+            probe_detail = readability_detail.strip() or "session_read probe failed without output"
             return SessionStartResult(
-                status="error",
+                status="success",
                 session_id=session_id,
                 launch_title=launch_title,
-                error=f"root session {session_id} was created but failed same-repo session_read probe: {readability_detail}",
-                readability_status="failed_same_repo_probe",
+                resume_hint=(
+                    f"Open /sessions in OpenCode TUI and switch to {session_id}, or run opencode --session {session_id}. "
+                    f"Warning: same-repo session_read probe failed ({probe_detail}); treat this root session as degraded readability and avoid immediate rollback."
+                ),
+                resume_command=f"opencode --session {session_id}",
+                readability_status="degraded_same_repo_probe",
+                tui_resume_command="/sessions",
+                stop_continuation_status="root_session_detached",
+                stop_continuation_attempts=0,
+                execution_mode="root_session",
+                metadata={
+                    "stopContinuationStatus": "root_session_detached",
+                    "stopContinuationAttempts": 0,
+                    "sameRepoProbeDetail": probe_detail,
+                    "command": command,
+                },
             )
         return SessionStartResult(
             status="success",

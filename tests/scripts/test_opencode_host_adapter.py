@@ -229,7 +229,7 @@ def test_probe_same_repo_session_readability_retries_session_not_found(monkeypat
     assert detail == "Session: ses-root"
 
 
-def test_open_code_host_adapter_start_root_session_returns_error_when_probe_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_open_code_host_adapter_start_root_session_returns_degraded_success_when_probe_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     process = _FakeProcess(stdout=io.StringIO(), stderr=io.StringIO(), poll_result=None)
     monkeypatch.setattr(adapter, "spawn_detached_opencode_run", lambda command, workdir: process)
     monkeypatch.setattr(adapter, "read_initial_session_id", lambda *args, **kwargs: ("ses-root", "", ""))
@@ -238,10 +238,11 @@ def test_open_code_host_adapter_start_root_session_returns_error_when_probe_fail
     host = adapter.OpenCodeHostAdapter(cli_resolver=lambda: "/fake/opencode")
     result = host.start_root_session(_session_context(tmp_path, agent="hephaestus"))
 
-    assert result.status == "error"
+    assert result.status == "success"
     assert result.session_id == "ses-root"
-    assert result.readability_status == "failed_same_repo_probe"
-    assert process.terminated is True
+    assert result.readability_status == "degraded_same_repo_probe"
+    assert "Warning: same-repo session_read probe failed" in result.resume_hint
+    assert process.terminated is False
 
 
 def test_open_code_host_adapter_sets_retry_flag_for_prefill_error(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
