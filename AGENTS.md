@@ -36,6 +36,7 @@
 
 ## Workflow rules agents are likely to miss
 - `main_orchestrator` is orchestration-only. It validates contracts and routes work; it does **not** implement issue scope or perform final issue QA itself.
+- `/autodev-flow` is an operator/orchestration entry contract (`C0..C6`) only. When invoking this skill, the active caller must remain orchestration-only and must **not** do issue implementation work, final acceptance QA, or assume `issue_worker` / `pr_verifier` / `release_worker` responsibilities.
 - `issue_worker` and `pr_verifier` run as subagents inside the current root orchestrator session, and the root should launch them synchronously with `run_in_background: false`. `release_worker` runs as a synchronous foreground subagent inside an independent release root session claimed by the release command. Fresh root-session dispatch is only for `main_orchestrator` bootstrap/recovery handoff and the dedicated release root-session entrypoint.
 - After `orchestrator_supervisor.py release` (or `/autodev-release`) returns success, the caller session must treat release execution as detached to the independent release root session: only observe via `inspect`/`reconcile`, and **must not** manually launch another `release_worker` from the caller session.
 - On this branch, development scheduling is bounded and issue-scoped: multiple issues may progress concurrently, but the same issue must never have more than one active root orchestrator or development path.

@@ -47,20 +47,6 @@ PYTHONPATH=. python3 scripts/autodev_project.py init --project-root <project> --
 PYTHONPATH=. python3 scripts/autodev_project.py doctor --project-root <project>
 ```
 
-若你希望 init 同時自動建立/綁定 GitHub Project（建議）：
-
-```bash
-PYTHONPATH=. python3 scripts/autodev_project.py init \
-  --project-root <project> \
-  --github-repo <owner/repo> \
-  --create-github-project \
-  --github-project-title "Autodev Control Plane"
-```
-
-可選參數：
-
-- `--github-project-owner <owner>`（預設取 `<owner/repo>` 的 owner）
-
 ### 2.3（選用）Projects V2 同步設定
 
 目前最小同步需要你提供：
@@ -73,8 +59,6 @@ PYTHONPATH=. python3 scripts/autodev_project.py init \
 ```bash
 export AUTODEV_GITHUB_PROJECT_ID=<project_node_id>
 ```
-
-> 補充：使用 `--create-github-project` 時，init 會把 project/field 綁定資訊寫進 `.autodev.yaml` 的 monitoring block，並嘗試同步到現有 issue runtime context。
 
 ---
 

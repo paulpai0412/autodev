@@ -40,7 +40,7 @@ priority_bridge:
       - run_py_compile_or_build_commands_for_issue_code
       - run_lsp_diagnostics_on_issue_code
       - run_manual_driver_or_surface_qa
-      - run_browser_or_playwright_qa
+      - run_browser_qa
       - run_sql_execution_validation
       - run_review_work_as_main_agent_qa
 
@@ -99,7 +99,7 @@ skills:
       - karpathy-guidelines
       - diagnose
     frontend_and_browser:
-      - playwright
+      - browser-qa
       - web-design-engineer
       - frontend-ui-ux
     review_and_quality:
@@ -251,7 +251,7 @@ repo_specific_gates:
       - web_ui_or_static_html_surface_changed
       - dashboard_builder_ui_changed
     skills_or_references:
-      - playwright
+      - browser-qa
       - e2e-testing
       - browser-qa
     pass_when:
@@ -862,7 +862,7 @@ phases:
     goal: Verify each issue through its smallest real user surface.
     policy: verifier_owned_issue_small_e2e
     primary_skills:
-      - playwright
+      - browser-qa
       - e2e-testing
       - browser-qa
     examples:
