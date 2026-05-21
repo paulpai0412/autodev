@@ -46,6 +46,41 @@ def fake_init_bootstrap_run(args: list[str], **_kwargs: object) -> CompletedProc
     raise AssertionError(f"unexpected command: {args}")
 
 
+def fake_init_with_project_bootstrap_run(args: list[str], **_kwargs: object) -> CompletedProcess[str]:
+    if args[:3] == ["git", "rev-parse", "--is-inside-work-tree"]:
+        return completed(args, returncode=128, stderr="not a git repository")
+    if args[:4] == ["git", "rev-parse", "--verify", "HEAD"]:
+        return completed(args, returncode=128, stderr="fatal: Needed a single revision")
+    if args[:4] == ["git", "remote", "get-url", "origin"]:
+        return completed(args, returncode=2, stderr="no such remote")
+    if args[:3] == ["gh", "repo", "view"]:
+        return completed(args, returncode=1, stderr="not found")
+    if args[:3] == ["git", "init", "-b"]:
+        return completed(args, stdout="initialized")
+    if args[:3] == ["git", "remote", "add"]:
+        return completed(args)
+    if args[:3] == ["gh", "repo", "create"]:
+        return completed(args, stdout="created")
+    if args[:3] == ["gh", "label", "create"]:
+        return completed(args)
+    if args[:4] == ["gh", "project", "list", "--owner"]:
+        return completed(args, stdout="[]")
+    if args[:4] == ["gh", "project", "create", "--owner"]:
+        return completed(args, stdout=json.dumps({"id": "PVT_project_1", "number": 7, "title": "Autodev Control Plane"}))
+    if args[:4] == ["gh", "project", "link", "7"]:
+        return completed(args)
+    if args[:4] == ["gh", "project", "field-list", "7"]:
+        return completed(args, stdout="[]")
+    if args[:4] == ["gh", "project", "field-create", "7"]:
+        if "Workflow State" in args:
+            return completed(args, stdout=json.dumps({"id": "PVTF_state"}))
+        if "Current Stage" in args:
+            return completed(args, stdout=json.dumps({"id": "PVTF_stage"}))
+        if "PR Workflow" in args:
+            return completed(args, stdout=json.dumps({"id": "PVTF_pr_workflow"}))
+    raise AssertionError(f"unexpected command: {args}")
+
+
 def test_init_creates_project_contract_dirs_and_agents_managed_block(tmp_path: Path):
     write(tmp_path / "AGENTS.md", "# Project Agents\n\nKeep this project-specific guidance.\n")
 
@@ -80,6 +115,30 @@ def test_init_creates_project_contract_dirs_and_agents_managed_block(tmp_path: P
     assert ["gh", "repo", "create", "paulpai0412/autodev", "--private", "--description", autodev_project.DEFAULT_REPO_DESCRIPTION] in commands
     label_commands = [command for command in commands if isinstance(command, list) and command[:3] == ["gh", "label", "create"]]
     assert len(label_commands) == len(autodev_project.BOOTSTRAP_LABELS)
+
+
+def test_init_create_github_project_writes_monitoring_block(tmp_path: Path):
+    write(tmp_path / "AGENTS.md", "# Project Agents\n")
+
+    with patch("scripts.autodev_project.subprocess.run", side_effect=fake_init_with_project_bootstrap_run):
+        exit_code = autodev_project.main(
+            [
+                "init",
+                "--project-root",
+                str(tmp_path),
+                "--github-repo",
+                "paulpai0412/autodev",
+                "--create-github-project",
+            ]
+        )
+
+    assert exit_code == 0
+    config = read(tmp_path / ".autodev.yaml")
+    assert "AUTODEV_GITHUB_MONITORING:BEGIN" in config
+    assert 'github_project_id: "PVT_project_1"' in config
+    assert 'state: "PVTF_state"' in config
+    assert 'stage: "PVTF_stage"' in config
+    assert 'pr_workflow: "PVTF_pr_workflow"' in config
 
 
 def test_init_dry_run_writes_nothing(tmp_path: Path):
@@ -191,6 +250,34 @@ def test_doctor_reports_missing_control_plane_db(tmp_path: Path, capsys: Capture
 
     assert exit_code == 1
     assert "missing .opencode/runtime/control-plane.sqlite3" in captured.out
+
+
+def test_doctor_reports_incomplete_github_monitoring_block(tmp_path: Path, capsys: CaptureFixture[str]):
+    write(
+        tmp_path / ".autodev.yaml",
+        '\n'.join(
+            [
+                'schema_version: "1.0"',
+                'project:',
+                '  name: demo',
+                '# AUTODEV_GITHUB_MONITORING:BEGIN',
+                'github_project_title: "Autodev Control Plane"',
+                'github_project_field_ids:',
+                '  state: "PVTF_state"',
+                '# AUTODEV_GITHUB_MONITORING:END',
+                '',
+            ]
+        ),
+    )
+    write(tmp_path / "AGENTS.md", "# AGENTS.md\n")
+
+    exit_code = autodev_project.main(["doctor", "--project-root", str(tmp_path)])
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "missing github_project_id in .autodev.yaml monitoring block" in captured.out
+    assert "missing github_project_field_ids.stage" in captured.out
+    assert "missing github_project_field_ids.pr_workflow" in captured.out
 
 
 def test_doctor_reports_tracked_runtime_files(tmp_path: Path, capsys: CaptureFixture[str]):

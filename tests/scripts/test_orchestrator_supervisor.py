@@ -997,7 +997,10 @@ def test_start_issue_records_db_backed_dispatch_result(tmp_path: Path):
     with patch(
         "scripts.orchestrator_supervisor._default_host_adapter",
         return_value=successful_host_adapter(session_id="ses_root_test", resume_command="opencode --session ses_root_test"),
-    ), patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+    ), patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""), patch(
+        "scripts.orchestrator_supervisor._sync_issue_body_projection",
+        return_value="",
+    ) as sync_body_projection:
         result = orchestrator_supervisor.start_issue(
             base_dir=tmp_path,
             issue_number="42",
@@ -1027,6 +1030,152 @@ def test_start_issue_records_db_backed_dispatch_result(tmp_path: Path):
     assert '"base_branch": "main"' in str(stack_base["payload_json"])
     runtime_context = orchestrator_supervisor.read_runtime_context(tmp_path, "42")
     assert runtime_context.get("issue_worktree_path") == str(tmp_path)
+    assert sync_body_projection.call_count == 2
+
+
+def test_start_issue_body_projection_failure_does_not_block_dispatch(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    orchestrator_supervisor._sync_issue_packet_to_db(tmp_path, issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+
+    with patch(
+        "scripts.orchestrator_supervisor._default_host_adapter",
+        return_value=successful_host_adapter(session_id="ses_root_test", resume_command="opencode --session ses_root_test"),
+    ), patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""), patch(
+        "scripts.orchestrator_supervisor._sync_issue_body_projection",
+        side_effect=["body projection failed at dispatch", ""],
+    ):
+        result = orchestrator_supervisor.start_issue(
+            base_dir=tmp_path,
+            issue_number="42",
+            source_session_id="autodev-start",
+            updated_at="2026-05-07T17:10:00+08:00",
+        )
+
+    latest_admin = read_latest_issue_history(tmp_path, "42", entry_type="admin_action")
+    issue = read_issue(tmp_path, "42")
+    assert result.get("status") == "success"
+    assert issue is not None
+    assert issue["state"] == "running"
+    assert latest_admin is not None
+    payload = json.loads(str(latest_admin["payload_json"] or "{}"))
+    assert payload["decision_type"] == "admin_github_projection_failure"
+    assert "issue_body" in str(latest_admin["summary"])
+
+
+def test_start_issue_projection_bundle_runs_comment_and_project_sync(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    orchestrator_supervisor._sync_issue_packet_to_db(tmp_path, issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+
+    with patch(
+        "scripts.orchestrator_supervisor._default_host_adapter",
+        return_value=successful_host_adapter(session_id="ses_root_test", resume_command="opencode --session ses_root_test"),
+    ), patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""), patch(
+        "scripts.orchestrator_supervisor._sync_issue_body_projection",
+        return_value="",
+    ) as sync_body_projection, patch(
+        "scripts.orchestrator_supervisor._sync_issue_status_comment",
+        return_value="",
+    ) as sync_status_comment, patch(
+        "scripts.orchestrator_supervisor._sync_project_fields_projection",
+        return_value="",
+    ) as sync_project_fields:
+        result = orchestrator_supervisor.start_issue(
+            base_dir=tmp_path,
+            issue_number="42",
+            source_session_id="autodev-start",
+            updated_at="2026-05-07T17:10:00+08:00",
+        )
+
+    assert result.get("status") == "success"
+    assert sync_body_projection.call_count == 2
+    assert sync_status_comment.call_count == 2
+    assert sync_project_fields.call_count == 2
+
+
+def test_sync_project_fields_projection_includes_pr_workflow_status(tmp_path: Path):
+    _ingest_issue_packet_text(tmp_path, "42", SAMPLE_ISSUE_PACKET)
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="running",
+        command_id="cmd-running",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_session_id="ses-root-42",
+    )
+    orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:01:00+08:00",
+        runtime_context={
+            "github_project_id": "PVT_project_1",
+            "github_project_field_ids": {
+                "state": "PVTF_state",
+                "stage": "PVTF_stage",
+                "pr_workflow": "PVTF_pr_workflow",
+            },
+        },
+    )
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="evidence_packet",
+        payload={
+            "status": "pass",
+            "pr_number": "88",
+        },
+        updated_at="2026-05-07T17:02:00+08:00",
+    )
+
+    captured_fields: dict[str, str] = {}
+
+    def fake_sync_fields(*, fields: dict[str, str], **_kwargs: object) -> str:
+        captured_fields.update(fields)
+        return ""
+
+    with patch("scripts.orchestrator_supervisor._read_project_github_repo", return_value="example/repo"), patch(
+        "scripts.orchestrator_supervisor._lifecycle_helpers.sync_project_fields_projection",
+        side_effect=fake_sync_fields,
+    ):
+        error = orchestrator_supervisor._sync_project_fields_projection(
+            base_dir=tmp_path,
+            issue_number="42",
+            command_id="cmd-project-sync",
+            updated_at="2026-05-07T17:03:00+08:00",
+        )
+
+    assert error == ""
+    assert captured_fields["PVTF_state"] == "running"
+    assert captured_fields["PVTF_stage"] == ""
+    assert captured_fields["PVTF_pr_workflow"] == "verifier_passed"
+
+
+def test_inspect_project_pr_workflow_reflects_merged_release(tmp_path: Path):
+    _ingest_issue_packet_text(tmp_path, "42", SAMPLE_ISSUE_PACKET)
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="release_pending",
+        command_id="cmd-release-pending",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_session_id="ses-release-42",
+    )
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="release_result",
+        payload={
+            "status": "success",
+            "merge": {"merged": True, "merged_sha": "abc123"},
+            "pr_number": "88",
+        },
+        updated_at="2026-05-07T17:00:30+08:00",
+    )
+
+    payload = orchestrator_supervisor.inspect_control_plane(base_dir=tmp_path, issue_number="42")
+    pr_workflow = cast(dict[str, object], payload["projectPrWorkflow"])
+
+    assert pr_workflow["status"] == "merged"
+    assert pr_workflow["prNumber"] == "88"
 
 
 def test_start_issue_succeeds_without_legacy_runtime_files(tmp_path: Path):
@@ -2142,8 +2291,9 @@ def test_validate_session_request_rejects_stale_issue_or_branch(tmp_path: Path):
 
     stale_issue_request = cast(dict[str, object], dict(request))
     stale_issue_request["issueNumber"] = "41"
+    stale_issue_session_request = cast(orchestrator_supervisor.SessionRequest, cast(object, stale_issue_request))
     issue_error = validate_session_request_for_dispatch(
-        cast(orchestrator_supervisor.SessionRequest, stale_issue_request),
+        stale_issue_session_request,
         ledger,
         base_dir=tmp_path,
     )
@@ -2151,8 +2301,9 @@ def test_validate_session_request_rejects_stale_issue_or_branch(tmp_path: Path):
 
     stale_branch_request = cast(dict[str, object], dict(request))
     stale_branch_request["branch"] = "agent/issue-42-alt"
+    stale_branch_session_request = cast(orchestrator_supervisor.SessionRequest, cast(object, stale_branch_request))
     branch_error = validate_session_request_for_dispatch(
-        cast(orchestrator_supervisor.SessionRequest, stale_branch_request),
+        stale_branch_session_request,
         ledger,
         base_dir=tmp_path,
     )
@@ -7028,7 +7179,7 @@ verifier_manual_qa:
                 "surface_qa_gate": {"status": "pass", "evidence_ref": "artifacts/browser-e2e/report.html"},
                 "browser_e2e_gate": "pass",
             },
-            "browser_e2e_evidence": {"method": "playwright"},
+            "browser_e2e_evidence": {"method": "chrome"},
         },
         updated_at="2026-05-07T17:11:00+08:00",
     )
@@ -7137,6 +7288,7 @@ def test_inspect_command_prints_control_plane_snapshot(tmp_path: Path, monkeypat
         "issue",
         "latestDecision",
         "latestGitHubSyncAttempt",
+        "projectPrWorkflow",
         "releaseGate",
         "releaseChildSession",
         "latestReleaseChildSession",
@@ -7149,6 +7301,8 @@ def test_inspect_command_prints_control_plane_snapshot(tmp_path: Path, monkeypat
     assert cast(dict[str, object], payload["issue"])["issue_number"] == "42"
     assert cast(dict[str, object], payload["latestDecision"])["command_id"] == "cmd-claim"
     assert cast(dict[str, object], payload["latestGitHubSyncAttempt"])["command_id"] == "cmd-gh"
+    assert cast(dict[str, object], payload["latestGitHubSyncAttempt"])["projection_target"] == "labels"
+    assert cast(dict[str, object], payload["projectPrWorkflow"])["status"] == "not_opened"
     assert cast(dict[str, object], payload["releaseChildSession"])["childSessionID"] == "ses-release-worker-42"
     assert cast(dict[str, object], payload["latestReleaseChildSession"])["command_id"] == "cmd-release-child"
     release_backfill = cast(dict[str, object], payload["releaseBackfill"])

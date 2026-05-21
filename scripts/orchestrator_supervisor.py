@@ -1079,6 +1079,12 @@ def start_issue(
         reason=f"Dispatch root session request for issue #{issue_number}.",
         from_state="claimed",
     )
+    _sync_github_projection_bundle(
+        base_dir=base_dir,
+        issue_number=issue_number,
+        phase="dispatching",
+        updated_at=timestamp,
+    )
     session_result = dispatch_session_request(
         request,
         workdir=issue_worktree,
@@ -1120,6 +1126,12 @@ def start_issue(
                 f"Resume the active root session with {_default_host_adapter().resume_link(root_session_id)}. "
                 f"GitHub running-label sync failed and may need retry: {sync_error}"
             )
+        _sync_github_projection_bundle(
+            base_dir=base_dir,
+            issue_number=issue_number,
+            phase="running",
+            updated_at=recorded_at,
+        )
         # Persist the initial bootstrap -> issue_worker handoff in SQLite before the
         # first issue_worker launch so verifier evidence can come from the control plane.
         ledger["lastSessionResult"] = dict(session_result)
@@ -1583,6 +1595,253 @@ def _sync_issue_progress_label(
         command_id=command_id,
         updated_at=updated_at,
     )
+
+
+def _render_issue_body_projection_markdown(*, base_dir: Path, issue_number: str, updated_at: str) -> str:
+    issue = read_issue(base_dir, issue_number) or {}
+    issue_packet = _load_json_dict(issue.get("issue_packet_json"))
+
+    state = str(issue.get("state") or "")
+    role = str(issue.get("current_role") or "")
+    stage = str(issue.get("current_stage") or "")
+    status = str(issue.get("current_status") or "")
+    dependencies_raw = issue_packet.get("dependencies")
+    dependencies = [str(item).strip() for item in dependencies_raw] if isinstance(dependencies_raw, list) else []
+    dependencies = [item for item in dependencies if item]
+    parent_reference = str(issue_packet.get("parent_reference") or "none")
+
+    def _db_ref(entry_type: str) -> str:
+        ref = read_latest_ref(base_dir, issue_number, entry_type)
+        command_id = str(ref.get("command_id") or "")
+        history_id = str(ref.get("history_id") or "")
+        pointer = command_id or history_id
+        if not pointer:
+            return "none"
+        return f"db:issue-history/{entry_type}:{issue_number}:{pointer}"
+
+    dependencies_display = ", ".join(f"#{dep}" if dep.isdigit() else dep for dep in dependencies) if dependencies else "none"
+    lines = [
+        "## Autodev status snapshot",
+        f"- state: {state or 'unknown'}",
+        f"- role/stage/status: {role or 'n/a'} / {stage or 'n/a'} / {status or 'n/a'}",
+        f"- parent reference: {parent_reference}",
+        f"- dependencies: {dependencies_display}",
+        f"- latest pr ref: {_db_ref('pr_opened')}",
+        f"- latest evidence ref: {_db_ref('evidence_packet')}",
+        f"- latest release ref: {_db_ref('release_result')}",
+        f"- updated_at: {updated_at}",
+    ]
+    return "\n".join(lines)
+
+
+def _sync_issue_body_projection(
+    *,
+    base_dir: Path,
+    issue_number: str,
+    command_id: str | None = None,
+    updated_at: str | None = None,
+) -> str:
+    sync_body = cast(Callable[..., str], _lifecycle_helpers.sync_issue_body_projection)
+    timestamp = _now(updated_at)
+    try:
+        return sync_body(
+            base_dir=base_dir,
+            issue_number=issue_number,
+            repo=_read_project_github_repo(base_dir),
+            projection_markdown=_render_issue_body_projection_markdown(
+                base_dir=base_dir,
+                issue_number=issue_number,
+                updated_at=timestamp,
+            ),
+            now=_now,
+            run=subprocess.run,
+            command_id=command_id,
+            updated_at=timestamp,
+        )
+    except Exception as error:  # pragma: no cover - defensive subprocess/env guard
+        return str(error)
+
+
+def _sync_issue_status_comment(
+    *,
+    base_dir: Path,
+    issue_number: str,
+    command_id: str | None = None,
+    updated_at: str | None = None,
+) -> str:
+    sync_comment = cast(Callable[..., str], _lifecycle_helpers.sync_issue_status_comment)
+    timestamp = _now(updated_at)
+    issue = read_issue(base_dir, issue_number) or {}
+    body_lines = [
+        "## Autodev status",
+        f"- state: {str(issue.get('state') or 'unknown')}",
+        (
+            "- role/stage/status: "
+            f"{str(issue.get('current_role') or 'n/a')} / "
+            f"{str(issue.get('current_stage') or 'n/a')} / "
+            f"{str(issue.get('current_status') or 'n/a')}"
+        ),
+        f"- updated_at: {timestamp}",
+    ]
+    try:
+        return sync_comment(
+            base_dir=base_dir,
+            issue_number=issue_number,
+            repo=_read_project_github_repo(base_dir),
+            comment_markdown="\n".join(body_lines),
+            now=_now,
+            run=subprocess.run,
+            command_id=command_id,
+            updated_at=timestamp,
+        )
+    except Exception as error:  # pragma: no cover - defensive subprocess/env guard
+        return str(error)
+
+
+def _sync_project_fields_projection(
+    *,
+    base_dir: Path,
+    issue_number: str,
+    command_id: str | None = None,
+    updated_at: str | None = None,
+) -> str:
+    sync_fields = cast(Callable[..., str], _lifecycle_helpers.sync_project_fields_projection)
+    timestamp = _now(updated_at)
+    issue = read_issue(base_dir, issue_number) or {}
+    configured = _load_json_dict((read_runtime_context(base_dir, issue_number) or {}).get("github_project_field_ids"))
+    fields: dict[str, str] = {}
+    state_field_id = str(configured.get("state") or "").strip()
+    stage_field_id = str(configured.get("stage") or "").strip()
+    pr_workflow_field_id = str(configured.get("pr_workflow") or "").strip()
+    if state_field_id:
+        fields[state_field_id] = str(issue.get("state") or "")
+    if stage_field_id:
+        fields[stage_field_id] = str(issue.get("current_stage") or "")
+    if pr_workflow_field_id:
+        pr_workflow_status = "not_opened"
+        pr_opened = read_latest_history_entry(base_dir, issue_number=issue_number, entry_type="pr_opened")
+        if pr_opened is not None:
+            pr_workflow_status = "opened"
+
+        evidence_packet = _read_db_artifact_fact(base_dir=base_dir, issue_number=issue_number, artifact_kind="evidence_packet")
+        evidence_status = str(evidence_packet.get("status") or "").strip().lower()
+        if evidence_status == "pass":
+            pr_workflow_status = "verifier_passed"
+        elif evidence_status in {"fail", "blocked"}:
+            pr_workflow_status = f"verifier_{evidence_status}"
+
+        release_result = _read_db_artifact_fact(base_dir=base_dir, issue_number=issue_number, artifact_kind="release_result")
+        release_status = str(release_result.get("status") or "").strip().lower()
+        merge_payload_raw = release_result.get("merge")
+        merge_payload = cast(dict[str, object], merge_payload_raw) if isinstance(merge_payload_raw, dict) else {}
+        merged = bool(release_result.get("merged")) or bool(merge_payload.get("merged"))
+        if merged or release_status in {"success", "completed"}:
+            pr_workflow_status = "merged"
+        elif release_status in {"blocked", "failed"}:
+            blocked_reason = str(release_result.get("blocked_reason") or "").strip()
+            pr_workflow_status = f"release_{blocked_reason or release_status}"
+
+        fields[pr_workflow_field_id] = pr_workflow_status
+    try:
+        return sync_fields(
+            base_dir=base_dir,
+            issue_number=issue_number,
+            repo=_read_project_github_repo(base_dir),
+            fields=fields,
+            now=_now,
+            run=subprocess.run,
+            command_id=command_id,
+            updated_at=timestamp,
+        )
+    except Exception as error:  # pragma: no cover - defensive subprocess/env guard
+        return str(error)
+
+
+def _project_pr_workflow_projection(base_dir: Path, issue_number: str) -> dict[str, str]:
+    status = "not_opened"
+    detail = "no pr_opened fact"
+
+    pr_opened = read_latest_history_entry(base_dir, issue_number=issue_number, entry_type="pr_opened")
+    if pr_opened is not None:
+        status = "opened"
+        detail = "pr_opened fact exists"
+
+    evidence_packet = _read_db_artifact_fact(base_dir=base_dir, issue_number=issue_number, artifact_kind="evidence_packet")
+    evidence_status = str(evidence_packet.get("status") or "").strip().lower()
+    if evidence_status == "pass":
+        status = "verifier_passed"
+        detail = "evidence_packet passed"
+    elif evidence_status in {"fail", "blocked"}:
+        status = f"verifier_{evidence_status}"
+        detail = f"evidence_packet {evidence_status}"
+
+    release_result = _read_db_artifact_fact(base_dir=base_dir, issue_number=issue_number, artifact_kind="release_result")
+    release_status = str(release_result.get("status") or "").strip().lower()
+    merge_payload_raw = release_result.get("merge")
+    merge_payload = cast(dict[str, object], merge_payload_raw) if isinstance(merge_payload_raw, dict) else {}
+    merged = bool(release_result.get("merged")) or bool(merge_payload.get("merged"))
+    if merged or release_status in {"success", "completed"}:
+        status = "merged"
+        detail = "release result indicates merged"
+    elif release_status in {"blocked", "failed"}:
+        blocked_reason = str(release_result.get("blocked_reason") or "").strip()
+        status = f"release_{blocked_reason or release_status}"
+        detail = f"release result {release_status}"
+
+    return {
+        "status": status,
+        "detail": detail,
+        "prNumber": _extract_pr_number_from_artifact_fact(evidence_packet) or _extract_pr_number_from_artifact_fact(release_result),
+    }
+
+
+def _sync_github_projection_bundle(
+    *,
+    base_dir: Path,
+    issue_number: str,
+    phase: str,
+    updated_at: str,
+) -> None:
+    sync_commands = {
+        "body": f"start-issue:{issue_number}:{phase}:body",
+        "comment": f"start-issue:{issue_number}:{phase}:status-comment",
+        "project": f"start-issue:{issue_number}:{phase}:project-fields",
+    }
+    sync_errors: list[tuple[str, str]] = []
+    body_error = _sync_issue_body_projection(
+        base_dir=base_dir,
+        issue_number=issue_number,
+        command_id=sync_commands["body"],
+        updated_at=updated_at,
+    )
+    if body_error:
+        sync_errors.append(("issue_body", body_error))
+    comment_error = _sync_issue_status_comment(
+        base_dir=base_dir,
+        issue_number=issue_number,
+        command_id=sync_commands["comment"],
+        updated_at=updated_at,
+    )
+    if comment_error:
+        sync_errors.append(("status_comment", comment_error))
+    project_error = _sync_project_fields_projection(
+        base_dir=base_dir,
+        issue_number=issue_number,
+        command_id=sync_commands["project"],
+        updated_at=updated_at,
+    )
+    if project_error:
+        sync_errors.append(("project_fields", project_error))
+
+    for target, error in sync_errors:
+        record_admin_decision(
+            base_dir,
+            command_id=f"start-issue:{issue_number}:{phase}:{target}:admin-failed",
+            issue_number=issue_number,
+            decision_type="admin_github_projection_failure",
+            reason=f"GitHub projection sync failed ({target}) for issue #{issue_number}: {error}",
+            updated_at=updated_at,
+        )
 
 
 def _close_github_issue_after_release_merge(
@@ -3063,6 +3322,7 @@ def inspect_control_plane(
         "issue": read_issue(base_dir, issue_number) or {},
         "latestDecision": read_latest_decision(base_dir, issue_number) or {},
         "latestGitHubSyncAttempt": read_latest_github_sync_attempt(base_dir, issue_number) or {},
+        "projectPrWorkflow": _project_pr_workflow_projection(base_dir, issue_number),
         "releaseGate": _release_gate_view(base_dir, issue_number),
         "releaseChildSession": read_release_child_session(base_dir, issue_number),
         "latestReleaseChildSession": read_latest_ref(base_dir, issue_number, "release_child_session"),

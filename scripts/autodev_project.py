@@ -28,6 +28,9 @@ ROOT = Path(__file__).resolve().parents[1]
 AGENTS_BEGIN = "<!-- AUTODEV:BEGIN -->"
 AGENTS_END = "<!-- AUTODEV:END -->"
 DEFAULT_REPO_DESCRIPTION = "Autodev consumer project"
+GITHUB_MONITORING_BEGIN = "# AUTODEV_GITHUB_MONITORING:BEGIN"
+GITHUB_MONITORING_END = "# AUTODEV_GITHUB_MONITORING:END"
+DEFAULT_GITHUB_PROJECT_TITLE = "Autodev Control Plane"
 
 BOOTSTRAP_LABELS = [
     ("needs-triage", "D4C5F9", "Maintainer needs to evaluate this issue"),
@@ -90,6 +93,15 @@ class ActionReport:
 
     def has_findings(self) -> bool:
         return bool(self.findings)
+
+
+@dataclass
+class GitHubProjectSetup:
+    owner: str
+    title: str
+    number: int
+    project_id: str
+    field_ids: dict[str, str]
 
 
 def _project_root(path: str | None) -> Path:
@@ -182,11 +194,270 @@ def _repo_https_url(github_repo: str) -> str:
     return f"https://github.com/{github_repo}.git"
 
 
+def _github_owner(github_repo: str) -> str:
+    owner, _, _repo = github_repo.partition("/")
+    return owner
+
+
 def _validate_github_repo(github_repo: str) -> str:
     normalized = github_repo.strip()
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", normalized):
         raise ValueError(f"github_repo must be owner/repo, got {github_repo!r}")
     return normalized
+
+
+def _parse_optional_json(stdout: str) -> dict[str, object] | list[object]:
+    text = stdout.strip()
+    if not text:
+        return {}
+    parsed = json.loads(text)
+    if isinstance(parsed, (dict, list)):
+        return parsed
+    return {}
+
+
+def _as_int(value: object, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return default
+        try:
+            return int(stripped)
+        except ValueError:
+            return default
+    return default
+
+
+def _find_project_by_title(*, owner: str, title: str) -> tuple[int, str] | None:
+    result = _run_command(
+        [
+            "gh",
+            "project",
+            "list",
+            "--owner",
+            owner,
+            "--limit",
+            "100",
+            "--format",
+            "json",
+        ],
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    parsed = _parse_optional_json(cast(str, result.stdout or ""))
+    projects = parsed if isinstance(parsed, list) else []
+    for project in projects:
+        if not isinstance(project, dict):
+            continue
+        if str(project.get("title") or "") == title:
+            number = int(project.get("number") or 0)
+            project_id = str(project.get("id") or "")
+            if number > 0 and project_id:
+                return number, project_id
+    return None
+
+
+def _create_project(*, owner: str, title: str) -> tuple[int, str]:
+    result = _run_command(
+        [
+            "gh",
+            "project",
+            "create",
+            "--owner",
+            owner,
+            "--title",
+            title,
+            "--format",
+            "json",
+        ],
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = cast(str, result.stderr or "").strip() or cast(str, result.stdout or "").strip()
+        raise RuntimeError(f"failed to create GitHub project {title!r}: {detail}")
+    parsed = _parse_optional_json(cast(str, result.stdout or ""))
+    payload = cast(dict[str, object], parsed) if isinstance(parsed, dict) else {}
+    number = _as_int(payload.get("number"), 0)
+    project_id = str(payload.get("id") or "")
+    if number <= 0 or not project_id:
+        raise RuntimeError(f"failed to parse created project payload for {title!r}")
+    return number, project_id
+
+
+def _ensure_project_linked(*, owner: str, project_number: int, github_repo: str) -> None:
+    _ = _run_command(
+        [
+            "gh",
+            "project",
+            "link",
+            str(project_number),
+            "--owner",
+            owner,
+            "--repo",
+            github_repo,
+        ],
+        check=False,
+    )
+
+
+def _ensure_project_field(*, owner: str, project_number: int, field_name: str, data_type: str) -> str:
+    listed = _run_command(
+        [
+            "gh",
+            "project",
+            "field-list",
+            str(project_number),
+            "--owner",
+            owner,
+            "--limit",
+            "100",
+            "--format",
+            "json",
+        ],
+        check=False,
+    )
+    if listed.returncode != 0:
+        detail = cast(str, listed.stderr or "").strip() or cast(str, listed.stdout or "").strip()
+        raise RuntimeError(f"failed to list project fields: {detail}")
+    listed_payload = _parse_optional_json(cast(str, listed.stdout or ""))
+    fields = listed_payload if isinstance(listed_payload, list) else []
+    for field in fields:
+        if not isinstance(field, dict):
+            continue
+        if str(field.get("name") or "") == field_name:
+            field_id = str(field.get("id") or "")
+            if field_id:
+                return field_id
+
+    created = _run_command(
+        [
+            "gh",
+            "project",
+            "field-create",
+            str(project_number),
+            "--owner",
+            owner,
+            "--name",
+            field_name,
+            "--data-type",
+            data_type,
+            "--format",
+            "json",
+        ],
+        check=False,
+    )
+    if created.returncode != 0:
+        detail = cast(str, created.stderr or "").strip() or cast(str, created.stdout or "").strip()
+        raise RuntimeError(f"failed to create project field {field_name!r}: {detail}")
+    created_payload = _parse_optional_json(cast(str, created.stdout or ""))
+    payload = cast(dict[str, object], created_payload) if isinstance(created_payload, dict) else {}
+    field_id = str(payload.get("id") or "")
+    if not field_id:
+        raise RuntimeError(f"failed to parse project field id for {field_name!r}")
+    return field_id
+
+
+def _monitoring_block(*, setup: GitHubProjectSetup) -> str:
+    return "\n".join(
+        [
+            GITHUB_MONITORING_BEGIN,
+            f'github_project_owner: "{setup.owner}"',
+            f'github_project_title: "{setup.title}"',
+            f"github_project_number: {setup.number}",
+            f'github_project_id: "{setup.project_id}"',
+            "github_project_field_ids:",
+            f'  state: "{setup.field_ids.get("state", "")}"',
+            f'  stage: "{setup.field_ids.get("stage", "")}"',
+            f'  pr_workflow: "{setup.field_ids.get("pr_workflow", "")}"',
+            GITHUB_MONITORING_END,
+            "",
+        ]
+    )
+
+
+def _replace_monitoring_block(config_text: str, *, setup: GitHubProjectSetup) -> str:
+    block = _monitoring_block(setup=setup)
+    if (GITHUB_MONITORING_BEGIN in config_text) != (GITHUB_MONITORING_END in config_text):
+        raise ValueError("unbalanced autodev github monitoring markers in .autodev.yaml")
+    if GITHUB_MONITORING_BEGIN in config_text:
+        before, rest = config_text.split(GITHUB_MONITORING_BEGIN, 1)
+        _middle, after = rest.split(GITHUB_MONITORING_END, 1)
+        merged = f"{before}{block}{after.lstrip(chr(10))}"
+    else:
+        separator = "" if config_text.endswith("\n") else "\n"
+        merged = f"{config_text}{separator}{block}"
+    return merged
+
+
+def _extract_monitoring_from_config(config_text: str) -> tuple[str, dict[str, str]]:
+    project_id = ""
+    field_ids: dict[str, str] = {}
+    for raw_line in config_text.splitlines():
+        line = raw_line.strip()
+        if line.startswith("github_project_id:"):
+            project_id = line.split(":", 1)[1].strip().strip('"')
+        if line.startswith("state:") and "github_project_field_ids" in config_text:
+            value = line.split(":", 1)[1].strip().strip('"')
+            if value:
+                field_ids.setdefault("state", value)
+        if line.startswith("stage:") and "github_project_field_ids" in config_text:
+            value = line.split(":", 1)[1].strip().strip('"')
+            if value:
+                field_ids.setdefault("stage", value)
+        if line.startswith("pr_workflow:"):
+            value = line.split(":", 1)[1].strip().strip('"')
+            if value:
+                field_ids.setdefault("pr_workflow", value)
+    return project_id, field_ids
+
+
+def _ensure_issue_runtime_project_binding(*, root: Path, project_id: str, field_ids: dict[str, str], dry_run: bool, check: bool, report: ActionReport) -> None:
+    if dry_run or check:
+        report.actions.append("sync issue runtime context with GitHub project binding")
+        return
+    try:
+        from scripts.control_plane_db import issues_in_states, sync_issue_runtime_context
+
+        runtime_rows = issues_in_states(
+            root,
+            [
+                "ready",
+                "claimed",
+                "dispatching",
+                "running",
+                "verifying",
+                "verified",
+                "release_pending",
+                "failed",
+                "quarantined",
+            ],
+        )
+        for row in runtime_rows:
+            issue_number = str(row.get("issue_number") or "")
+            if not issue_number:
+                continue
+            _ = sync_issue_runtime_context(
+                root,
+                issue_number=issue_number,
+                updated_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                runtime_context={
+                    "github_project_id": project_id,
+                    "github_project_field_ids": {
+                        "state": field_ids.get("state", ""),
+                        "stage": field_ids.get("stage", ""),
+                        "pr_workflow": field_ids.get("pr_workflow", ""),
+                    },
+                },
+            )
+    except Exception as error:  # pragma: no cover - defensive post-init sync
+        report.findings.append(f"failed to sync issue runtime project binding: {error}")
 
 
 def _is_git_repo(root: Path) -> bool:
@@ -391,8 +662,20 @@ def _replace_managed_block(original: str, block: str) -> str:
     return f"{before}{block}{after.lstrip(chr(10))}"
 
 
-def init_project(root: Path, *, github_repo: str, dry_run: bool, check: bool, force: bool) -> ActionReport:
+def init_project(
+    root: Path,
+    *,
+    github_repo: str,
+    dry_run: bool,
+    check: bool,
+    force: bool,
+    create_github_project: bool = False,
+    github_project_title: str = DEFAULT_GITHUB_PROJECT_TITLE,
+    github_project_owner: str = "",
+) -> ActionReport:
     github_repo = _validate_github_repo(github_repo)
+    project_owner = github_project_owner.strip() or _github_owner(github_repo)
+    project_title = github_project_title.strip() or DEFAULT_GITHUB_PROJECT_TITLE
     report = ActionReport(actions=[], findings=[])
     config_path = root / ".autodev.yaml"
     expected_config = _config_text(root, github_repo)
@@ -448,6 +731,63 @@ def init_project(root: Path, *, github_repo: str, dry_run: bool, check: bool, fo
 
     _bootstrap_project_repository(root, github_repo=github_repo, dry_run=dry_run, check=check, force=force, report=report)
 
+    if create_github_project:
+        report.actions.append(f"ensure GitHub Project '{project_title}' for {project_owner}")
+        if not dry_run and not check:
+            try:
+                found = _find_project_by_title(owner=project_owner, title=project_title)
+                if found is None:
+                    project_number, project_id = _create_project(owner=project_owner, title=project_title)
+                else:
+                    project_number, project_id = found
+
+                _ensure_project_linked(owner=project_owner, project_number=project_number, github_repo=github_repo)
+
+                field_ids = {
+                    "state": _ensure_project_field(
+                        owner=project_owner,
+                        project_number=project_number,
+                        field_name="Workflow State",
+                        data_type="TEXT",
+                    ),
+                    "stage": _ensure_project_field(
+                        owner=project_owner,
+                        project_number=project_number,
+                        field_name="Current Stage",
+                        data_type="TEXT",
+                    ),
+                    "pr_workflow": _ensure_project_field(
+                        owner=project_owner,
+                        project_number=project_number,
+                        field_name="PR Workflow",
+                        data_type="TEXT",
+                    ),
+                }
+
+                config_before = _read_text(config_path) if config_path.exists() else expected_config
+                setup = GitHubProjectSetup(
+                    owner=project_owner,
+                    title=project_title,
+                    number=project_number,
+                    project_id=project_id,
+                    field_ids=field_ids,
+                )
+                config_after = _replace_monitoring_block(config_before, setup=setup)
+                if config_after != config_before:
+                    report.actions.append("update .autodev.yaml github monitoring block")
+                    _write_text(config_path, config_after)
+
+                _ensure_issue_runtime_project_binding(
+                    root=root,
+                    project_id=project_id,
+                    field_ids=field_ids,
+                    dry_run=dry_run,
+                    check=check,
+                    report=report,
+                )
+            except Exception as error:
+                report.findings.append(f"failed to set up GitHub project monitoring: {error}")
+
     return report
 
 
@@ -474,6 +814,16 @@ def doctor_project(root: Path) -> ActionReport:
     report = ActionReport(actions=[], findings=[])
     if not (root / ".autodev.yaml").exists():
         report.findings.append("missing .autodev.yaml")
+    else:
+        config_text = _read_text(root / ".autodev.yaml")
+        project_id, field_ids = _extract_monitoring_from_config(config_text)
+        has_monitoring_block = GITHUB_MONITORING_BEGIN in config_text and GITHUB_MONITORING_END in config_text
+        if has_monitoring_block:
+            if not project_id:
+                report.findings.append("missing github_project_id in .autodev.yaml monitoring block")
+            for field_key in ("state", "stage", "pr_workflow"):
+                if not str(field_ids.get(field_key) or "").strip():
+                    report.findings.append(f"missing github_project_field_ids.{field_key} in .autodev.yaml monitoring block")
     if not (root / ".opencode/runtime/control-plane.sqlite3").exists():
         report.findings.append("missing .opencode/runtime/control-plane.sqlite3")
     if _is_git_repo(root) and not _runtime_gitignore_is_configured(root):
@@ -598,6 +948,21 @@ def build_parser() -> argparse.ArgumentParser:
     init = subparsers.add_parser("init", help="Initialize an autodev consumer project")
     _ = init.add_argument("--project-root", default=".")
     _ = init.add_argument("--github-repo", default="paulpai0412/autodev")
+    _ = init.add_argument(
+        "--create-github-project",
+        action="store_true",
+        help="Create/link a GitHub Project and persist project+field bindings for monitoring",
+    )
+    _ = init.add_argument(
+        "--github-project-title",
+        default=DEFAULT_GITHUB_PROJECT_TITLE,
+        help="GitHub Project title used when --create-github-project is enabled",
+    )
+    _ = init.add_argument(
+        "--github-project-owner",
+        default="",
+        help="GitHub owner login for project operations (defaults to repo owner)",
+    )
     _ = init.add_argument("--dry-run", action="store_true")
     _ = init.add_argument("--check", action="store_true")
     _ = init.add_argument("--force", action="store_true")
@@ -667,6 +1032,9 @@ def main(argv: list[str] | None = None) -> int:
             dry_run=cast(bool, args.dry_run),
             check=check_mode,
             force=cast(bool, args.force),
+            create_github_project=cast(bool, args.create_github_project),
+            github_project_title=cast(str, args.github_project_title),
+            github_project_owner=cast(str, args.github_project_owner),
         )
         _print_report(report, json_output=json_output)
         return 1 if check_mode and (report.actions or report.findings) else (1 if report.has_findings() else 0)

@@ -1217,6 +1217,8 @@ def record_github_sync_attempt(
     status: str,
     updated_at: str,
     last_error: str = "",
+    projection_target: str = "labels",
+    projection_payload: dict[str, Any] | None = None,
 ) -> None:
     ensure_control_plane_db(base_dir)
     with _connection(base_dir) as connection:
@@ -1244,6 +1246,8 @@ def record_github_sync_attempt(
                 "intended_label_delta": delta,
                 "attempt_count": attempt_count,
                 "last_error": last_error,
+                "projection_target": projection_target,
+                "projection_payload": projection_payload if isinstance(projection_payload, dict) else {},
             },
             unique_key=f"github-sync:{command_id}:{attempt_count}",
         )
@@ -1330,10 +1334,13 @@ def _history_row_to_github_sync(row: sqlite3.Row | dict[str, Any] | None) -> dic
         return None
     payload = _json_loads_dict(row["payload_json"])
     delta = payload.get("intended_label_delta", {})
+    projection_payload = payload.get("projection_payload", {})
     return {
         "command_id": str(row["command_id"]),
         "issue_number": str(row["issue_number"]),
         "intended_label_delta": _json_dumps(delta if isinstance(delta, dict) else {}),
+        "projection_target": str(payload.get("projection_target") or "labels"),
+        "projection_payload": _json_dumps(projection_payload if isinstance(projection_payload, dict) else {}),
         "status": str(row["status"]),
         "attempt_count": int(payload.get("attempt_count") or 1),
         "last_error": str(payload.get("last_error") or row["summary"] or ""),

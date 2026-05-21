@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
 import subprocess
 from pathlib import Path
 from typing import Callable, cast
@@ -36,6 +38,27 @@ READY_FOR_AGENT_LABEL = "ready-for-agent"
 AGENT_DISPATCHING_LABEL = "agent-dispatching"
 AGENT_IN_PROGRESS_LABEL = "agent-in-progress"
 QUARANTINED_LABEL = "quarantined"
+PROJECTION_BODY_START = "<!-- autodev:projection:start -->"
+PROJECTION_BODY_END = "<!-- autodev:projection:end -->"
+STATUS_COMMENT_MARKER = "<!-- autodev:status-comment -->"
+
+
+def _upsert_projection_block(*, body: str, projection_markdown: str) -> tuple[str, bool]:
+    block = f"{PROJECTION_BODY_START}\n{projection_markdown.strip()}\n{PROJECTION_BODY_END}"
+    start = body.find(PROJECTION_BODY_START)
+    end = body.find(PROJECTION_BODY_END)
+    if start != -1 and end != -1 and end > start:
+        end_index = end + len(PROJECTION_BODY_END)
+        updated = f"{body[:start].rstrip()}\n\n{block}\n{body[end_index:].lstrip()}"
+        return updated.rstrip() + "\n", updated.strip() != body.strip()
+    trimmed = body.rstrip()
+    if trimmed:
+        updated = f"{trimmed}\n\n{block}\n"
+    else:
+        updated = f"{block}\n"
+    return updated, True
+
+
 def _issue_backing_type(base_dir: Path, issue_number: str) -> str:
     issue = read_issue(base_dir, issue_number) or {}
     issue_packet = cast(dict[str, object], json.loads(str(issue.get("issue_packet_json") or "{}"))) if issue else {}
@@ -142,6 +165,8 @@ def sync_issue_progress_label(
                 status="skipped",
                 updated_at=now(updated_at),
                 last_error="skipped GitHub label sync for local-seeded issue",
+                projection_target="labels",
+                projection_payload={"repo": repo, "issue_number": issue_number},
             )
         return ""
     if not repo:
@@ -154,6 +179,8 @@ def sync_issue_progress_label(
                 remove_labels=remove_labels,
                 status="skipped",
                 updated_at=now(updated_at),
+                projection_target="labels",
+                projection_payload={"repo": repo, "issue_number": issue_number},
             )
         return ""
     command = ["gh", "issue", "edit", issue_number, "--repo", repo]
@@ -172,6 +199,8 @@ def sync_issue_progress_label(
                 remove_labels=remove_labels,
                 status="success",
                 updated_at=now(updated_at),
+                projection_target="labels",
+                projection_payload={"repo": repo, "issue_number": issue_number},
             )
         return ""
     error = (completed.stderr or completed.stdout).strip() or f"gh issue edit failed with exit code {completed.returncode}"
@@ -185,8 +214,512 @@ def sync_issue_progress_label(
             status="failed",
             updated_at=now(updated_at),
             last_error=error,
+            projection_target="labels",
+            projection_payload={"repo": repo, "issue_number": issue_number},
         )
     return error
+
+
+def sync_issue_body_projection(
+    *,
+    base_dir: Path,
+    issue_number: str,
+    repo: str,
+    projection_markdown: str,
+    now: NowFunc,
+    run: Callable[..., subprocess.CompletedProcess[str]],
+    command_id: str | None = None,
+    updated_at: str | None = None,
+) -> str:
+    timestamp = now(updated_at)
+    backing_type = _issue_backing_type(base_dir, issue_number)
+    if backing_type == "local_seeded":
+        if command_id:
+            record_github_sync_attempt(
+                base_dir,
+                command_id=command_id,
+                issue_number=issue_number,
+                add_labels=[],
+                remove_labels=[],
+                status="skipped",
+                updated_at=timestamp,
+                last_error="skipped GitHub issue body projection for local-seeded issue",
+                projection_target="issue_body",
+                projection_payload={"repo": repo, "issue_number": issue_number},
+            )
+        return ""
+    if not repo:
+        if command_id:
+            record_github_sync_attempt(
+                base_dir,
+                command_id=command_id,
+                issue_number=issue_number,
+                add_labels=[],
+                remove_labels=[],
+                status="skipped",
+                updated_at=timestamp,
+                last_error="skipped GitHub issue body projection because project github_repo is unset",
+                projection_target="issue_body",
+                projection_payload={"repo": repo, "issue_number": issue_number},
+            )
+        return ""
+
+    view_completed = run(
+        ["gh", "issue", "view", issue_number, "--repo", repo, "--json", "body"],
+        cwd=base_dir,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if view_completed.returncode != 0:
+        error = (view_completed.stderr or view_completed.stdout).strip() or (
+            f"gh issue view failed with exit code {view_completed.returncode}"
+        )
+        if command_id:
+            record_github_sync_attempt(
+                base_dir,
+                command_id=command_id,
+                issue_number=issue_number,
+                add_labels=[],
+                remove_labels=[],
+                status="failed",
+                updated_at=timestamp,
+                last_error=error,
+                projection_target="issue_body",
+                projection_payload={"repo": repo, "issue_number": issue_number},
+            )
+        return error
+
+    parsed = cast(dict[str, object], json.loads(view_completed.stdout or "{}"))
+    current_body = str(parsed.get("body") or "")
+    updated_body, changed = _upsert_projection_block(body=current_body, projection_markdown=projection_markdown)
+    if not changed:
+        if command_id:
+            record_github_sync_attempt(
+                base_dir,
+                command_id=command_id,
+                issue_number=issue_number,
+                add_labels=[],
+                remove_labels=[],
+                status="skipped",
+                updated_at=timestamp,
+                last_error="skipped GitHub issue body projection because rendered content is unchanged",
+                projection_target="issue_body",
+                projection_payload={
+                    "repo": repo,
+                    "issue_number": issue_number,
+                    "content_hash": hashlib.sha256(updated_body.encode("utf-8")).hexdigest(),
+                },
+            )
+        return ""
+
+    edit_completed = run(
+        ["gh", "issue", "edit", issue_number, "--repo", repo, "--body", updated_body],
+        cwd=base_dir,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if edit_completed.returncode == 0:
+        if command_id:
+            record_github_sync_attempt(
+                base_dir,
+                command_id=command_id,
+                issue_number=issue_number,
+                add_labels=[],
+                remove_labels=[],
+                status="success",
+                updated_at=timestamp,
+                projection_target="issue_body",
+                projection_payload={
+                    "repo": repo,
+                    "issue_number": issue_number,
+                    "content_hash": hashlib.sha256(updated_body.encode("utf-8")).hexdigest(),
+                },
+            )
+        return ""
+
+    error = (edit_completed.stderr or edit_completed.stdout).strip() or (
+        f"gh issue edit --body failed with exit code {edit_completed.returncode}"
+    )
+    if command_id:
+        record_github_sync_attempt(
+            base_dir,
+            command_id=command_id,
+            issue_number=issue_number,
+            add_labels=[],
+            remove_labels=[],
+            status="failed",
+            updated_at=timestamp,
+            last_error=error,
+            projection_target="issue_body",
+            projection_payload={"repo": repo, "issue_number": issue_number},
+        )
+    return error
+
+
+def sync_issue_status_comment(
+    *,
+    base_dir: Path,
+    issue_number: str,
+    repo: str,
+    comment_markdown: str,
+    now: NowFunc,
+    run: Callable[..., subprocess.CompletedProcess[str]],
+    command_id: str | None = None,
+    updated_at: str | None = None,
+) -> str:
+    timestamp = now(updated_at)
+    body = f"{STATUS_COMMENT_MARKER}\n{comment_markdown.strip()}"
+    backing_type = _issue_backing_type(base_dir, issue_number)
+    if backing_type == "local_seeded":
+        if command_id:
+            record_github_sync_attempt(
+                base_dir,
+                command_id=command_id,
+                issue_number=issue_number,
+                add_labels=[],
+                remove_labels=[],
+                status="skipped",
+                updated_at=timestamp,
+                last_error="skipped GitHub status comment sync for local-seeded issue",
+                projection_target="status_comment",
+                projection_payload={"repo": repo, "issue_number": issue_number},
+            )
+        return ""
+    if not repo:
+        if command_id:
+            record_github_sync_attempt(
+                base_dir,
+                command_id=command_id,
+                issue_number=issue_number,
+                add_labels=[],
+                remove_labels=[],
+                status="skipped",
+                updated_at=timestamp,
+                last_error="skipped GitHub status comment sync because project github_repo is unset",
+                projection_target="status_comment",
+                projection_payload={"repo": repo, "issue_number": issue_number},
+            )
+        return ""
+
+    comments_completed = run(
+        ["gh", "api", f"repos/{repo}/issues/{issue_number}/comments"],
+        cwd=base_dir,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if comments_completed.returncode != 0:
+        error = (comments_completed.stderr or comments_completed.stdout).strip() or (
+            f"gh api issue comments failed with exit code {comments_completed.returncode}"
+        )
+        if command_id:
+            record_github_sync_attempt(
+                base_dir,
+                command_id=command_id,
+                issue_number=issue_number,
+                add_labels=[],
+                remove_labels=[],
+                status="failed",
+                updated_at=timestamp,
+                last_error=error,
+                projection_target="status_comment",
+                projection_payload={"repo": repo, "issue_number": issue_number},
+            )
+        return error
+
+    comments = json.loads(comments_completed.stdout or "[]")
+    comment_id = ""
+    current_body = ""
+    if isinstance(comments, list):
+        for item in reversed(comments):
+            if not isinstance(item, dict):
+                continue
+            candidate = str(item.get("body") or "")
+            if STATUS_COMMENT_MARKER in candidate:
+                comment_id = str(item.get("id") or "")
+                current_body = candidate
+                break
+
+    if current_body.strip() == body.strip():
+        if command_id:
+            record_github_sync_attempt(
+                base_dir,
+                command_id=command_id,
+                issue_number=issue_number,
+                add_labels=[],
+                remove_labels=[],
+                status="skipped",
+                updated_at=timestamp,
+                last_error="skipped GitHub status comment sync because rendered content is unchanged",
+                projection_target="status_comment",
+                projection_payload={
+                    "repo": repo,
+                    "issue_number": issue_number,
+                    "content_hash": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+                },
+            )
+        return ""
+
+    if comment_id:
+        command = [
+            "gh",
+            "api",
+            f"repos/{repo}/issues/comments/{comment_id}",
+            "--method",
+            "PATCH",
+            "-f",
+            f"body={body}",
+        ]
+    else:
+        command = [
+            "gh",
+            "api",
+            f"repos/{repo}/issues/{issue_number}/comments",
+            "--method",
+            "POST",
+            "-f",
+            f"body={body}",
+        ]
+    sync_completed = run(
+        command,
+        cwd=base_dir,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if sync_completed.returncode == 0:
+        if command_id:
+            record_github_sync_attempt(
+                base_dir,
+                command_id=command_id,
+                issue_number=issue_number,
+                add_labels=[],
+                remove_labels=[],
+                status="success",
+                updated_at=timestamp,
+                projection_target="status_comment",
+                projection_payload={
+                    "repo": repo,
+                    "issue_number": issue_number,
+                    "comment_id": comment_id,
+                    "content_hash": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+                },
+            )
+        return ""
+
+    error = (sync_completed.stderr or sync_completed.stdout).strip() or (
+        f"gh api status comment sync failed with exit code {sync_completed.returncode}"
+    )
+    if command_id:
+        record_github_sync_attempt(
+            base_dir,
+            command_id=command_id,
+            issue_number=issue_number,
+            add_labels=[],
+            remove_labels=[],
+            status="failed",
+            updated_at=timestamp,
+            last_error=error,
+            projection_target="status_comment",
+            projection_payload={"repo": repo, "issue_number": issue_number, "comment_id": comment_id},
+        )
+    return error
+
+
+def sync_project_fields_projection(
+    *,
+    base_dir: Path,
+    issue_number: str,
+    repo: str,
+    fields: dict[str, str],
+    now: NowFunc,
+    run: Callable[..., subprocess.CompletedProcess[str]],
+    command_id: str | None = None,
+    updated_at: str | None = None,
+) -> str:
+    timestamp = now(updated_at)
+    project_id = str((read_runtime_context(base_dir, issue_number) or {}).get("github_project_id") or "").strip()
+    if not project_id:
+        project_id = str(os.environ.get("AUTODEV_GITHUB_PROJECT_ID", "")).strip()
+
+    if not repo or not project_id:
+        if command_id:
+            record_github_sync_attempt(
+                base_dir,
+                command_id=command_id,
+                issue_number=issue_number,
+                add_labels=[],
+                remove_labels=[],
+                status="skipped",
+                updated_at=timestamp,
+                last_error="skipped GitHub project field sync because repo/project is not configured",
+                projection_target="project_fields",
+                projection_payload={"repo": repo, "issue_number": issue_number, "project_id": project_id},
+            )
+        return ""
+
+    owner, _, name = repo.partition("/")
+    if not owner or not name:
+        error = f"invalid github repo format for project field sync: {repo!r}"
+        if command_id:
+            record_github_sync_attempt(
+                base_dir,
+                command_id=command_id,
+                issue_number=issue_number,
+                add_labels=[],
+                remove_labels=[],
+                status="failed",
+                updated_at=timestamp,
+                last_error=error,
+                projection_target="project_fields",
+                projection_payload={"repo": repo, "issue_number": issue_number, "project_id": project_id},
+            )
+        return error
+
+    query = (
+        "query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){issue(number:$number){projectItems(first:100){nodes{id project{id}}}}}}"
+    )
+    lookup = run(
+        [
+            "gh",
+            "api",
+            "graphql",
+            "-f",
+            f"query={query}",
+            "-F",
+            f"owner={owner}",
+            "-F",
+            f"repo={name}",
+            "-F",
+            f"number={issue_number}",
+        ],
+        cwd=base_dir,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if lookup.returncode != 0:
+        error = (lookup.stderr or lookup.stdout).strip() or f"gh api graphql lookup failed with exit code {lookup.returncode}"
+        if command_id:
+            record_github_sync_attempt(
+                base_dir,
+                command_id=command_id,
+                issue_number=issue_number,
+                add_labels=[],
+                remove_labels=[],
+                status="failed",
+                updated_at=timestamp,
+                last_error=error,
+                projection_target="project_fields",
+                projection_payload={"repo": repo, "issue_number": issue_number, "project_id": project_id},
+            )
+        return error
+
+    item_id = ""
+    payload = json.loads(lookup.stdout or "{}")
+    nodes = (
+        payload.get("data", {})
+        .get("repository", {})
+        .get("issue", {})
+        .get("projectItems", {})
+        .get("nodes", [])
+        if isinstance(payload, dict)
+        else []
+    )
+    if isinstance(nodes, list):
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            node_project_id = str((node.get("project") or {}).get("id") or "") if isinstance(node.get("project"), dict) else ""
+            if node_project_id == project_id:
+                item_id = str(node.get("id") or "")
+                break
+
+    if not item_id:
+        if command_id:
+            record_github_sync_attempt(
+                base_dir,
+                command_id=command_id,
+                issue_number=issue_number,
+                add_labels=[],
+                remove_labels=[],
+                status="skipped",
+                updated_at=timestamp,
+                last_error="skipped GitHub project field sync because issue is not linked to configured project",
+                projection_target="project_fields",
+                projection_payload={"repo": repo, "issue_number": issue_number, "project_id": project_id},
+            )
+        return ""
+
+    for field_id, field_value in fields.items():
+        field_id = str(field_id or "").strip()
+        field_value = str(field_value or "").strip()
+        if not field_id:
+            continue
+        mutation = (
+            "mutation($project:ID!,$item:ID!,$field:ID!,$value:String!){updateProjectV2ItemFieldValue(input:{projectId:$project,itemId:$item,fieldId:$field,value:{text:$value}}){projectV2Item{id}}}"
+        )
+        update = run(
+            [
+                "gh",
+                "api",
+                "graphql",
+                "-f",
+                f"query={mutation}",
+                "-F",
+                f"project={project_id}",
+                "-F",
+                f"item={item_id}",
+                "-F",
+                f"field={field_id}",
+                "-F",
+                f"value={field_value}",
+            ],
+            cwd=base_dir,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if update.returncode != 0:
+            error = (update.stderr or update.stdout).strip() or (
+                f"gh api graphql project field update failed with exit code {update.returncode}"
+            )
+            if command_id:
+                record_github_sync_attempt(
+                    base_dir,
+                    command_id=command_id,
+                    issue_number=issue_number,
+                    add_labels=[],
+                    remove_labels=[],
+                    status="failed",
+                    updated_at=timestamp,
+                    last_error=error,
+                    projection_target="project_fields",
+                    projection_payload={"repo": repo, "issue_number": issue_number, "project_id": project_id, "item_id": item_id},
+                )
+            return error
+
+    if command_id:
+        record_github_sync_attempt(
+            base_dir,
+            command_id=command_id,
+            issue_number=issue_number,
+            add_labels=[],
+            remove_labels=[],
+            status="success",
+            updated_at=timestamp,
+            projection_target="project_fields",
+            projection_payload={
+                "repo": repo,
+                "issue_number": issue_number,
+                "project_id": project_id,
+                "item_id": item_id,
+                "fields_hash": hashlib.sha256(json.dumps(fields, sort_keys=True).encode("utf-8")).hexdigest(),
+            },
+        )
+    return ""
 
 
 def sync_local_main_after_release_merge(
@@ -288,6 +821,8 @@ def close_github_issue_after_release_merge(
                 status="skipped",
                 updated_at=timestamp,
                 last_error="skipped GitHub issue close for local-seeded issue",
+                projection_target="issue_close",
+                projection_payload={"repo": repo, "issue_number": issue_number},
             )
         return ""
     if not repo:
@@ -301,6 +836,8 @@ def close_github_issue_after_release_merge(
                 status="skipped",
                 updated_at=timestamp,
                 last_error="skipped GitHub issue close because project github_repo is unset",
+                projection_target="issue_close",
+                projection_payload={"repo": repo, "issue_number": issue_number},
             )
         return ""
 
@@ -334,6 +871,8 @@ def close_github_issue_after_release_merge(
                 remove_labels=[],
                 status="success",
                 updated_at=timestamp,
+                projection_target="issue_close",
+                projection_payload={"repo": repo, "issue_number": issue_number, "pr_number": pr_number},
             )
         return ""
     error = (completed.stderr or completed.stdout).strip() or f"gh issue close failed with exit code {completed.returncode}"
@@ -347,6 +886,8 @@ def close_github_issue_after_release_merge(
             status="failed",
             updated_at=timestamp,
             last_error=error,
+            projection_target="issue_close",
+            projection_payload={"repo": repo, "issue_number": issue_number, "pr_number": pr_number},
         )
     return error
 

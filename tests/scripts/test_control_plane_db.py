@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 from pathlib import Path
 
 from scripts.control_plane_db import (
@@ -219,8 +220,35 @@ def test_record_github_sync_attempt_tracks_status(tmp_path: Path):
     assert attempt is not None
     assert attempt["status"] == "failed"
     assert attempt["last_error"] == "boom"
+    assert attempt["projection_target"] == "labels"
+    assert json.loads(str(attempt["projection_payload"])) == {}
     assert latest_ref["command_id"] == "cmd-gh"
     assert latest_ref["status"] == "failed"
+
+
+def test_record_github_sync_attempt_supports_projection_payload(tmp_path: Path):
+    ensure_control_plane_db(tmp_path)
+
+    record_github_sync_attempt(
+        tmp_path,
+        command_id="cmd-gh-proj",
+        issue_number="42",
+        add_labels=[],
+        remove_labels=[],
+        status="success",
+        updated_at="2026-05-11T10:10:00+08:00",
+        projection_target="issue_close",
+        projection_payload={"repo": "example/repo", "issue_number": "42", "pr_number": "18"},
+    )
+
+    attempt = read_github_sync_attempt(tmp_path, "cmd-gh-proj")
+    assert attempt is not None
+    assert attempt["projection_target"] == "issue_close"
+    assert json.loads(str(attempt["projection_payload"])) == {
+        "repo": "example/repo",
+        "issue_number": "42",
+        "pr_number": "18",
+    }
 
 
 def test_issues_in_states_returns_only_matching_runtime_rows(tmp_path: Path):
