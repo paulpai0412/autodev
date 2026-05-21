@@ -1,0 +1,55 @@
+schema_version: "1.0"
+
+project:
+  name: your-project
+  root: /path/to/your-project
+  github_repo: owner/repo
+
+# Optional: enable GitHub Projects V2 projection by filling these values.
+# If github_project_id is empty, autodev falls back to AUTODEV_GITHUB_PROJECT_ID.
+github_project_id: "PVT_<PROJECT_ID>"
+github_project_field_ids:
+  state: "PVTF_<STATE_FIELD_ID>"
+  stage: "PVTF_<STAGE_FIELD_ID>"
+
+context:
+  required_reads:
+    - AGENTS.md
+    - CONTEXT.md
+    - docs/agents/domain.md
+    - docs/agents/issue-tracker.md
+    - docs/agents/triage-labels.md
+
+runtime:
+  control_plane_db: .opencode/runtime/control-plane.sqlite3
+# AUTODEV_GITHUB_MONITORING:BEGIN
+github_project_owner: "owner"
+github_project_title: "Your Project Board"
+github_project_number: 1
+github_project_id: "PVT_<PROJECT_ID>"
+github_project_field_ids:
+  state: "PVTSSF_<STATE_FIELD_ID>"
+  stage: "PVTF_<STAGE_FIELD_ID>"
+  pr_workflow: "PVTSSF_<PR_WORKFLOW_FIELD_ID>"
+github_project_field_option_ids:
+  state:
+    claimed: "<OPTION_ID_CLAIMED>"
+    completed: "<OPTION_ID_COMPLETED>"
+    dispatching: "<OPTION_ID_DISPATCHING>"
+    failed: "<OPTION_ID_FAILED>"
+    quarantined: "<OPTION_ID_QUARANTINED>"
+    ready: "<OPTION_ID_READY>"
+    release_pending: "<OPTION_ID_RELEASE_PENDING>"
+    running: "<OPTION_ID_RUNNING>"
+    verified: "<OPTION_ID_VERIFIED>"
+    verifying: "<OPTION_ID_VERIFYING>"
+  pr_workflow:
+    merged: "<OPTION_ID_MERGED>"
+    not_opened: "<OPTION_ID_NOT_OPENED>"
+    opened: "<OPTION_ID_OPENED>"
+    release_blocked: "<OPTION_ID_RELEASE_BLOCKED>"
+    release_failed: "<OPTION_ID_RELEASE_FAILED>"
+    verifier_blocked: "<OPTION_ID_VERIFIER_BLOCKED>"
+    verifier_fail: "<OPTION_ID_VERIFIER_FAIL>"
+    verifier_passed: "<OPTION_ID_VERIFIER_PASSED>"
+# AUTODEV_GITHUB_MONITORING:END
