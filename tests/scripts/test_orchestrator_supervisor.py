@@ -10,6 +10,7 @@ from typing import cast
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
+import pytest
 import scripts.orchestrator_supervisor as orchestrator_supervisor
 from scripts.control_plane_db import read_github_sync_attempt, read_issue, read_latest_github_sync_attempt, read_latest_issue_history, read_latest_ref
 from scripts.host_adapter import SessionOutcome, SessionStartContext, SessionStartResult
@@ -4260,7 +4261,7 @@ def test_dispatch_session_request_terminates_when_session_id_never_arrives():
     assert "did not emit a sessionID" in str(result.get("error", ""))
 
 
-def test_dispatch_session_request_fails_when_same_repo_session_read_probe_fails():
+def test_dispatch_session_request_returns_success_with_degraded_probe_status_when_same_repo_session_read_probe_fails():
     request: orchestrator_supervisor.SessionRequest = {
         "requestGeneration": 1,
         "nonce": "nonce-42",
@@ -4279,10 +4280,16 @@ def test_dispatch_session_request_fails_when_same_repo_session_read_probe_fails(
 
     adapter = FakeHostAdapter(
         SessionStartResult(
-            status="error",
+            status="success",
             session_id="ses_root_stdout",
-            error="root session ses_root_stdout was created but failed same-repo session_read probe: Session not found: ses_root_stdout",
-            readability_status="failed_same_repo_probe",
+            resume_hint=(
+                "Open /sessions in OpenCode TUI and switch to ses_root_stdout, or run opencode --session ses_root_stdout. "
+                "Warning: same-repo session_read probe failed (Session not found: ses_root_stdout); "
+                "treat this root session as degraded readability and avoid immediate rollback."
+            ),
+            resume_command="opencode --session ses_root_stdout",
+            readability_status="degraded_same_repo_probe",
+            metadata={"sameRepoProbeDetail": "Session not found: ses_root_stdout"},
         )
     )
     with patch("scripts.orchestrator_supervisor._default_host_adapter", return_value=adapter):
@@ -4293,10 +4300,10 @@ def test_dispatch_session_request_fails_when_same_repo_session_read_probe_fails(
             updated_at="2026-05-07T17:10:00+08:00",
         )
 
-    assert result.get("status") == "error"
+    assert result.get("status") == "success"
     assert result.get("rootSessionID") == "ses_root_stdout"
-    assert result.get("sessionReadabilityStatus") == "failed_same_repo_probe"
-    assert "failed same-repo session_read probe" in str(result.get("error", ""))
+    assert result.get("sessionReadabilityStatus") == "degraded_same_repo_probe"
+    assert "opencode --session ses_root_stdout" in str(result.get("cliOpenCommand", ""))
 
 
 def test_dispatch_session_request_retries_without_source_session_on_prefill_error():
@@ -6071,6 +6078,49 @@ def test_start_issue_records_ready_rollback_reason_on_dispatch_error(tmp_path: P
     assert payload["restored_ready_for_agent"] is True
 
 
+def test_start_issue_treats_error_with_root_session_as_degraded_success_and_skips_ready_rollback(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    orchestrator_supervisor._sync_issue_packet_to_db(tmp_path, issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+
+    with patch(
+        "scripts.orchestrator_supervisor.dispatch_session_request",
+        return_value={
+            "status": "error",
+            "error": "root session ses_root_stdout was created but failed same-repo session_read probe: Session not found: ses_root_stdout",
+            "recordedAt": "2026-05-07T17:10:00+08:00",
+            "issueNumber": "42",
+            "branch": "agent/issue-42-demo",
+            "sourceSessionID": "workspace_reconcile",
+            "role": "main_orchestrator",
+            "stage": "orchestrator_bootstrap",
+            "reason": "orchestrator bootstrap continuation for issue #42",
+            "title": "Continue issue #42 on agent/issue-42-demo",
+            "rootSessionID": "ses_root_stdout",
+            "sessionReadabilityStatus": "degraded_same_repo_probe",
+        },
+    ), patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+        result = orchestrator_supervisor.start_issue(
+            base_dir=tmp_path,
+            issue_number="42",
+            source_session_id="workspace_reconcile",
+            updated_at="2026-05-07T17:10:00+08:00",
+        )
+
+    issue = read_issue(tmp_path, "42")
+    rollback = read_latest_issue_history(tmp_path, "42", entry_type="admin_action")
+    degraded_event = read_latest_issue_history(tmp_path, "42", entry_type="admin_action")
+    assert result.get("status") == "success"
+    assert result.get("rootSessionID") == "ses_root_stdout"
+    assert result.get("sessionReadabilityStatus") == "degraded_same_repo_probe"
+    assert issue is not None
+    assert issue["state"] == "running"
+    assert issue["current_session_id"] == "ses_root_stdout"
+    assert rollback is not None
+    rollback_payload = json.loads(str(rollback["payload_json"] or "{}"))
+    assert rollback_payload.get("decision_type") == "same_repo_probe_degraded"
+    assert degraded_event is not None
+
+
 def test_start_issue_blocks_rollback_when_latest_dispatch_result_has_active_root(tmp_path: Path):
     issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
     orchestrator_supervisor._sync_issue_packet_to_db(tmp_path, issue_packet, updated_at="2026-05-07T17:00:00+08:00")
@@ -6233,6 +6283,246 @@ def test_reconcile_quarantines_stale_queued_release_worker_with_stale_root_heart
     assert request is None
     assert issue is not None
     assert issue["state"] == "quarantined"
+
+
+def test_reconcile_root_heartbeat_timeout_respects_env_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AUTODEV_ROOT_HEARTBEAT_TIMEOUT_SECONDS", "1800")
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "pr_verifier", "stage": "pr_verifier_execution", "status": "queued"}
+    cast(dict[str, str], ledger["artifacts"])["evidence_packet_ref"] = "docs/agents/evidence/issue-42-pr-77.yaml"
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="verifying",
+        command_id="cmd-verifying",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_session_id="ses-root-42",
+    )
+    connection = sqlite3.connect(tmp_path / ".opencode/runtime/control-plane.sqlite3")
+    try:
+        _ = connection.execute(
+            "UPDATE issues SET last_event_at = ? WHERE issue_number = ?",
+            ("2026-05-07T17:00:00+08:00", "42"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    updated_ledger, decision, request = reconcile_ledger(
+        ledger,
+        artifact_base_dir=tmp_path,
+        updated_at="2026-05-07T17:16:00+08:00",
+    )
+
+    issue = read_issue(tmp_path, "42")
+    assert updated_ledger is ledger
+    assert decision["action"] != "hold_quarantined_issue"
+    assert request is None
+    assert issue is not None
+    assert issue["state"] == "verifying"
+
+
+def test_reconcile_does_not_quarantine_on_first_same_repo_probe_degraded_start(tmp_path: Path) -> None:
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "issue_worker", "stage": "issue_worker_execution", "status": "queued"}
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="running",
+        command_id="cmd-running",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_session_id="ses-root-42",
+    )
+    orchestrator_supervisor._record_dispatch_result_history(
+        base_dir=tmp_path,
+        session_result={
+            "status": "success",
+            "rootSessionID": "ses-root-42",
+            "recordedAt": "2026-05-07T17:10:00+08:00",
+            "issueNumber": "42",
+            "branch": "agent/issue-42-demo",
+            "sourceSessionID": "workspace_reconcile",
+            "role": "main_orchestrator",
+            "stage": "orchestrator_bootstrap",
+            "reason": "bootstrap dispatch result",
+            "title": "Continue issue #42 on agent/issue-42-demo",
+            "sessionReadabilityStatus": "degraded_same_repo_probe",
+        },
+    )
+    orchestrator_supervisor._record_same_repo_probe_degraded_event(
+        base_dir=tmp_path,
+        issue_number="42",
+        session_result=cast(
+            orchestrator_supervisor.SessionResult,
+            cast(object, {
+                "status": "success",
+                "rootSessionID": "ses-root-42",
+                "recordedAt": "2026-05-07T17:10:00+08:00",
+                "issueNumber": "42",
+                "sessionReadabilityStatus": "degraded_same_repo_probe",
+                "error": "same-repo probe timeout",
+            }),
+        ),
+    )
+
+    updated_ledger, decision, request = reconcile_ledger(
+        ledger,
+        artifact_base_dir=tmp_path,
+        updated_at="2026-05-07T17:11:00+08:00",
+    )
+
+    issue = read_issue(tmp_path, "42")
+    assert updated_ledger is ledger
+    assert decision["action"] == "no_change"
+    assert request is None
+    assert issue is not None
+    assert issue["state"] == "running"
+
+
+def test_reconcile_quarantines_on_second_consecutive_same_repo_probe_degraded_start(tmp_path: Path) -> None:
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "issue_worker", "stage": "issue_worker_execution", "status": "queued"}
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="running",
+        command_id="cmd-running",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_session_id="ses-root-42",
+    )
+    first_result: dict[str, object] = {
+        "status": "success",
+        "rootSessionID": "ses-root-41",
+        "recordedAt": "2026-05-07T17:09:00+08:00",
+        "issueNumber": "42",
+        "branch": "agent/issue-42-demo",
+        "sourceSessionID": "workspace_reconcile",
+        "role": "main_orchestrator",
+        "stage": "orchestrator_bootstrap",
+        "reason": "bootstrap dispatch result",
+        "title": "Continue issue #42 on agent/issue-42-demo",
+        "sessionReadabilityStatus": "degraded_same_repo_probe",
+    }
+    second_result: dict[str, object] = {
+        "status": "success",
+        "rootSessionID": "ses-root-42",
+        "recordedAt": "2026-05-07T17:10:00+08:00",
+        "issueNumber": "42",
+        "branch": "agent/issue-42-demo",
+        "sourceSessionID": "workspace_reconcile",
+        "role": "main_orchestrator",
+        "stage": "orchestrator_bootstrap",
+        "reason": "bootstrap dispatch result",
+        "title": "Continue issue #42 on agent/issue-42-demo",
+        "sessionReadabilityStatus": "degraded_same_repo_probe",
+    }
+    orchestrator_supervisor._record_dispatch_result_history(
+        base_dir=tmp_path,
+        session_result=cast(orchestrator_supervisor.SessionResult, cast(object, first_result)),
+    )
+    orchestrator_supervisor._record_dispatch_result_history(
+        base_dir=tmp_path,
+        session_result=cast(orchestrator_supervisor.SessionResult, cast(object, second_result)),
+    )
+    orchestrator_supervisor._record_same_repo_probe_degraded_event(
+        base_dir=tmp_path,
+        issue_number="42",
+        session_result=cast(orchestrator_supervisor.SessionResult, cast(object, {**first_result, "error": "same-repo probe timeout #1"})),
+    )
+    orchestrator_supervisor._record_same_repo_probe_degraded_event(
+        base_dir=tmp_path,
+        issue_number="42",
+        session_result=cast(orchestrator_supervisor.SessionResult, cast(object, {**second_result, "error": "same-repo probe timeout #2"})),
+    )
+
+    with patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+        updated_ledger, decision, request = reconcile_ledger(
+            ledger,
+            artifact_base_dir=tmp_path,
+            updated_at="2026-05-07T17:11:00+08:00",
+        )
+
+    issue = read_issue(tmp_path, "42")
+    assert updated_ledger is ledger
+    assert decision["action"] == "hold_quarantined_issue"
+    assert request is None
+    assert issue is not None
+    assert issue["state"] == "quarantined"
+
+
+def test_reconcile_same_repo_probe_degraded_respects_env_override_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AUTODEV_SAME_REPO_PROBE_DEGRADED_LIMIT", "3")
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "issue_worker", "stage": "issue_worker_execution", "status": "queued"}
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="running",
+        command_id="cmd-running",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_session_id="ses-root-42",
+    )
+    first_result: dict[str, object] = {
+        "status": "success",
+        "rootSessionID": "ses-root-41",
+        "recordedAt": "2026-05-07T17:09:00+08:00",
+        "issueNumber": "42",
+        "branch": "agent/issue-42-demo",
+        "sourceSessionID": "workspace_reconcile",
+        "role": "main_orchestrator",
+        "stage": "orchestrator_bootstrap",
+        "reason": "bootstrap dispatch result",
+        "title": "Continue issue #42 on agent/issue-42-demo",
+        "sessionReadabilityStatus": "degraded_same_repo_probe",
+    }
+    second_result: dict[str, object] = {
+        "status": "success",
+        "rootSessionID": "ses-root-42",
+        "recordedAt": "2026-05-07T17:10:00+08:00",
+        "issueNumber": "42",
+        "branch": "agent/issue-42-demo",
+        "sourceSessionID": "workspace_reconcile",
+        "role": "main_orchestrator",
+        "stage": "orchestrator_bootstrap",
+        "reason": "bootstrap dispatch result",
+        "title": "Continue issue #42 on agent/issue-42-demo",
+        "sessionReadabilityStatus": "degraded_same_repo_probe",
+    }
+    orchestrator_supervisor._record_dispatch_result_history(
+        base_dir=tmp_path,
+        session_result=cast(orchestrator_supervisor.SessionResult, cast(object, first_result)),
+    )
+    orchestrator_supervisor._record_dispatch_result_history(
+        base_dir=tmp_path,
+        session_result=cast(orchestrator_supervisor.SessionResult, cast(object, second_result)),
+    )
+    orchestrator_supervisor._record_same_repo_probe_degraded_event(
+        base_dir=tmp_path,
+        issue_number="42",
+        session_result=cast(orchestrator_supervisor.SessionResult, cast(object, {**first_result, "error": "same-repo probe timeout #1"})),
+    )
+    orchestrator_supervisor._record_same_repo_probe_degraded_event(
+        base_dir=tmp_path,
+        issue_number="42",
+        session_result=cast(orchestrator_supervisor.SessionResult, cast(object, {**second_result, "error": "same-repo probe timeout #2"})),
+    )
+
+    updated_ledger, decision, request = reconcile_ledger(
+        ledger,
+        artifact_base_dir=tmp_path,
+        updated_at="2026-05-07T17:11:00+08:00",
+    )
+
+    issue = read_issue(tmp_path, "42")
+    assert updated_ledger is ledger
+    assert decision["action"] == "no_change"
+    assert request is None
+    assert issue is not None
+    assert issue["state"] == "running"
 
 
 def test_reconcile_release_success_keeps_issue_completed(tmp_path: Path):

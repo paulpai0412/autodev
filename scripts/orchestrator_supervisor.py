@@ -8,6 +8,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -26,6 +27,7 @@ from scripts.control_plane_db import (
     append_issue_event,
     append_issue_history,
     canonical_control_plane_base_dir,
+    control_plane_db_path,
     completed_issue_numbers,
     describe_control_plane_schema,
     ensure_control_plane_db,
@@ -559,6 +561,7 @@ DEFAULT_RELEASE_CAPACITY = 1
 DEFAULT_RELEASE_BACKFILL_MODE = "auto"
 DEFAULT_AUTO_RELEASE_APPROVAL_MODE = "human_required"
 ROOT_HEARTBEAT_TIMEOUT_SECONDS = 900
+DEFAULT_SAME_REPO_PROBE_DEGRADED_LIMIT = 2
 TRANSIENT_RELEASE_BLOCKERS = {
     "required_checks_pending",
     "required_checks_failed",
@@ -685,6 +688,41 @@ def _record_dispatch_result_history(
         content_hash=body_hash,
         unique_key=f"dispatch-result:{issue_number}:{body_hash}",
     )
+
+
+def _is_same_repo_probe_degradation(session_result: SessionResult) -> bool:
+    root_session_id = str(session_result.get("rootSessionID") or "")
+    if not root_session_id:
+        return False
+    readability_status = str(session_result.get("sessionReadabilityStatus") or "")
+    if readability_status in {"failed_same_repo_probe", "degraded_same_repo_probe"}:
+        return True
+    error_text = str(session_result.get("error") or "").lower()
+    return "same-repo session_read probe" in error_text
+
+
+def _promote_same_repo_probe_degraded_result(session_result: SessionResult) -> bool:
+    if session_result.get("status") == "success":
+        return False
+    if not _is_same_repo_probe_degradation(session_result):
+        return False
+    degraded_root_session_id = str(session_result.get("rootSessionID") or "")
+    if not degraded_root_session_id:
+        return False
+    session_result["status"] = "success"
+    if not str(session_result.get("sessionReadabilityStatus") or ""):
+        session_result["sessionReadabilityStatus"] = "degraded_same_repo_probe"
+    if not str(session_result.get("cliOpenCommand") or ""):
+        session_result["cliOpenCommand"] = f"opencode --session {degraded_root_session_id}"
+    if not str(session_result.get("tuiResumeCommand") or ""):
+        session_result["tuiResumeCommand"] = "/sessions"
+    degraded_error = str(session_result.get("error") or "")
+    resume_link = _default_host_adapter().resume_link(degraded_root_session_id)
+    session_result["recommendedAction"] = (
+        f"Resume the active root session with {resume_link}. "
+        f"Dispatch returned a degraded status after the session was created: {degraded_error or 'same-repo session_read probe failed'}"
+    )
+    return True
 
 
 def _session_result_recorded_at(session_result: JsonObject) -> str:
@@ -1091,6 +1129,7 @@ def start_issue(
         source_session_id=source_session_id,
         updated_at=timestamp,
     )
+    _ = _promote_same_repo_probe_degraded_result(session_result)
     if session_result.get("status") == "success":
         root_session_id = str(session_result.get("rootSessionID") or "")
         recorded_at = str(session_result.get("recordedAt") or timestamp)
@@ -1112,6 +1151,11 @@ def start_issue(
             created_at=recorded_at,
             payload=cast(JsonObject, cast(object, dict(session_result))),
             session_seq=1,
+        )
+        _record_same_repo_probe_degraded_event(
+            base_dir=base_dir,
+            issue_number=issue_number,
+            session_result=session_result,
         )
         sync_error = _sync_issue_progress_label(
             base_dir=base_dir,
@@ -1217,6 +1261,28 @@ def _release_capacity() -> int:
     except ValueError:
         return DEFAULT_RELEASE_CAPACITY
     return max(1, capacity)
+
+
+def root_heartbeat_timeout_seconds() -> int:
+    raw = os.environ.get("AUTODEV_ROOT_HEARTBEAT_TIMEOUT_SECONDS", "")
+    if not raw:
+        return ROOT_HEARTBEAT_TIMEOUT_SECONDS
+    try:
+        timeout_seconds = int(raw)
+    except ValueError:
+        return ROOT_HEARTBEAT_TIMEOUT_SECONDS
+    return max(1, timeout_seconds)
+
+
+def _same_repo_probe_degraded_limit() -> int:
+    raw = os.environ.get("AUTODEV_SAME_REPO_PROBE_DEGRADED_LIMIT", "")
+    if not raw:
+        return DEFAULT_SAME_REPO_PROBE_DEGRADED_LIMIT
+    try:
+        limit = int(raw)
+    except ValueError:
+        return DEFAULT_SAME_REPO_PROBE_DEGRADED_LIMIT
+    return max(1, limit)
 
 
 def _release_backfill_mode() -> str:
@@ -1385,7 +1451,7 @@ def _quarantine_stale_running_issue(
     last_event_time = _parse_iso8601(last_event_at)
     if current_time is None or last_event_time is None:
         return False
-    if current_time - last_event_time <= timedelta(seconds=ROOT_HEARTBEAT_TIMEOUT_SECONDS):
+    if current_time - last_event_time <= timedelta(seconds=root_heartbeat_timeout_seconds()):
         return False
 
     issue = cast(dict[str, str], ledger["issue"])
@@ -1446,7 +1512,7 @@ def _quarantine_stale_dispatching_issue_without_root_session(
     dispatching_time = _parse_iso8601(dispatching_at)
     if current_time is None or dispatching_time is None:
         return False
-    if current_time - dispatching_time <= timedelta(seconds=ROOT_HEARTBEAT_TIMEOUT_SECONDS):
+    if current_time - dispatching_time <= timedelta(seconds=root_heartbeat_timeout_seconds()):
         return False
 
     issue = cast(dict[str, str], ledger["issue"])
@@ -1486,7 +1552,7 @@ def _quarantine_stale_queued_subagent_with_stale_root(
     last_event_time = _parse_iso8601(last_event_at)
     if current_time is None or last_event_time is None:
         return False
-    if current_time - last_event_time <= timedelta(seconds=ROOT_HEARTBEAT_TIMEOUT_SECONDS):
+    if current_time - last_event_time <= timedelta(seconds=root_heartbeat_timeout_seconds()):
         return False
 
     issue = cast(dict[str, str], ledger["issue"])
@@ -2975,6 +3041,11 @@ def _dispatch_request_via_db(
                 payload=cast(JsonObject, cast(object, dict(session_result))),
                 session_seq=1,
             )
+            _record_same_repo_probe_degraded_event(
+                base_dir=base_dir,
+                issue_number=request["issueNumber"],
+                session_result=session_result,
+            )
             update_issue_execution_claim(
                 base_dir=base_dir,
                 issue_number=request["issueNumber"],
@@ -3020,7 +3091,8 @@ def _dispatch_request_via_db(
                 current_role="main_orchestrator",
                 current_stage=str(request.get("stage") or "release_root_execution"),
                 current_status="running",
-            )
+                )
+        _ = _promote_same_repo_probe_degraded_result(session_result)
     if session_result.get("status") != "success":
         current_issue_state = read_issue(base_dir, request["issueNumber"])
         current_state = str(current_issue_state.get("state") or "") if current_issue_state else ""
@@ -3300,6 +3372,137 @@ def _record_session_result_history(base_dir: Path, ledger: JsonObject, session_r
         status=child_session_status or status,
         extra=release_child_session,
     )
+
+
+def _record_same_repo_probe_degraded_event(
+    *,
+    base_dir: Path,
+    issue_number: str,
+    session_result: SessionResult,
+) -> None:
+    root_session_id = str(session_result.get("rootSessionID") or "")
+    recorded_at = str(session_result.get("recordedAt") or "")
+    if not root_session_id or not recorded_at:
+        return
+    readability_status = str(session_result.get("sessionReadabilityStatus") or "")
+    if readability_status != "degraded_same_repo_probe":
+        return
+    error_text = str(session_result.get("error") or "").strip()
+    summary = (
+        f"Root session {root_session_id} started with degraded same-repo session_read probe status; "
+        f"session remains active and reconcile should monitor follow-up health checks."
+    )
+    if error_text:
+        summary = f"{summary} Detail: {error_text}"
+    _ = append_issue_history(
+        base_dir,
+        issue_number=issue_number,
+        entry_type="admin_action",
+        created_at=recorded_at,
+        status="same_repo_probe_degraded",
+        session_id=root_session_id,
+        command_id=f"same-repo-probe-degraded:{issue_number}:{root_session_id}:{recorded_at}",
+        summary=summary,
+        payload={
+            "decision_type": "same_repo_probe_degraded",
+            "root_session_id": root_session_id,
+            "session_readability_status": readability_status,
+            "error": error_text,
+        },
+        unique_key=f"same-repo-probe-degraded:{issue_number}:{root_session_id}:{recorded_at}",
+    )
+
+
+def _same_repo_probe_degraded_event_count(
+    *,
+    base_dir: Path,
+    issue_number: str,
+) -> int:
+    ensure_control_plane_db(base_dir)
+    control_plane_path = control_plane_db_path(base_dir)
+    connection = sqlite3.connect(control_plane_path)
+    try:
+        row = connection.execute(
+            (
+                "SELECT COUNT(*) AS count FROM issue_history "
+                "WHERE issue_number = ? AND entry_type = 'admin_action' AND status = 'same_repo_probe_degraded'"
+            ),
+            (issue_number,),
+        ).fetchone()
+    finally:
+        connection.close()
+    return int(row[0]) if row else 0
+
+
+def _same_repo_probe_degraded_streak(
+    *,
+    base_dir: Path,
+    issue_number: str,
+) -> int:
+    ensure_control_plane_db(base_dir)
+    control_plane_path = control_plane_db_path(base_dir)
+    connection = sqlite3.connect(control_plane_path)
+    try:
+        rows = connection.execute(
+            (
+                "SELECT payload_json FROM issue_history "
+                "WHERE issue_number = ? AND entry_type = 'dispatch_result' "
+                "ORDER BY created_at DESC, history_id DESC LIMIT 32"
+            ),
+            (issue_number,),
+        ).fetchall()
+    finally:
+        connection.close()
+
+    streak = 0
+    for row in rows:
+        payload_raw = str(row[0] or "{}")
+        try:
+            payload = cast(dict[str, object], json.loads(payload_raw))
+        except json.JSONDecodeError:
+            break
+        if not isinstance(payload, dict):
+            break
+        root_session_id = str(payload.get("rootSessionID") or "")
+        if not root_session_id:
+            continue
+        readability_status = str(payload.get("sessionReadabilityStatus") or "")
+        if readability_status == "degraded_same_repo_probe":
+            streak += 1
+            continue
+        break
+    return streak
+
+
+def _quarantine_on_repeated_same_repo_probe_degradation(
+    *,
+    base_dir: Path,
+    ledger: JsonObject,
+    runtime_issue: dict[str, object],
+    updated_at: str,
+) -> bool:
+    issue = cast(dict[str, str], ledger["issue"])
+    issue_number = issue["number"]
+    runtime_state = str(runtime_issue.get("state") or "")
+    if runtime_state in {"quarantined", "completed", "failed"}:
+        return False
+    degraded_streak = _same_repo_probe_degraded_streak(base_dir=base_dir, issue_number=issue_number)
+    degraded_limit = _same_repo_probe_degraded_limit()
+    if degraded_streak < degraded_limit:
+        return False
+    degraded_count = _same_repo_probe_degraded_event_count(base_dir=base_dir, issue_number=issue_number)
+    summary = (
+        f"Issue #{issue_number} recorded {degraded_streak} consecutive same-repo session_read degraded starts "
+        f"({degraded_count} total degraded events); "
+        f"quarantine after threshold {degraded_limit} to require controlled recovery."
+    )
+    quarantine_issue_execution(
+        base_dir=base_dir,
+        issue_number=issue_number,
+        reason=summary,
+        updated_at=updated_at,
+    )
+    return True
 
 
 def _bump_ledger_revision(ledger: JsonObject, updated_at: str) -> None:
@@ -3898,6 +4101,14 @@ def reconcile_ledger(
             base_dir=base_dir,
             ledger=ledger,
             current=current,
+            runtime_issue=cast(dict[str, object], runtime_issue),
+            updated_at=timestamp,
+        ):
+            runtime_issue = read_issue(base_dir, issue["number"])
+
+        if runtime_issue and _quarantine_on_repeated_same_repo_probe_degradation(
+            base_dir=base_dir,
+            ledger=ledger,
             runtime_issue=cast(dict[str, object], runtime_issue),
             updated_at=timestamp,
         ):
