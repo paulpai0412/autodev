@@ -1,0 +1,17 @@
+schema_version: "1.0"
+
+project:
+  name: autodev
+  root: /home/timmypai/apps/autodev
+  github_repo: paulpai0412/autodev
+
+context:
+  required_reads:
+    - AGENTS.md
+    - CONTEXT.md
+    - docs/agents/domain.md
+    - docs/agents/issue-tracker.md
+    - docs/agents/triage-labels.md
+
+runtime:
+  control_plane_db: .opencode/runtime/control-plane.sqlite3
