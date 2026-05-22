@@ -72,6 +72,8 @@ def fake_init_with_project_bootstrap_run(args: list[str], **_kwargs: object) -> 
     if args[:4] == ["gh", "project", "field-list", "7"]:
         return completed(args, stdout="[]")
     if args[:4] == ["gh", "project", "field-create", "7"]:
+        if "Status" in args:
+            return completed(args, stdout=json.dumps({"id": "PVTF_status"}))
         if "Workflow State" in args:
             return completed(args, stdout=json.dumps({"id": "PVTF_state"}))
         if "Current Stage" in args:
@@ -136,6 +138,7 @@ def test_init_create_github_project_writes_monitoring_block(tmp_path: Path):
     config = read(tmp_path / ".autodev.yaml")
     assert "AUTODEV_GITHUB_MONITORING:BEGIN" in config
     assert 'github_project_id: "PVT_project_1"' in config
+    assert 'status: "PVTF_status"' in config
     assert 'state: "PVTF_state"' in config
     assert 'stage: "PVTF_stage"' in config
     assert 'pr_workflow: "PVTF_pr_workflow"' in config
@@ -276,6 +279,7 @@ def test_doctor_reports_incomplete_github_monitoring_block(tmp_path: Path, capsy
 
     assert exit_code == 1
     assert "missing github_project_id in .autodev.yaml monitoring block" in captured.out
+    assert "missing github_project_field_ids.status" in captured.out
     assert "missing github_project_field_ids.stage" in captured.out
     assert "missing github_project_field_ids.pr_workflow" in captured.out
 

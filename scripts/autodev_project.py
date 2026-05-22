@@ -137,6 +137,12 @@ AUTODEV_PR_WORKFLOW_STATES = [
     "merged",
 ]
 
+AUTODEV_PROJECT_STATUS_OPTIONS = [
+    "Todo",
+    "In progress",
+    "Done",
+]
+
 
 def _project_root(path: str | None) -> Path:
     return Path(path or ".").resolve()
@@ -547,6 +553,7 @@ def _option_id_map_for_states(*, owner: str, project_number: int, field_name: st
 
 def _monitoring_block(*, setup: GitHubProjectSetup) -> str:
     state_mapping = setup.field_option_ids.get("state", {})
+    status_mapping = setup.field_option_ids.get("status", {})
     pr_workflow_mapping = setup.field_option_ids.get("pr_workflow", {})
     return "\n".join(
         [
@@ -557,11 +564,14 @@ def _monitoring_block(*, setup: GitHubProjectSetup) -> str:
             f'github_project_id: "{setup.project_id}"',
             "github_project_field_ids:",
             f'  state: "{setup.field_ids.get("state", "")}"',
+            f'  status: "{setup.field_ids.get("status", "")}"',
             f'  stage: "{setup.field_ids.get("stage", "")}"',
             f'  pr_workflow: "{setup.field_ids.get("pr_workflow", "")}"',
             "github_project_field_option_ids:",
             "  state:",
             *[f'    {key}: "{state_mapping[key]}"' for key in sorted(state_mapping)],
+            "  status:",
+            *[f'    {key}: "{status_mapping[key]}"' for key in sorted(status_mapping)],
             "  pr_workflow:",
             *[f'    {key}: "{pr_workflow_mapping[key]}"' for key in sorted(pr_workflow_mapping)],
             GITHUB_MONITORING_END,
@@ -587,7 +597,7 @@ def _replace_monitoring_block(config_text: str, *, setup: GitHubProjectSetup) ->
 def _extract_monitoring_from_config(config_text: str) -> tuple[str, dict[str, str], dict[str, dict[str, str]]]:
     project_id = ""
     field_ids: dict[str, str] = {}
-    field_option_ids: dict[str, dict[str, str]] = {"state": {}, "pr_workflow": {}}
+    field_option_ids: dict[str, dict[str, str]] = {"state": {}, "status": {}, "pr_workflow": {}}
     in_option_block = False
     current_option_section = ""
     for raw_line in config_text.splitlines():
@@ -602,7 +612,7 @@ def _extract_monitoring_from_config(config_text: str) -> tuple[str, dict[str, st
 
         if in_option_block and raw_line.startswith("  ") and line.endswith(":"):
             section_name = line[:-1]
-            current_option_section = section_name if section_name in {"state", "pr_workflow"} else ""
+            current_option_section = section_name if section_name in {"state", "status", "pr_workflow"} else ""
             continue
 
         if in_option_block and raw_line.startswith("    ") and ":" in line and current_option_section:
@@ -621,6 +631,10 @@ def _extract_monitoring_from_config(config_text: str) -> tuple[str, dict[str, st
             value = line.split(":", 1)[1].strip().strip('"')
             if value:
                 field_ids.setdefault("state", value)
+        if line.startswith("status:") and "github_project_field_ids" in config_text and raw_line.startswith("  "):
+            value = line.split(":", 1)[1].strip().strip('"')
+            if value:
+                field_ids.setdefault("status", value)
         if line.startswith("stage:") and "github_project_field_ids" in config_text and raw_line.startswith("  "):
             value = line.split(":", 1)[1].strip().strip('"')
             if value:
@@ -674,11 +688,13 @@ def _ensure_issue_runtime_project_binding(
                     "github_project_id": project_id,
                     "github_project_field_ids": {
                         "state": field_ids.get("state", ""),
+                        "status": field_ids.get("status", ""),
                         "stage": field_ids.get("stage", ""),
                         "pr_workflow": field_ids.get("pr_workflow", ""),
                     },
                     "github_project_field_option_ids": {
                         "state": dict(field_option_ids.get("state", {})),
+                        "status": dict(field_option_ids.get("status", {})),
                         "pr_workflow": dict(field_option_ids.get("pr_workflow", {})),
                     },
                 },
@@ -978,6 +994,13 @@ def init_project(
                         data_type="SINGLE_SELECT",
                         single_select_options=AUTODEV_ISSUE_STATES,
                     ),
+                    "status": _ensure_project_field(
+                        owner=project_owner,
+                        project_number=project_number,
+                        field_name="Status",
+                        data_type="SINGLE_SELECT",
+                        single_select_options=AUTODEV_PROJECT_STATUS_OPTIONS,
+                    ),
                     "stage": _ensure_project_field(
                         owner=project_owner,
                         project_number=project_number,
@@ -998,6 +1021,12 @@ def init_project(
                         project_number=project_number,
                         field_name="Workflow State",
                         states=AUTODEV_ISSUE_STATES,
+                    ),
+                    "status": _option_id_map_for_states(
+                        owner=project_owner,
+                        project_number=project_number,
+                        field_name="Status",
+                        states=AUTODEV_PROJECT_STATUS_OPTIONS,
                     ),
                     "pr_workflow": _option_id_map_for_states(
                         owner=project_owner,
@@ -1077,10 +1106,10 @@ def doctor_project(root: Path) -> ActionReport:
         if has_monitoring_block:
             if not project_id:
                 report.findings.append("missing github_project_id in .autodev.yaml monitoring block")
-            for field_key in ("state", "stage", "pr_workflow"):
+            for field_key in ("state", "status", "stage", "pr_workflow"):
                 if not str(field_ids.get(field_key) or "").strip():
                     report.findings.append(f"missing github_project_field_ids.{field_key} in .autodev.yaml monitoring block")
-            for option_group in ("state", "pr_workflow"):
+            for option_group in ("state", "status", "pr_workflow"):
                 if not field_option_ids.get(option_group):
                     report.findings.append(f"missing github_project_field_option_ids.{option_group} mapping in .autodev.yaml monitoring block")
     if not (root / ".opencode/runtime/control-plane.sqlite3").exists():
