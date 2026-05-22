@@ -1287,6 +1287,58 @@ def test_start_issue_from_issue_worktree_uses_root_control_plane_db(tmp_path: Pa
     assert not (issue_worktree / ".opencode/runtime/control-plane.sqlite3").exists()
 
 
+def test_issue_worktree_sync_rebases_onto_latest_origin_main(tmp_path: Path):
+    _ = subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    _ = subprocess.run(["git", "config", "user.email", "autodev@example.com"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    _ = subprocess.run(["git", "config", "user.name", "autodev"], cwd=tmp_path, check=True, capture_output=True, text=True)
+
+    readme = tmp_path / "README.md"
+    readme.write_text("demo\n", encoding="utf-8")
+    _ = subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    _ = subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+
+    remote_repo = tmp_path / "remote.git"
+    _ = subprocess.run(["git", "init", "--bare", str(remote_repo)], cwd=tmp_path, check=True, capture_output=True, text=True)
+    _ = subprocess.run(["git", "remote", "add", "origin", str(remote_repo)], cwd=tmp_path, check=True, capture_output=True, text=True)
+    _ = subprocess.run(["git", "push", "-u", "origin", "main"], cwd=tmp_path, check=True, capture_output=True, text=True)
+
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    orchestrator_supervisor._sync_issue_packet_to_db(tmp_path, issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+
+    with patch(
+        "scripts.orchestrator_supervisor._default_host_adapter",
+        return_value=successful_host_adapter(session_id="ses_root_test", resume_command="opencode --session ses_root_test"),
+    ), patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+        _ = orchestrator_supervisor.start_issue(
+            base_dir=tmp_path,
+            issue_number="42",
+            source_session_id="autodev-start",
+            updated_at="2026-05-07T17:10:00+08:00",
+        )
+
+    main_change = tmp_path / "UPSTREAM.txt"
+    main_change.write_text("new upstream line\n", encoding="utf-8")
+    _ = subprocess.run(["git", "add", "UPSTREAM.txt"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    _ = subprocess.run(["git", "commit", "-m", "upstream"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    _ = subprocess.run(["git", "push", "origin", "main"], cwd=tmp_path, check=True, capture_output=True, text=True)
+
+    issue_worktree = tmp_path / ".opencode/runtime/issue-worktrees/issue-42"
+    assert not (issue_worktree / "UPSTREAM.txt").exists()
+
+    orchestrator_supervisor._sync_issue_worktree_with_base_branch(worktree_path=issue_worktree, base_branch="main")
+
+    upstream_on_issue = subprocess.run(
+        ["git", "show", "origin/main:UPSTREAM.txt"],
+        cwd=issue_worktree,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    file_in_issue = issue_worktree / "UPSTREAM.txt"
+    assert file_in_issue.exists()
+    assert file_in_issue.read_text(encoding="utf-8") == upstream_on_issue.stdout
+
+
 def test_start_issue_rejects_packet_issue_number_mismatch(tmp_path: Path):
     malicious_packet_text = SAMPLE_ISSUE_PACKET.replace('number: "42"', 'number: "../../etc/passwd"')
     issue_packet_path = tmp_path / "docs/agents/issue-packets/issue-42.yaml"

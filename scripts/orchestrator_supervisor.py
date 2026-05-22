@@ -159,6 +159,36 @@ def _branch_exists_locally(base_dir: Path, branch: str) -> bool:
     return completed.returncode == 0
 
 
+def _remote_exists(base_dir: Path, remote: str) -> bool:
+    completed = _run_git_command(base_dir, ["git", "remote", "get-url", remote])
+    return completed.returncode == 0
+
+
+def _sync_issue_worktree_with_base_branch(*, worktree_path: Path, base_branch: str) -> None:
+    if not _is_git_repo(worktree_path):
+        return
+
+    resolved_base_branch = base_branch or "main"
+    if _remote_exists(worktree_path, "origin"):
+        fetch = _run_git_command(worktree_path, ["git", "fetch", "origin", "--prune"])
+        if fetch.returncode != 0:
+            error = (fetch.stderr or fetch.stdout).strip() or "git fetch origin --prune failed"
+            raise RuntimeError(f"failed to sync issue worktree with origin before start: {error}")
+        rebase_target = f"origin/{resolved_base_branch}"
+    else:
+        rebase_target = resolved_base_branch
+
+    rebase = _run_git_command(worktree_path, ["git", "rebase", rebase_target])
+    if rebase.returncode == 0:
+        return
+
+    _ = _run_git_command(worktree_path, ["git", "rebase", "--abort"])
+    error = (rebase.stderr or rebase.stdout).strip() or f"git rebase {rebase_target} failed"
+    raise RuntimeError(
+        f"failed to rebase issue worktree onto {rebase_target} before start; resolve conflict then retry: {error}"
+    )
+
+
 def _ensure_issue_worktree(
     *,
     base_dir: Path,
@@ -1058,6 +1088,7 @@ def start_issue(
         base_branch=resolved_base_branch,
         updated_at=timestamp,
     )
+    _sync_issue_worktree_with_base_branch(worktree_path=issue_worktree, base_branch=resolved_base_branch)
     _ = sync_issue_runtime_context(
         base_dir,
         issue_number=issue_number,
