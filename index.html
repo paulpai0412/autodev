@@ -135,6 +135,7 @@
     .btn:hover { transform: translateY(-1px); border-color: rgba(152, 69, 44, .35); }
     .btn.primary { background: var(--ink); color: #fff7ec; border-color: var(--ink); }
     .btn.clay { background: var(--clay); border-color: var(--clay); color: white; }
+    .file-input-hidden { display: none; }
 
     .grid {
       display: grid;
@@ -662,7 +663,7 @@
     <header class="topbar">
       <div class="brand"><div class="mark">A</div><div><h1>Autodev Control Tower</h1><p>一條龍開發流程 · Claude 暖紙介面</p></div></div>
       <div class="context-pill"><strong>wferp</strong><code>/home/timmypai/apps/wferp</code></div>
-      <div class="top-actions"><div class="pill">GitHub 身份 · <strong>paulpai0412</strong></div><div class="pill">Flow Run · <strong>進行中</strong></div><button class="btn primary" type="button" data-screen-target="flow">新流程</button></div>
+      <div class="top-actions"><div class="pill">GitHub 身份 · <strong>paulpai0412</strong></div><div class="pill">Flow Run · <strong>進行中</strong></div><button class="btn" type="button" id="export-vocabulary">Export</button><button class="btn" type="button" id="import-vocabulary">Import</button><input class="file-input-hidden" id="import-vocabulary-input" type="file" accept="application/json"><button class="btn primary" type="button" data-screen-target="flow">新流程</button></div>
     </header>
 
     <main class="grid">
@@ -983,6 +984,7 @@
   <script id="control-tower-core">
     (function () {
       var APP_DB_KEY = "control-tower-registry.v1";
+      var VOCAB_EXPORT_VERSION = 1;
       var SPEC_PIPELINE_STAGES = ["clarify", "prd", "issue-plan"];
       var RUN_POLICY_PRESETS = [
         {
@@ -1164,6 +1166,47 @@
         };
       }
 
+      function createDefaultVocabularyState() {
+        return {
+          words: [],
+        };
+      }
+
+      function parseNonNegativeInteger(value, fallback) {
+        var parsed = Number(value);
+        if (!Number.isFinite(parsed) || parsed < 0) {
+          return fallback;
+        }
+        return Math.floor(parsed);
+      }
+
+      function normalizeVocabularyWord(word, index) {
+        var source = word && typeof word === "object" ? word : {};
+        var progress = source.progress && typeof source.progress === "object" ? source.progress : {};
+
+        return {
+          id: normalizeOptionalString(source.id) || "word-" + String(index + 1),
+          term: normalizeOptionalString(source.term) || "",
+          meaning: normalizeOptionalString(source.meaning) || "",
+          progress: {
+            correctCount: parseNonNegativeInteger(progress.correctCount, 0),
+            incorrectCount: parseNonNegativeInteger(progress.incorrectCount, 0),
+            streak: parseNonNegativeInteger(progress.streak, 0),
+            lastReviewedAt: normalizeOptionalString(progress.lastReviewedAt),
+            nextReviewAt: normalizeOptionalString(progress.nextReviewAt),
+          },
+        };
+      }
+
+      function normalizeVocabularyState(raw) {
+        var source = raw && typeof raw === "object" ? raw : {};
+        var words = Array.isArray(source.words) ? source.words : [];
+
+        return {
+          words: words.map(normalizeVocabularyWord),
+        };
+      }
+
       function normalizeDb(raw) {
         if (!raw || typeof raw !== "object") {
           return {
@@ -1172,6 +1215,7 @@
             flowRuns: [],
             flowRunEvents: [],
             flowEventSequence: 0,
+            vocabulary: createDefaultVocabularyState(),
           };
         }
 
@@ -1261,6 +1305,7 @@
             : [],
           flowRunEvents: Array.isArray(raw.flowRunEvents) ? raw.flowRunEvents : [],
           flowEventSequence: Number.isFinite(raw.flowEventSequence) ? Number(raw.flowEventSequence) : 0,
+          vocabulary: normalizeVocabularyState(raw.vocabulary),
         };
       }
 
@@ -1507,6 +1552,7 @@
               flowRuns: [],
               flowRunEvents: [],
               flowEventSequence: 0,
+              vocabulary: createDefaultVocabularyState(),
             };
           }
 
@@ -1519,6 +1565,7 @@
               flowRuns: [],
               flowRunEvents: [],
               flowEventSequence: 0,
+              vocabulary: createDefaultVocabularyState(),
             };
           }
         }
@@ -2685,6 +2732,55 @@
           return lifecycleEvents.slice();
         }
 
+        function exportVocabularyData() {
+          var db = readDb();
+          var vocabulary = normalizeVocabularyState(db.vocabulary);
+
+          return {
+            schema: "vocabulary-backup",
+            version: VOCAB_EXPORT_VERSION,
+            exportedAt: nowIso(),
+            words: vocabulary.words.map(function (word) {
+              return {
+                id: word.id,
+                term: word.term,
+                meaning: word.meaning,
+                progress: {
+                  correctCount: word.progress.correctCount,
+                  incorrectCount: word.progress.incorrectCount,
+                  streak: word.progress.streak,
+                  lastReviewedAt: word.progress.lastReviewedAt,
+                  nextReviewAt: word.progress.nextReviewAt,
+                },
+              };
+            }),
+          };
+        }
+
+        function importVocabularyData(payload) {
+          if (!payload || typeof payload !== "object") {
+            throw new Error("Import payload must be a JSON object.");
+          }
+
+          var words = Array.isArray(payload.words)
+            ? payload.words
+            : payload.vocabulary && Array.isArray(payload.vocabulary.words)
+              ? payload.vocabulary.words
+              : null;
+          if (!words) {
+            throw new Error("Import payload must include words array.");
+          }
+
+          var db = readDb();
+          db.vocabulary = normalizeVocabularyState({ words: words });
+          writeDb(db);
+
+          return {
+            importedWords: db.vocabulary.words.length,
+            importedAt: nowIso(),
+          };
+        }
+
         return {
           APP_DB_KEY: APP_DB_KEY,
           readDb: readDb,
@@ -2726,6 +2822,8 @@
           getAllProjectsView: getAllProjectsView,
           triggerAllProjectsLifecycleAction: triggerAllProjectsLifecycleAction,
           getLifecycleEvents: getLifecycleEvents,
+          exportVocabularyData: exportVocabularyData,
+          importVocabularyData: importVocabularyData,
           setEnv: function (nextEnv) {
             env = nextEnv || {};
           },
@@ -2831,6 +2929,9 @@
       const policySaveResult = document.getElementById('policy-save-result');
       const policyRuntimeEnv = document.getElementById('policy-runtime-env');
       const policyAuditLog = document.getElementById('policy-audit-log');
+      const exportVocabularyButton = document.getElementById('export-vocabulary');
+      const importVocabularyButton = document.getElementById('import-vocabulary');
+      const importVocabularyInput = document.getElementById('import-vocabulary-input');
       let activeFlowRunId = null;
 
       const issuePlanSource = [
@@ -3400,6 +3501,51 @@
         policySaveResult.textContent = 'policy 已儲存並寫入 audit。';
         renderRunPolicy();
       });
+
+      if (exportVocabularyButton) {
+        exportVocabularyButton.addEventListener('click', () => {
+          try {
+            const payload = app.exportVocabularyData();
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+            const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const anchor = document.createElement('a');
+            anchor.href = url;
+            anchor.download = `vocabulary-backup-${timestamp}.json`;
+            document.body.appendChild(anchor);
+            anchor.click();
+            anchor.remove();
+            URL.revokeObjectURL(url);
+            policySaveResult.textContent = `已匯出詞彙資料（${payload.words.length} 筆）。`;
+          } catch (error) {
+            policySaveResult.textContent = `匯出失敗：${error.message}`;
+          }
+        });
+      }
+
+      if (importVocabularyButton && importVocabularyInput) {
+        importVocabularyButton.addEventListener('click', () => {
+          importVocabularyInput.click();
+        });
+
+        importVocabularyInput.addEventListener('change', async (event) => {
+          const file = event.target.files && event.target.files[0];
+          if (!file) {
+            return;
+          }
+
+          try {
+            const text = await file.text();
+            const payload = JSON.parse(text);
+            const result = app.importVocabularyData(payload);
+            policySaveResult.textContent = `已匯入詞彙資料（${result.importedWords} 筆）。`;
+          } catch (error) {
+            policySaveResult.textContent = `匯入失敗：${error.message}`;
+          } finally {
+            event.target.value = '';
+          }
+        });
+      }
     }
 
     (function initRunDashboardAndRecovery() {
