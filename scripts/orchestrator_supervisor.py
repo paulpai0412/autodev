@@ -1808,10 +1808,19 @@ def _sync_project_fields_projection(
     configured = _load_json_dict((read_runtime_context(base_dir, issue_number) or {}).get("github_project_field_ids"))
     fields: dict[str, str] = {}
     state_field_id = str(configured.get("state") or "").strip()
+    status_field_id = str(configured.get("status") or "").strip()
     stage_field_id = str(configured.get("stage") or "").strip()
     pr_workflow_field_id = str(configured.get("pr_workflow") or "").strip()
     if state_field_id:
         fields[state_field_id] = str(issue.get("state") or "")
+    if status_field_id:
+        issue_state = str(issue.get("state") or "").strip()
+        if issue_state == "completed":
+            fields[status_field_id] = "Done"
+        elif issue_state in {"claimed", "dispatching", "running", "verifying", "verified", "release_pending"}:
+            fields[status_field_id] = "In progress"
+        else:
+            fields[status_field_id] = "Todo"
     if stage_field_id:
         fields[stage_field_id] = str(issue.get("current_stage") or "")
     if pr_workflow_field_id:

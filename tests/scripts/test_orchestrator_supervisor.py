@@ -1110,6 +1110,7 @@ def test_sync_project_fields_projection_includes_pr_workflow_status(tmp_path: Pa
         runtime_context={
             "github_project_id": "PVT_project_1",
             "github_project_field_ids": {
+                "status": "PVTF_status",
                 "state": "PVTF_state",
                 "stage": "PVTF_stage",
                 "pr_workflow": "PVTF_pr_workflow",
@@ -1145,9 +1146,51 @@ def test_sync_project_fields_projection_includes_pr_workflow_status(tmp_path: Pa
         )
 
     assert error == ""
+    assert captured_fields["PVTF_status"] == "In progress"
     assert captured_fields["PVTF_state"] == "running"
     assert captured_fields["PVTF_stage"] == ""
     assert captured_fields["PVTF_pr_workflow"] == "verifier_passed"
+
+
+def test_sync_project_fields_projection_maps_active_states_to_status_in_progress(tmp_path: Path):
+    _ingest_issue_packet_text(tmp_path, "42", SAMPLE_ISSUE_PACKET)
+    orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:01:00+08:00",
+        runtime_context={
+            "github_project_id": "PVT_project_1",
+            "github_project_field_ids": {
+                "status": "PVTF_status",
+                "state": "PVTF_state",
+            },
+        },
+    )
+
+    def fake_sync_fields(*, fields: dict[str, str], **_kwargs: object) -> str:
+        assert fields["PVTF_status"] == "In progress"
+        return ""
+
+    with patch("scripts.orchestrator_supervisor._read_project_github_repo", return_value="example/repo"), patch(
+        "scripts.orchestrator_supervisor._lifecycle_helpers.sync_project_fields_projection",
+        side_effect=fake_sync_fields,
+    ):
+        for issue_state in ("running", "verifying", "release_pending"):
+            orchestrator_supervisor.upsert_issue_state(
+                tmp_path,
+                issue_number="42",
+                state=issue_state,
+                command_id=f"cmd-{issue_state}",
+                updated_at="2026-05-07T17:00:00+08:00",
+                current_session_id="ses-root-42",
+            )
+            error = orchestrator_supervisor._sync_project_fields_projection(
+                base_dir=tmp_path,
+                issue_number="42",
+                command_id=f"cmd-project-sync-{issue_state}",
+                updated_at="2026-05-07T17:03:00+08:00",
+            )
+            assert error == ""
 
 
 def test_inspect_project_pr_workflow_reflects_merged_release(tmp_path: Path):
