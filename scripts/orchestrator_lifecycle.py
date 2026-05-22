@@ -656,10 +656,17 @@ def sync_project_fields_projection(
     runtime_context = read_runtime_context(base_dir, issue_number) or {}
     option_map_payload = runtime_context.get("github_project_field_option_ids")
     option_map = option_map_payload if isinstance(option_map_payload, dict) else {}
+    configured_field_ids_payload = runtime_context.get("github_project_field_ids")
+    configured_field_ids = configured_field_ids_payload if isinstance(configured_field_ids_payload, dict) else {}
     state_options_payload = option_map.get("state")
     state_options = state_options_payload if isinstance(state_options_payload, dict) else {}
+    status_options_payload = option_map.get("status")
+    status_options = status_options_payload if isinstance(status_options_payload, dict) else {}
     pr_workflow_options_payload = option_map.get("pr_workflow")
     pr_workflow_options = pr_workflow_options_payload if isinstance(pr_workflow_options_payload, dict) else {}
+    state_field_id = str(configured_field_ids.get("state") or "").strip()
+    status_field_id = str(configured_field_ids.get("status") or "").strip()
+    pr_workflow_field_id = str(configured_field_ids.get("pr_workflow") or "").strip()
 
     for field_id, field_value in fields.items():
         field_id = str(field_id or "").strip()
@@ -668,9 +675,11 @@ def sync_project_fields_projection(
             continue
         option_id = ""
         if field_value:
-            if field_id == str((read_runtime_context(base_dir, issue_number) or {}).get("github_project_field_ids", {}).get("state", "")).strip():
+            if field_id == state_field_id:
                 option_id = str(state_options.get(field_value, "")).strip()
-            elif field_id == str((read_runtime_context(base_dir, issue_number) or {}).get("github_project_field_ids", {}).get("pr_workflow", "")).strip():
+            elif field_id == status_field_id:
+                option_id = str(status_options.get(field_value, "")).strip()
+            elif field_id == pr_workflow_field_id:
                 option_id = str(pr_workflow_options.get(field_value, "")).strip()
 
         if option_id:

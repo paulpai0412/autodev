@@ -5,7 +5,7 @@ from pathlib import Path
 from subprocess import CompletedProcess
 
 from scripts import orchestrator_lifecycle
-from scripts.control_plane_db import ensure_control_plane_db, ingest_issue_packet, read_github_sync_attempt
+from scripts.control_plane_db import ensure_control_plane_db, ingest_issue_packet, read_github_sync_attempt, sync_issue_runtime_context
 
 
 def _seed_github_backed_issue(tmp_path: Path, issue_number: str = "42") -> None:
@@ -164,3 +164,69 @@ def test_sync_project_fields_projection_skips_when_project_not_configured(tmp_pa
     assert attempt is not None
     assert attempt["status"] == "skipped"
     assert attempt["projection_target"] == "project_fields"
+
+
+def test_sync_project_fields_projection_uses_single_select_option_for_status(tmp_path: Path) -> None:
+    _seed_github_backed_issue(tmp_path)
+    sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-21T10:06:00+08:00",
+        runtime_context={
+            "github_project_id": "PVT_project_1",
+            "github_project_field_ids": {
+                "status": "field-id-status",
+                "state": "field-id-state",
+                "pr_workflow": "field-id-pr",
+            },
+            "github_project_field_option_ids": {
+                "status": {"In progress": "opt-in-progress"},
+                "state": {"running": "opt-running"},
+                "pr_workflow": {},
+            },
+        },
+    )
+
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], **_: object) -> CompletedProcess[str]:
+        calls.append(command)
+        if command[:3] == ["gh", "api", "graphql"] and any("query($owner:String!,$repo:String!,$number:Int!)" in part for part in command):
+            payload = {
+                "data": {
+                    "repository": {
+                        "issue": {
+                            "projectItems": {
+                                "nodes": [
+                                    {"id": "ITEM_1", "project": {"id": "PVT_project_1"}}
+                                ]
+                            }
+                        }
+                    }
+                }
+            }
+            return CompletedProcess(command, 0, stdout=json.dumps(payload), stderr="")
+        if command[:3] == ["gh", "api", "graphql"] and any("updateProjectV2ItemFieldValue" in part for part in command):
+            return CompletedProcess(command, 0, stdout="{}", stderr="")
+        return CompletedProcess(command, 1, stdout="", stderr="unexpected command")
+
+    error = orchestrator_lifecycle.sync_project_fields_projection(
+        base_dir=tmp_path,
+        issue_number="42",
+        repo="example/repo",
+        fields={"field-id-status": "In progress"},
+        now=lambda explicit: explicit or "2026-05-21T10:06:00+08:00",
+        run=fake_run,
+        command_id="cmd-project-fields-status",
+        updated_at="2026-05-21T10:06:00+08:00",
+    )
+
+    assert error == ""
+    mutation_calls = [
+        command for command in calls if command[:3] == ["gh", "api", "graphql"] and any("updateProjectV2ItemFieldValue" in part for part in command)
+    ]
+    assert len(mutation_calls) == 1
+    status_update_call = mutation_calls[0]
+    assert "-F" in status_update_call
+    assert "field=field-id-status" in status_update_call
+    assert "option=opt-in-progress" in status_update_call
