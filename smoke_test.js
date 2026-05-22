@@ -953,6 +953,51 @@ function runTests() {
     );
   });
 
+  test("AC1: user can configure daily target cards", () => {
+    const app = createControlTowerApp({ storage: createMemoryStorage() });
+
+    const configured = app.setDailyGoal(12);
+    const status = app.getDailyGoalStatus("2026-05-20");
+
+    assert.equal(configured.targetCards, 12);
+    assert.equal(status.targetCards, 12);
+    assert.equal(status.completedCards, 0);
+    assert.equal(status.goalMet, false);
+  });
+
+  test("AC1: daily progress updates toward today's target", () => {
+    const app = createControlTowerApp({ storage: createMemoryStorage() });
+
+    app.setDailyGoal(10);
+    app.addCompletedCards(4, { dateKey: "2026-05-20" });
+    app.addCompletedCards(3, { dateKey: "2026-05-20" });
+
+    const beforeGoal = app.getDailyGoalStatus("2026-05-20");
+    assert.equal(beforeGoal.completedCards, 7);
+    assert.equal(beforeGoal.remainingCards, 3);
+    assert.equal(beforeGoal.goalMet, false);
+
+    app.addCompletedCards(3, { dateKey: "2026-05-20" });
+    const afterGoal = app.getDailyGoalStatus("2026-05-20");
+    assert.equal(afterGoal.completedCards, 10);
+    assert.equal(afterGoal.remainingCards, 0);
+    assert.equal(afterGoal.goalMet, true);
+  });
+
+  test("AC1: streak increments only on days that meet target", () => {
+    const app = createControlTowerApp({ storage: createMemoryStorage() });
+
+    app.setDailyGoal(5);
+    app.addCompletedCards(5, { dateKey: "2026-05-18" });
+    app.addCompletedCards(2, { dateKey: "2026-05-19" });
+    app.addCompletedCards(5, { dateKey: "2026-05-20" });
+    app.addCompletedCards(5, { dateKey: "2026-05-21" });
+
+    const streak = app.getStreakStats("2026-05-21");
+    assert.equal(streak.currentStreak, 2);
+    assert.equal(streak.bestStreak, 2);
+  });
+
   let passed = 0;
   for (const { name, fn } of tests) {
     try {

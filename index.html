@@ -882,6 +882,26 @@
               <div class="metric" id="kpi-release"><span>Release queue</span><strong id="kpi-release-count">—</strong><small id="kpi-release-detail">等待合併</small></div>
               <div class="metric intervention" id="kpi-intervention"><span>需要介入 ⚑</span><strong id="kpi-blocked-count">—</strong><small id="kpi-intervention-detail">quarantined / failed</small></div>
             </div>
+            <div class="panel" style="margin-bottom:12px">
+              <div class="panel-head"><h3>Daily Goal · Streak</h3><span>cards/day tracking</span></div>
+              <div class="panel-body">
+                <div class="field-row" style="grid-template-columns: 1fr 120px auto; margin-top:0">
+                  <label for="daily-goal-input">每日目標</label>
+                  <input id="daily-goal-input" type="number" min="1" step="1" value="20" aria-label="Daily goal cards">
+                  <button class="btn" id="daily-goal-save" type="button">儲存目標</button>
+                </div>
+                <div class="field-row" style="grid-template-columns: 1fr 120px auto; margin-top:10px">
+                  <label for="daily-completed-input">今日新增完成</label>
+                  <input id="daily-completed-input" type="number" min="1" step="1" value="1" aria-label="Completed cards increment">
+                  <button class="btn primary" id="daily-completed-add" type="button">加入完成</button>
+                </div>
+                <div class="check-list" style="margin-top:12px">
+                  <div class="check-item"><div><strong>今日進度</strong><div class="project-meta" id="daily-goal-progress">0 / 0</div></div><span class="tag info" id="daily-goal-remaining">剩餘 0</span></div>
+                  <div class="check-item"><div><strong>連續達標</strong><div class="project-meta" id="daily-goal-streak">current 0 · best 0</div></div><span class="tag done" id="daily-goal-state">未達標</span></div>
+                </div>
+                <p class="mini-note" id="daily-goal-feedback"></p>
+              </div>
+            </div>
             <!-- Intervention-needed signals: quarantined/failed issues -->
             <div id="run-intervention-signals" style="margin-bottom:12px"></div>
             <!-- Active issue state list -->
@@ -1037,6 +1057,50 @@
         return JSON.parse(JSON.stringify(value));
       }
 
+      function toDateKey(value) {
+        if (typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value)) {
+          return value;
+        }
+        var date = value ? new Date(value) : new Date();
+        if (Number.isNaN(date.getTime())) {
+          throw new Error("Invalid date value for daily goal tracking.");
+        }
+        return date.toISOString().slice(0, 10);
+      }
+
+      function shiftDateKey(dateKey, deltaDays) {
+        var base = new Date(String(dateKey) + "T00:00:00Z");
+        if (Number.isNaN(base.getTime())) {
+          throw new Error("Invalid date key: " + String(dateKey));
+        }
+        base.setUTCDate(base.getUTCDate() + Number(deltaDays || 0));
+        return base.toISOString().slice(0, 10);
+      }
+
+      function normalizeDailyGoalState(raw) {
+        var source = raw && typeof raw === "object" ? raw : {};
+        var targetCards = parsePositiveInteger(source.targetCards, 20);
+        var completedByDate = {};
+
+        if (source.completedByDate && typeof source.completedByDate === "object") {
+          Object.keys(source.completedByDate).forEach(function (dateKey) {
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) {
+              return;
+            }
+            var completed = Number(source.completedByDate[dateKey]);
+            if (!Number.isFinite(completed) || completed <= 0) {
+              return;
+            }
+            completedByDate[dateKey] = Math.floor(completed);
+          });
+        }
+
+        return {
+          targetCards: targetCards,
+          completedByDate: completedByDate,
+        };
+      }
+
       function getRunPolicyPresetById(presetId) {
         var targetId = String(presetId || "").trim();
         var found = RUN_POLICY_PRESETS.find(function (preset) {
@@ -1172,6 +1236,7 @@
             flowRuns: [],
             flowRunEvents: [],
             flowEventSequence: 0,
+            dailyGoal: normalizeDailyGoalState(null),
           };
         }
 
@@ -1261,6 +1326,7 @@
             : [],
           flowRunEvents: Array.isArray(raw.flowRunEvents) ? raw.flowRunEvents : [],
           flowEventSequence: Number.isFinite(raw.flowEventSequence) ? Number(raw.flowEventSequence) : 0,
+          dailyGoal: normalizeDailyGoalState(raw.dailyGoal),
         };
       }
 
@@ -1507,6 +1573,7 @@
               flowRuns: [],
               flowRunEvents: [],
               flowEventSequence: 0,
+              dailyGoal: normalizeDailyGoalState(null),
             };
           }
 
@@ -1519,6 +1586,7 @@
               flowRuns: [],
               flowRunEvents: [],
               flowEventSequence: 0,
+              dailyGoal: normalizeDailyGoalState(null),
             };
           }
         }
@@ -2685,6 +2753,101 @@
           return lifecycleEvents.slice();
         }
 
+        function setDailyGoal(targetCards) {
+          var parsedTarget = parsePositiveInteger(targetCards, null);
+          if (!parsedTarget) {
+            throw new Error("Daily goal target must be a positive integer.");
+          }
+
+          var db = readDb();
+          db.dailyGoal = normalizeDailyGoalState(db.dailyGoal);
+          db.dailyGoal.targetCards = parsedTarget;
+          writeDb(db);
+
+          return {
+            targetCards: parsedTarget,
+          };
+        }
+
+        function addCompletedCards(count, options) {
+          var parsedCount = parsePositiveInteger(count, null);
+          if (!parsedCount) {
+            throw new Error("Completed cards increment must be a positive integer.");
+          }
+
+          var opts = options && typeof options === "object" ? options : {};
+          var dateKey = toDateKey(opts.dateKey);
+          var db = readDb();
+          db.dailyGoal = normalizeDailyGoalState(db.dailyGoal);
+
+          var previous = Number(db.dailyGoal.completedByDate[dateKey] || 0);
+          db.dailyGoal.completedByDate[dateKey] = previous + parsedCount;
+          writeDb(db);
+
+          return getDailyGoalStatus(dateKey);
+        }
+
+        function getDailyGoalStatus(dateKey) {
+          var targetDate = toDateKey(dateKey);
+          var db = readDb();
+          var state = normalizeDailyGoalState(db.dailyGoal);
+          var completedCards = Number(state.completedByDate[targetDate] || 0);
+          var remainingCards = Math.max(state.targetCards - completedCards, 0);
+
+          return {
+            dateKey: targetDate,
+            targetCards: state.targetCards,
+            completedCards: completedCards,
+            remainingCards: remainingCards,
+            goalMet: completedCards >= state.targetCards,
+          };
+        }
+
+        function getStreakStats(asOfDate) {
+          var targetDate = toDateKey(asOfDate);
+          var db = readDb();
+          var state = normalizeDailyGoalState(db.dailyGoal);
+          var completedByDate = state.completedByDate;
+          var metDates = Object.keys(completedByDate)
+            .filter(function (dateKey) {
+              return Number(completedByDate[dateKey] || 0) >= state.targetCards;
+            })
+            .sort();
+
+          var metSet = new Set(metDates);
+          var currentStreak = 0;
+          var cursor = targetDate;
+          while (metSet.has(cursor)) {
+            currentStreak += 1;
+            cursor = shiftDateKey(cursor, -1);
+          }
+
+          var bestStreak = 0;
+          var runLength = 0;
+          var previousDate = null;
+          metDates.forEach(function (dateKey) {
+            if (!previousDate) {
+              runLength = 1;
+            } else if (shiftDateKey(previousDate, 1) === dateKey) {
+              runLength += 1;
+            } else {
+              runLength = 1;
+            }
+
+            if (runLength > bestStreak) {
+              bestStreak = runLength;
+            }
+            previousDate = dateKey;
+          });
+
+          return {
+            asOfDate: targetDate,
+            targetCards: state.targetCards,
+            currentStreak: currentStreak,
+            bestStreak: bestStreak,
+          };
+        }
+
         return {
           APP_DB_KEY: APP_DB_KEY,
           readDb: readDb,
@@ -2726,6 +2889,10 @@
           getAllProjectsView: getAllProjectsView,
           triggerAllProjectsLifecycleAction: triggerAllProjectsLifecycleAction,
           getLifecycleEvents: getLifecycleEvents,
+          setDailyGoal: setDailyGoal,
+          addCompletedCards: addCompletedCards,
+          getDailyGoalStatus: getDailyGoalStatus,
+          getStreakStats: getStreakStats,
           setEnv: function (nextEnv) {
             env = nextEnv || {};
           },
@@ -3403,6 +3570,9 @@
     }
 
     (function initRunDashboardAndRecovery() {
+      var metricsApp = window.ControlTowerCore && window.ControlTowerCore.createControlTowerApp
+        ? window.ControlTowerCore.createControlTowerApp()
+        : null;
       var MOCK_ISSUES = [
         { number: 11, title: 'Run Dashboard v0', state: 'running', role: 'issue_worker', last_event: '2026-05-19T11:35:16', history: [
           { role: 'main_orchestrator', status: 'done', summary: 'Root session started, issue_worker dispatched.', ts: '2026-05-19T11:34:00' },
@@ -3431,6 +3601,43 @@
       ];
 
       var recoveryAuditLog = [];
+
+      function todayDateKey() {
+        return new Date().toISOString().slice(0, 10);
+      }
+
+      function renderDailyGoalPanel() {
+        if (!metricsApp) {
+          return;
+        }
+
+        var today = todayDateKey();
+        var status = metricsApp.getDailyGoalStatus(today);
+        var streak = metricsApp.getStreakStats(today);
+        var goalInput = document.getElementById('daily-goal-input');
+        var progress = document.getElementById('daily-goal-progress');
+        var remaining = document.getElementById('daily-goal-remaining');
+        var streakEl = document.getElementById('daily-goal-streak');
+        var state = document.getElementById('daily-goal-state');
+
+        if (goalInput) {
+          goalInput.value = String(status.targetCards);
+        }
+        if (progress) {
+          progress.textContent = status.completedCards + ' / ' + status.targetCards;
+        }
+        if (remaining) {
+          remaining.textContent = status.goalMet ? '已達標' : ('剩餘 ' + status.remainingCards);
+          remaining.className = 'tag ' + (status.goalMet ? 'done' : 'info');
+        }
+        if (streakEl) {
+          streakEl.textContent = 'current ' + streak.currentStreak + ' · best ' + streak.bestStreak;
+        }
+        if (state) {
+          state.textContent = status.goalMet ? '今日達標' : '未達標';
+          state.className = 'tag ' + (status.goalMet ? 'done' : 'blocked');
+        }
+      }
 
       function stateClass(state) {
         var map = { running: 'sb-running', verified: 'sb-verified', completed: 'sb-completed', quarantined: 'sb-quarantined', failed: 'sb-failed', ready: 'sb-ready' };
@@ -3557,7 +3764,52 @@
         });
       });
 
+      var saveGoalBtn = document.getElementById('daily-goal-save');
+      if (saveGoalBtn) {
+        saveGoalBtn.addEventListener('click', function () {
+          var input = document.getElementById('daily-goal-input');
+          var feedback = document.getElementById('daily-goal-feedback');
+          if (!metricsApp || !input) {
+            return;
+          }
+          try {
+            metricsApp.setDailyGoal(Number(input.value));
+            renderDailyGoalPanel();
+            if (feedback) {
+              feedback.textContent = '每日目標已更新。';
+            }
+          } catch (error) {
+            if (feedback) {
+              feedback.textContent = error.message;
+            }
+          }
+        });
+      }
+
+      var addCompletedBtn = document.getElementById('daily-completed-add');
+      if (addCompletedBtn) {
+        addCompletedBtn.addEventListener('click', function () {
+          var input = document.getElementById('daily-completed-input');
+          var feedback = document.getElementById('daily-goal-feedback');
+          if (!metricsApp || !input) {
+            return;
+          }
+          try {
+            metricsApp.addCompletedCards(Number(input.value), { dateKey: todayDateKey() });
+            renderDailyGoalPanel();
+            if (feedback) {
+              feedback.textContent = '今日完成卡片已更新。';
+            }
+          } catch (error) {
+            if (feedback) {
+              feedback.textContent = error.message;
+            }
+          }
+        });
+      }
+
       renderRunDashboard();
+      renderDailyGoalPanel();
       populateIssueSelects();
       renderRecoveryAuditTrail();
     })();
