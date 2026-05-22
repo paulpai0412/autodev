@@ -89,6 +89,73 @@ function runTests() {
     assert.equal(app.getSpecPipelineStatus(flowRun.flowRunId).currentStage, "issue-plan");
   });
 
+  test("AC3: vocabulary export includes words with progress data", () => {
+    const app = createControlTowerApp({
+      storage: createMemoryStorage(),
+    });
+
+    app.importVocabularyData({
+      words: [
+        {
+          id: "w-1",
+          term: "apple",
+          meaning: "蘋果",
+          progress: {
+            correctCount: 3,
+            incorrectCount: 1,
+            streak: 2,
+            lastReviewedAt: "2026-05-20T10:00:00.000Z",
+            nextReviewAt: "2026-05-23T10:00:00.000Z",
+          },
+        },
+      ],
+    });
+
+    const exported = app.exportVocabularyData();
+    assert.equal(exported.schema, "vocabulary-backup");
+    assert.equal(exported.version, 1);
+    assert.equal(Array.isArray(exported.words), true);
+    assert.equal(exported.words.length, 1);
+    assert.equal(exported.words[0].term, "apple");
+    assert.equal(exported.words[0].progress.correctCount, 3);
+    assert.equal(exported.words[0].progress.incorrectCount, 1);
+    assert.equal(exported.words[0].progress.streak, 2);
+  });
+
+  test("AC4: vocabulary import restores words and review progress", () => {
+    const app = createControlTowerApp({
+      storage: createMemoryStorage(),
+    });
+
+    const result = app.importVocabularyData({
+      schema: "vocabulary-backup",
+      version: 1,
+      words: [
+        {
+          id: "w-10",
+          term: "resilient",
+          meaning: "有韌性的",
+          progress: {
+            correctCount: 5,
+            incorrectCount: 0,
+            streak: 5,
+            lastReviewedAt: "2026-05-21T09:00:00.000Z",
+            nextReviewAt: "2026-05-25T09:00:00.000Z",
+          },
+        },
+      ],
+    });
+
+    assert.equal(result.importedWords, 1);
+
+    const exported = app.exportVocabularyData();
+    assert.equal(exported.words.length, 1);
+    assert.equal(exported.words[0].id, "w-10");
+    assert.equal(exported.words[0].meaning, "有韌性的");
+    assert.equal(exported.words[0].progress.lastReviewedAt, "2026-05-21T09:00:00.000Z");
+    assert.equal(exported.words[0].progress.nextReviewAt, "2026-05-25T09:00:00.000Z");
+  });
+
   test("AC3: approval queue lists release-blocked PRs with approval state in one view", () => {
     const app = createControlTowerApp({
       storage: createMemoryStorage(),
