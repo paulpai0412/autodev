@@ -1193,10 +1193,35 @@ def reconcile_issue_selection_or_recovery(
     return None
 
 
-def no_change_decision(ledger: JsonObject, *, current: dict[str, str], updated_at: str, bump_ledger_revision: Callable[[JsonObject, str], None]) -> ReconcileResult:
+def no_change_decision(
+    ledger: JsonObject,
+    *,
+    current: dict[str, str],
+    runtime_issue_state: str = "",
+    updated_at: str,
+    bump_ledger_revision: Callable[[JsonObject, str], None],
+) -> ReconcileResult:
     issue = cast(dict[str, str], ledger.get("issue", {}))
     issue_number = str(issue.get("number") or "")
     if not str(current.get("role") or "") and not str(current.get("stage") or ""):
+        if runtime_issue_state in {"dispatching", "running", "verifying", "release_pending"}:
+            summary = (
+                f"Issue #{issue_number or 'unknown'} is already active in the DB-backed control plane "
+                f"(state={runtime_issue_state}) but current role/stage is missing. Keep the current state "
+                "unchanged and recover from the persisted SQLite session facts."
+            )
+            del updated_at, bump_ledger_revision
+            return (
+                ledger,
+                {
+                    "action": "no_change",
+                    "next_role": "",
+                    "next_stage": "",
+                    "summary": summary,
+                    "request_title": "",
+                },
+                None,
+            )
         summary = (
             f"Issue #{issue_number or 'unknown'} has no queued role/stage in the DB-backed control plane. "
             "Run start-issue first to seed orchestrator_bootstrap, then reconcile again."

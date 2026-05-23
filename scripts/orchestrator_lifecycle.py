@@ -137,6 +137,35 @@ def clear_issue_session_ids(*, base_dir: Path, issue_number: str, updated_at: st
     )
 
 
+def clear_issue_runtime_phase_projection(*, base_dir: Path, issue_number: str, updated_at: str) -> None:
+    apply_issue_runtime_phase_projection_policy(
+        base_dir=base_dir,
+        issue_number=issue_number,
+        updated_at=updated_at,
+        policy="clear",
+    )
+
+
+def apply_issue_runtime_phase_projection_policy(
+    *,
+    base_dir: Path,
+    issue_number: str,
+    updated_at: str,
+    policy: str,
+) -> None:
+    if policy != "clear":
+        raise ValueError(f"unknown runtime phase projection policy {policy!r}")
+
+    _ = sync_issue_runtime_context(
+        base_dir,
+        issue_number=issue_number,
+        updated_at=updated_at,
+        current_role="",
+        current_stage="",
+        current_status="",
+    )
+
+
 def sync_issue_progress_label(
     *,
     base_dir: Path,
@@ -1148,6 +1177,7 @@ def release_issue_execution(
     if current_state == target_state:
         if target_state in {"failed", "completed"}:
             clear_issue_session_ids(base_dir=base_dir, issue_number=issue_number, updated_at=timestamp)
+            clear_issue_runtime_phase_projection(base_dir=base_dir, issue_number=issue_number, updated_at=timestamp)
         return
 
     if target_state == "ready" and current_state in {"claimed", "dispatching"}:
@@ -1176,6 +1206,7 @@ def release_issue_execution(
             reason=f"Release issue #{issue_number} back to ready-for-agent.",
             from_state=current_state,
         )
+        clear_issue_runtime_phase_projection(base_dir=base_dir, issue_number=issue_number, updated_at=timestamp)
         return
 
     if target_state == "verified" and current_state == "release_pending":
@@ -1189,6 +1220,7 @@ def release_issue_execution(
             from_state="release_pending",
             current_session_id="",
         )
+        clear_issue_runtime_phase_projection(base_dir=base_dir, issue_number=issue_number, updated_at=timestamp)
         return
 
     if target_state == "verified" and current_state in {"ready", "failed"}:
@@ -1200,6 +1232,7 @@ def release_issue_execution(
             updated_at=timestamp,
             current_session_id="",
         )
+        clear_issue_runtime_phase_projection(base_dir=base_dir, issue_number=issue_number, updated_at=timestamp)
         record_admin_decision(
             base_dir,
             command_id=f"{command_id}:admin-verified",
@@ -1235,10 +1268,11 @@ def release_issue_execution(
             updated_at=timestamp,
             reason=f"Release issue #{issue_number} into failed terminal state.",
             from_state="quarantined",
-            current_session_id="",
-        )
+                current_session_id="",
+            )
         else:
             clear_issue_session_ids(base_dir=base_dir, issue_number=issue_number, updated_at=timestamp)
+        clear_issue_runtime_phase_projection(base_dir=base_dir, issue_number=issue_number, updated_at=timestamp)
         return
 
     if target_state == "failed" and current_state in {"ready", "claimed", "dispatching"}:
@@ -1250,6 +1284,7 @@ def release_issue_execution(
             updated_at=timestamp,
             current_session_id="",
         )
+        clear_issue_runtime_phase_projection(base_dir=base_dir, issue_number=issue_number, updated_at=timestamp)
         record_admin_decision(
             base_dir,
             command_id=f"{command_id}:admin-failed",
@@ -1273,6 +1308,7 @@ def release_issue_execution(
             from_state=current_state,
             current_session_id="",
         )
+        clear_issue_runtime_phase_projection(base_dir=base_dir, issue_number=issue_number, updated_at=timestamp)
         return
 
     if target_state == "completed" and current_state in {"failed", "ready"}:
@@ -1284,6 +1320,7 @@ def release_issue_execution(
             updated_at=timestamp,
             current_session_id="",
         )
+        clear_issue_runtime_phase_projection(base_dir=base_dir, issue_number=issue_number, updated_at=timestamp)
         record_admin_decision(
             base_dir,
             command_id=f"{command_id}:admin-completed",

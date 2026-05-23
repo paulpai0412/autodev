@@ -590,6 +590,27 @@ NON_TERMINAL_RELEASE_FAILURE_KINDS = {
     "approval_blocked",
     "policy_blocked",
 }
+RUNTIME_PHASE_PROJECTION_CLEAR_STATES = {"completed", "failed"}
+RUNTIME_PHASE_PROJECTION_WHITELISTS: dict[str, set[tuple[str, str, str]]] = {
+    "ready": {
+        ("main_orchestrator", "orchestrator_bootstrap", "queued"),
+        ("main_orchestrator", "orchestrator_bootstrap", "running"),
+        ("main_orchestrator", "issue_selection_or_recovery", "queued"),
+        ("issue_worker", "issue_worker_execution", "queued"),
+        ("pr_verifier", "pr_verifier_execution", "queued"),
+    },
+    "verified": {("main_orchestrator", "issue_selection_or_recovery", "queued")},
+    "release_pending": {
+        ("main_orchestrator", "release_root_execution", "queued"),
+        ("main_orchestrator", "release_root_execution", "running"),
+    },
+    "dispatching": {("issue_worker", "issue_worker_execution", "queued")},
+    "running": {
+        ("main_orchestrator", "orchestrator_bootstrap", "running"),
+        ("issue_worker", "issue_worker_execution", "queued"),
+    },
+    "verifying": {("pr_verifier", "pr_verifier_execution", "queued")},
+}
 
 
 class SessionRequest(TypedDict):
@@ -1693,6 +1714,11 @@ def clear_issue_execution_claim_projection(*, base_dir: Path, issue_number: str,
     clear_claim(base_dir=base_dir, issue_number=issue_number, updated_at=updated_at)
 
 
+def clear_issue_runtime_phase_projection(*, base_dir: Path, issue_number: str, updated_at: str) -> None:
+    clear_phase = cast(Callable[..., None], _lifecycle_helpers.clear_issue_runtime_phase_projection)
+    clear_phase(base_dir=base_dir, issue_number=issue_number, updated_at=updated_at)
+
+
 def _sync_issue_progress_label(
     *,
     base_dir: Path,
@@ -2167,20 +2193,20 @@ def _sync_runtime_phase_metadata(
     queued_next_issue: dict[str, object] | None = None,
     updated_at: str,
 ) -> None:
-    runtime_context: dict[str, object] | None = None
-    if queued_next_issue:
-        runtime_context = {"queuedNextIssue": queued_next_issue}
-    else:
-        existing_runtime_context = read_runtime_context(base_dir, issue_number)
-        if isinstance(existing_runtime_context, dict) and "queuedNextIssue" in existing_runtime_context:
-            runtime_context = {"queuedNextIssue": None}
+    normalized_current, runtime_context = _normalize_runtime_phase_projection(
+        base_dir=base_dir,
+        issue_number=issue_number,
+        current=current,
+        queued_next_issue=queued_next_issue,
+    )
+
     _ = sync_issue_runtime_context(
         base_dir,
         issue_number=issue_number,
         updated_at=updated_at,
-        current_role=current.get("role", ""),
-        current_stage=current.get("stage", ""),
-        current_status=current.get("status", ""),
+        current_role=normalized_current.get("role", ""),
+        current_stage=normalized_current.get("stage", ""),
+        current_status=normalized_current.get("status", ""),
         attempts=attempts,
         limits=limits,
         last_failure=last_failure,
@@ -2189,6 +2215,39 @@ def _sync_runtime_phase_metadata(
         automation_flags=automation,
         artifact_refs=artifacts,
     )
+
+
+def _normalize_runtime_phase_projection(
+    *,
+    base_dir: Path,
+    issue_number: str,
+    current: dict[str, str],
+    queued_next_issue: dict[str, object] | None,
+) -> tuple[dict[str, str], dict[str, object] | None]:
+    normalized_current = dict(current)
+    runtime_issue = read_issue(base_dir, issue_number) or {}
+    runtime_state = str(runtime_issue.get("state") or "")
+    current_projection = (
+        normalized_current.get("role", ""),
+        normalized_current.get("stage", ""),
+        normalized_current.get("status", ""),
+    )
+
+    if runtime_state in RUNTIME_PHASE_PROJECTION_CLEAR_STATES:
+        normalized_current = {"role": "", "stage": "", "status": ""}
+    else:
+        allowed_projections = RUNTIME_PHASE_PROJECTION_WHITELISTS.get(runtime_state)
+        if allowed_projections is not None and current_projection not in allowed_projections:
+            normalized_current = {"role": "", "stage": "", "status": ""}
+
+    runtime_context: dict[str, object] | None = None
+    if queued_next_issue:
+        runtime_context = {"queuedNextIssue": queued_next_issue}
+    else:
+        existing_runtime_context = read_runtime_context(base_dir, issue_number)
+        if isinstance(existing_runtime_context, dict) and "queuedNextIssue" in existing_runtime_context:
+            runtime_context = {"queuedNextIssue": None}
+    return normalized_current, runtime_context
 
 
 def _json_dict(raw: object) -> dict[str, object]:
@@ -3670,6 +3729,7 @@ def retry_failed_issue_execution(
         updated_at=timestamp,
         current_session_id="",
     )
+    clear_issue_runtime_phase_projection(base_dir=base_dir, issue_number=issue_number, updated_at=timestamp)
     sync_error = _sync_projected_issue_labels(
         base_dir=base_dir,
         issue_number=issue_number,
@@ -3736,6 +3796,7 @@ def clear_ready_issue_session_fence(
         updated_at=timestamp,
         current_session_id="",
     )
+    clear_issue_runtime_phase_projection(base_dir=base_dir, issue_number=issue_number, updated_at=timestamp)
     sync_error = _sync_projected_issue_labels(
         base_dir=base_dir,
         issue_number=issue_number,
@@ -4381,6 +4442,7 @@ def reconcile_ledger(
             next_ledger, decision, request = no_change_decision(
                 ledger,
                 current=current,
+                runtime_issue_state=str(runtime_issue.get("state") or "") if runtime_issue is not None else "",
                 updated_at=timestamp,
                 bump_ledger_revision=_bump_ledger_revision,
             )

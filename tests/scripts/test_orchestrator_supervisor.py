@@ -925,6 +925,48 @@ def test_reconcile_keeps_queued_issue_worker_without_result_unchanged(tmp_path: 
     assert request is None
 
 
+@pytest.mark.parametrize("runtime_state", ["dispatching", "running"])
+def test_reconcile_active_runtime_issue_without_current_role_stage_does_not_request_start_issue(tmp_path: Path, runtime_state: str):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "", "stage": "", "status": ""}
+
+    orchestrator_supervisor.ensure_issue_row(tmp_path, issue_number="42", updated_at="2026-05-07T17:00:00+08:00")
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state=runtime_state,
+        command_id=f"cmd-{runtime_state}",
+        updated_at="2026-05-07T17:04:00+08:00",
+        current_session_id="ses-root-42",
+    )
+
+    connection = sqlite3.connect(tmp_path / ".opencode/runtime/control-plane.sqlite3")
+    try:
+        _ = connection.execute(
+            "UPDATE issues SET current_role = '', current_stage = '', current_status = '' WHERE issue_number = ?",
+            ("42",),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    updated_ledger, decision, request = reconcile_ledger(
+        ledger,
+        artifact_base_dir=tmp_path,
+        updated_at="2026-05-07T17:05:00+08:00",
+    )
+
+    current = cast(dict[str, object], updated_ledger["current"])
+
+    assert current == {"role": "", "stage": "", "status": ""}
+    assert decision["action"] == "no_change"
+    assert decision["request_title"] == ""
+    assert f"state={runtime_state}" in str(decision["summary"])
+    assert "start-issue" not in str(decision["summary"])
+    assert request is None
+
+
 def test_build_orchestrator_request_includes_nonce_generation_and_ledger_revision():
     issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
@@ -2480,6 +2522,230 @@ def test_sync_runtime_phase_metadata_clears_stale_queued_next_issue_projection(t
     assert "queuedNextIssue" not in cast(dict[str, object], without_queued_next_issue)
 
 
+def test_normalize_runtime_phase_projection_preserves_current_and_manages_queued_next_issue(tmp_path: Path) -> None:
+    current = {"role": "main_orchestrator", "stage": "issue_selection_or_recovery", "status": "queued"}
+
+    normalized_current, runtime_context = orchestrator_supervisor._normalize_runtime_phase_projection(
+        base_dir=tmp_path,
+        issue_number="42",
+        current=current,
+        queued_next_issue={"issue_number": "43", "branch": "agent/issue-43-demo", "base_branch": "main"},
+    )
+
+    assert normalized_current == current
+    assert cast(dict[str, object], runtime_context)["queuedNextIssue"] == {
+        "issue_number": "43",
+        "branch": "agent/issue-43-demo",
+        "base_branch": "main",
+    }
+
+    orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:00:00+08:00",
+        runtime_context={"queuedNextIssue": {"issue_number": "43", "branch": "agent/issue-43-demo", "base_branch": "main"}},
+    )
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="verified",
+        command_id="cmd-verified",
+        updated_at="2026-05-07T17:00:01+08:00",
+    )
+
+    normalized_current, runtime_context = orchestrator_supervisor._normalize_runtime_phase_projection(
+        base_dir=tmp_path,
+        issue_number="42",
+        current=current,
+        queued_next_issue=None,
+    )
+
+    assert normalized_current == current
+    assert runtime_context == {"queuedNextIssue": None}
+
+
+def test_normalize_runtime_phase_projection_clears_terminal_states(tmp_path: Path) -> None:
+    current = {"role": "main_orchestrator", "stage": "issue_selection_or_recovery", "status": "queued"}
+
+    for state in ("failed", "completed"):
+        orchestrator_supervisor.upsert_issue_state(
+            tmp_path,
+            issue_number="42",
+            state=state,
+            command_id=f"cmd-{state}",
+            updated_at="2026-05-07T17:00:00+08:00",
+        )
+
+        normalized_current, runtime_context = orchestrator_supervisor._normalize_runtime_phase_projection(
+            base_dir=tmp_path,
+            issue_number="42",
+            current=current,
+            queued_next_issue=None,
+        )
+
+        assert normalized_current == {"role": "", "stage": "", "status": ""}
+        assert runtime_context is None
+
+
+def test_normalize_runtime_phase_projection_preserves_ready_state_whitelist_and_clears_stale_ready_projection(tmp_path: Path) -> None:
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="ready",
+        command_id="cmd-ready",
+        updated_at="2026-05-07T17:00:00+08:00",
+    )
+
+    normalized_current, runtime_context = orchestrator_supervisor._normalize_runtime_phase_projection(
+        base_dir=tmp_path,
+        issue_number="42",
+        current={"role": "main_orchestrator", "stage": "orchestrator_bootstrap", "status": "queued"},
+        queued_next_issue=None,
+    )
+
+    assert normalized_current == {"role": "main_orchestrator", "stage": "orchestrator_bootstrap", "status": "queued"}
+    assert runtime_context is None
+
+    normalized_current, runtime_context = orchestrator_supervisor._normalize_runtime_phase_projection(
+        base_dir=tmp_path,
+        issue_number="42",
+        current={"role": "main_orchestrator", "stage": "release_root_execution", "status": "queued"},
+        queued_next_issue=None,
+    )
+
+    assert normalized_current == {"role": "", "stage": "", "status": ""}
+    assert runtime_context is None
+
+
+def test_normalize_runtime_phase_projection_clears_stale_verified_projection_but_keeps_release_waiting_handoff(tmp_path: Path) -> None:
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="verified",
+        command_id="cmd-verified",
+        updated_at="2026-05-07T17:00:00+08:00",
+    )
+
+    normalized_current, runtime_context = orchestrator_supervisor._normalize_runtime_phase_projection(
+        base_dir=tmp_path,
+        issue_number="42",
+        current={"role": "pr_verifier", "stage": "pr_verifier_execution", "status": "queued"},
+        queued_next_issue=None,
+    )
+
+    assert normalized_current == {"role": "", "stage": "", "status": ""}
+    assert runtime_context is None
+
+    normalized_current, runtime_context = orchestrator_supervisor._normalize_runtime_phase_projection(
+        base_dir=tmp_path,
+        issue_number="42",
+        current={"role": "main_orchestrator", "stage": "issue_selection_or_recovery", "status": "queued"},
+        queued_next_issue=None,
+    )
+
+    assert normalized_current == {"role": "main_orchestrator", "stage": "issue_selection_or_recovery", "status": "queued"}
+    assert runtime_context is None
+
+
+def test_normalize_runtime_phase_projection_clears_stale_release_pending_projection_but_keeps_release_root_active(tmp_path: Path) -> None:
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="release_pending",
+        command_id="cmd-release-pending",
+        updated_at="2026-05-07T17:00:00+08:00",
+    )
+
+    normalized_current, runtime_context = orchestrator_supervisor._normalize_runtime_phase_projection(
+        base_dir=tmp_path,
+        issue_number="42",
+        current={"role": "pr_verifier", "stage": "pr_verifier_execution", "status": "queued"},
+        queued_next_issue=None,
+    )
+
+    assert normalized_current == {"role": "", "stage": "", "status": ""}
+    assert runtime_context is None
+
+    normalized_current, runtime_context = orchestrator_supervisor._normalize_runtime_phase_projection(
+        base_dir=tmp_path,
+        issue_number="42",
+        current={"role": "main_orchestrator", "stage": "release_root_execution", "status": "queued"},
+        queued_next_issue=None,
+    )
+
+    assert normalized_current == {"role": "main_orchestrator", "stage": "release_root_execution", "status": "queued"}
+    assert runtime_context is None
+
+    normalized_current, runtime_context = orchestrator_supervisor._normalize_runtime_phase_projection(
+        base_dir=tmp_path,
+        issue_number="42",
+        current={"role": "main_orchestrator", "stage": "release_root_execution", "status": "running"},
+        queued_next_issue=None,
+    )
+
+    assert normalized_current == {"role": "main_orchestrator", "stage": "release_root_execution", "status": "running"}
+    assert runtime_context is None
+
+
+def test_normalize_runtime_phase_projection_enforces_active_state_whitelists(tmp_path: Path) -> None:
+    cases = [
+        (
+            "dispatching",
+            {"role": "issue_worker", "stage": "issue_worker_execution", "status": "queued"},
+            {"role": "issue_worker", "stage": "issue_worker_execution", "status": "queued"},
+        ),
+        (
+            "dispatching",
+            {"role": "main_orchestrator", "stage": "orchestrator_bootstrap", "status": "running"},
+            {"role": "", "stage": "", "status": ""},
+        ),
+        (
+            "running",
+            {"role": "main_orchestrator", "stage": "orchestrator_bootstrap", "status": "running"},
+            {"role": "main_orchestrator", "stage": "orchestrator_bootstrap", "status": "running"},
+        ),
+        (
+            "running",
+            {"role": "issue_worker", "stage": "issue_worker_execution", "status": "queued"},
+            {"role": "issue_worker", "stage": "issue_worker_execution", "status": "queued"},
+        ),
+        (
+            "running",
+            {"role": "pr_verifier", "stage": "pr_verifier_execution", "status": "queued"},
+            {"role": "", "stage": "", "status": ""},
+        ),
+        (
+            "verifying",
+            {"role": "pr_verifier", "stage": "pr_verifier_execution", "status": "queued"},
+            {"role": "pr_verifier", "stage": "pr_verifier_execution", "status": "queued"},
+        ),
+        (
+            "verifying",
+            {"role": "issue_worker", "stage": "issue_worker_execution", "status": "queued"},
+            {"role": "", "stage": "", "status": ""},
+        ),
+    ]
+
+    for state, current, expected in cases:
+        orchestrator_supervisor.upsert_issue_state(
+            tmp_path,
+            issue_number="42",
+            state=state,
+            command_id=f"cmd-{state}-{current['role'] or 'empty'}",
+            updated_at="2026-05-07T17:00:00+08:00",
+        )
+
+        normalized_current, runtime_context = orchestrator_supervisor._normalize_runtime_phase_projection(
+            base_dir=tmp_path,
+            issue_number="42",
+            current=current,
+            queued_next_issue=None,
+        )
+
+        assert normalized_current == expected
+        assert runtime_context is None
+
+
 def test_validate_session_request_allows_recovery_request_with_legacy_record_shaped_queued_next_issue(tmp_path: Path):
     issue_packets_dir = tmp_path / "docs/agents/issue-packets"
     issue_packets_dir.mkdir(parents=True, exist_ok=True)
@@ -3781,6 +4047,9 @@ def test_release_issue_execution_clears_session_ids_on_completed_terminal_state(
     assert issue is not None
     assert issue["state"] == "completed"
     assert issue["current_session_id"] == ""
+    assert issue["current_role"] == ""
+    assert issue["current_stage"] == ""
+    assert issue["current_status"] == ""
     artifact_refs = json.loads(str(issue["artifact_refs_json"]))
     assert "rootSessionID" not in artifact_refs
     assert "verifierSessionID" not in artifact_refs
@@ -3827,6 +4096,9 @@ def test_release_issue_execution_clears_session_ids_on_failed_terminal_state(tmp
     assert issue is not None
     assert issue["state"] == "failed"
     assert issue["current_session_id"] == ""
+    assert issue["current_role"] == ""
+    assert issue["current_stage"] == ""
+    assert issue["current_status"] == ""
     artifact_refs = json.loads(str(issue["artifact_refs_json"]))
     assert "rootSessionID" not in artifact_refs
     assert "verifierSessionID" not in artifact_refs
@@ -3873,6 +4145,9 @@ def test_release_issue_execution_returns_release_pending_to_verified_for_non_ter
     assert issue is not None
     assert issue["state"] == "verified"
     assert issue["current_session_id"] == ""
+    assert issue["current_role"] == ""
+    assert issue["current_stage"] == ""
+    assert issue["current_status"] == ""
     artifact_refs = json.loads(str(issue["artifact_refs_json"]))
     assert "rootSessionID" not in artifact_refs
     assert "verifierSessionID" not in artifact_refs
@@ -6218,6 +6493,9 @@ def test_retry_failed_issue_execution_restores_ready_when_failure_is_retryable(t
         tmp_path,
         issue_number="42",
         updated_at="2026-05-07T17:00:00+08:00",
+        current_role="main_orchestrator",
+        current_stage="issue_selection_or_recovery",
+        current_status="queued",
         last_failure={"kind": "approval_blocked", "retryable": True, "summary": "safe to retry"},
     )
 
@@ -6236,6 +6514,9 @@ def test_retry_failed_issue_execution_restores_ready_when_failure_is_retryable(t
     assert issue is not None
     assert issue["state"] == "ready"
     assert issue["current_session_id"] == ""
+    assert issue["current_role"] == ""
+    assert issue["current_stage"] == ""
+    assert issue["current_status"] == ""
     assert latest_decision is not None
     assert latest_decision["decision_type"] == "admin_retry_failed_issue"
     assert latest_decision["to_state"] == "ready"
@@ -6249,6 +6530,14 @@ def test_clear_ready_issue_session_fence_clears_stale_current_session_id(tmp_pat
         command_id="cmd-ready-fenced",
         updated_at="2026-05-07T17:00:00+08:00",
         current_session_id="ses-stale-root",
+    )
+    orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_role="main_orchestrator",
+        current_stage="orchestrator_bootstrap",
+        current_status="running",
     )
 
     with patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
@@ -6267,6 +6556,9 @@ def test_clear_ready_issue_session_fence_clears_stale_current_session_id(tmp_pat
     assert issue is not None
     assert issue["state"] == "ready"
     assert issue["current_session_id"] == ""
+    assert issue["current_role"] == ""
+    assert issue["current_stage"] == ""
+    assert issue["current_status"] == ""
     assert latest_decision is not None
     assert latest_decision["decision_type"] == "admin_clear_ready_session_fence"
     assert latest_decision["from_state"] == "ready"
@@ -7545,6 +7837,9 @@ def test_reconcile_release_human_approval_block_returns_issue_to_verified(tmp_pa
     assert issue is not None
     assert issue["state"] == "verified"
     assert issue["current_session_id"] == ""
+    assert issue["current_role"] == "main_orchestrator"
+    assert issue["current_stage"] == "issue_selection_or_recovery"
+    assert issue["current_status"] == "queued"
 
 
 def test_submit_artifact_release_result_normalizes_human_approval_block_reason(tmp_path: Path) -> None:
@@ -7997,6 +8292,9 @@ verifier_manual_qa:
     assert request is not None
     assert issue is not None
     assert issue["state"] == "verified"
+    assert issue["current_role"] == "main_orchestrator"
+    assert issue["current_stage"] == "issue_selection_or_recovery"
+    assert issue["current_status"] == "queued"
 
 
 def test_inspect_command_prints_control_plane_snapshot(tmp_path: Path, monkeypatch) -> None:
