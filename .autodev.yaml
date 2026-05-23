@@ -15,3 +15,53 @@ context:
 
 runtime:
   control_plane_db: .opencode/runtime/control-plane.sqlite3
+
+state_projection:
+  pr_workflow_to_sqlite_state:
+    merged: completed
+    release_blocked: quarantined
+    release_failed: failed
+    verifier_fail: failed
+    verifier_blocked: quarantined
+  sqlite_to_team_workflow:
+    ready: ready
+    claimed: in progress
+    dispatching: in progress
+    running: in progress
+    verifying: in progress
+    verified: in progress
+    release_pending: in review
+    failed: in review
+    quarantined: in review
+    completed: done
+  sqlite_to_primary_label:
+    ready: ready-for-agent
+    claimed: agent-dispatching
+    dispatching: agent-dispatching
+    running: agent-in-progress
+    verifying: agent-in-progress
+    verified: agent-in-progress
+    release_pending: agent-in-progress
+    failed: agent-in-review
+    quarantined: agent-in-review
+    completed: agent-completed
+  sqlite_to_pr_workflow:
+    ready: not_opened
+    claimed: not_opened
+    dispatching: not_opened
+    running: not_opened
+    verifying: opened
+    verified: verifier_passed
+    release_pending: verifier_passed
+    failed: verifier_fail
+    quarantined: verifier_blocked
+    completed: merged
+  pr_workflow_to_label:
+    not_opened: pr-not-opened
+    opened: pr-opened
+    verifier_passed: pr-verifier-passed
+    verifier_fail: pr-verifier-failed
+    verifier_blocked: pr-verifier-blocked
+    release_failed: pr-release-failed
+    release_blocked: pr-release-blocked
+    merged: pr-merged

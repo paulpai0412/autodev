@@ -100,6 +100,10 @@ def test_init_creates_project_contract_dirs_and_agents_managed_block(tmp_path: P
     assert 'schema_version: "1.0"' in config
     assert "github_repo: paulpai0412/autodev" in config
     assert "control_plane_db: .opencode/runtime/control-plane.sqlite3" in config
+    assert "state_projection:" in config
+    assert "sqlite_to_primary_label:" in config
+    assert "release_pending: agent-in-progress" in config
+    assert "pr_workflow_to_label:" in config
     assert (tmp_path / ".opencode/runtime/.gitkeep").exists()
     assert (tmp_path / ".opencode/runtime/control-plane.sqlite3").exists()
     gitignore = read(tmp_path / ".gitignore")

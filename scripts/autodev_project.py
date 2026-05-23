@@ -22,6 +22,11 @@ from scripts.control_plane_db import canonical_control_plane_base_dir, ensure_co
 from scripts.orchestrator_supervisor import show_latest_session
 from scripts.control_plane_db import list_issues
 from scripts.orchestrator_sessions import resolve_host_adapter
+from scripts.state_projection import (
+    PR_WORKFLOW_LABELS,
+    TEAM_WORKFLOW_STATES,
+    default_state_projection_config_lines,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,7 +45,16 @@ BOOTSTRAP_LABELS = [
     ("wontfix", "FFFFFF", "Will not be actioned"),
     ("agent-dispatching", "FBCA04", "Claimed by scheduler and dispatch in progress"),
     ("agent-in-progress", "5319E7", "Issue actively running in autodev"),
-    ("quarantined", "B60205", "Requires controlled recovery before it can continue"),
+    ("agent-in-review", "1D76DB", "Issue is in review or blocked release/quarantine handling"),
+    ("agent-completed", "0E8A16", "Issue completed by autodev"),
+    (PR_WORKFLOW_LABELS["not_opened"], "C2E0C6", "PR not opened yet"),
+    (PR_WORKFLOW_LABELS["opened"], "BFD4F2", "PR opened"),
+    (PR_WORKFLOW_LABELS["verifier_passed"], "0E8A16", "Verifier passed"),
+    (PR_WORKFLOW_LABELS["verifier_fail"], "B60205", "Verifier failed"),
+    (PR_WORKFLOW_LABELS["verifier_blocked"], "FBCA04", "Verifier blocked"),
+    (PR_WORKFLOW_LABELS["release_failed"], "B60205", "Release failed"),
+    (PR_WORKFLOW_LABELS["release_blocked"], "FBCA04", "Release blocked"),
+    (PR_WORKFLOW_LABELS["merged"], "0E8A16", "PR merged"),
 ]
 
 DOMAIN_DOCS = {
@@ -113,18 +127,7 @@ class GitHubProjectSetup:
     field_option_ids: dict[str, dict[str, str]]
 
 
-AUTODEV_ISSUE_STATES = [
-    "ready",
-    "claimed",
-    "dispatching",
-    "running",
-    "verifying",
-    "verified",
-    "release_pending",
-    "completed",
-    "failed",
-    "quarantined",
-]
+AUTODEV_ISSUE_STATES = TEAM_WORKFLOW_STATES
 
 AUTODEV_PR_WORKFLOW_STATES = [
     "not_opened",
@@ -831,28 +834,29 @@ def _bootstrap_project_repository(root: Path, *, github_repo: str, dry_run: bool
 
 def _config_text(root: Path, github_repo: str) -> str:
     project_name = root.name
-    return "\n".join(
-        [
-            'schema_version: "1.0"',
-            "",
-            "project:",
-            f"  name: {project_name}",
-            f"  root: {root}",
-            f"  github_repo: {github_repo}",
-            "",
-            "context:",
-            "  required_reads:",
-            "    - AGENTS.md",
-            "    - CONTEXT.md",
-            "    - docs/agents/domain.md",
-            "    - docs/agents/issue-tracker.md",
-            "    - docs/agents/triage-labels.md",
-            "",
-            "runtime:",
-            "  control_plane_db: .opencode/runtime/control-plane.sqlite3",
-            "",
-        ]
-    )
+    lines = [
+        'schema_version: "1.0"',
+        "",
+        "project:",
+        f"  name: {project_name}",
+        f"  root: {root}",
+        f"  github_repo: {github_repo}",
+        "",
+        "context:",
+        "  required_reads:",
+        "    - AGENTS.md",
+        "    - CONTEXT.md",
+        "    - docs/agents/domain.md",
+        "    - docs/agents/issue-tracker.md",
+        "    - docs/agents/triage-labels.md",
+        "",
+        "runtime:",
+        "  control_plane_db: .opencode/runtime/control-plane.sqlite3",
+        "",
+        *default_state_projection_config_lines(),
+        "",
+    ]
+    return "\n".join(lines)
 
 
 def _managed_agents_block() -> str:
