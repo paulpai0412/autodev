@@ -98,6 +98,25 @@ def fake_init_with_existing_project_link_run(args: list[str], **_kwargs: object)
         return completed(args, stdout="created")
     if args[:3] == ["gh", "label", "create"]:
         return completed(args)
+    if args[:4] == ["gh", "project", "field-list", "7"]:
+        return completed(
+            args,
+            stdout=json.dumps(
+                [
+                    {
+                        "id": "PVTF_state",
+                        "name": "Workflow State",
+                        "options": [{"id": "opt_ready", "name": "ready"}],
+                    },
+                    {"id": "PVTF_stage", "name": "Current Stage", "options": []},
+                    {
+                        "id": "PVTF_pr_workflow",
+                        "name": "PR Workflow",
+                        "options": [{"id": "opt_release_pending", "name": "release_pending"}],
+                    },
+                ]
+            ),
+        )
     if args[:4] == ["gh", "project", "link", "7"]:
         return completed(args)
     raise AssertionError(f"unexpected command: {args}")
@@ -222,6 +241,156 @@ def test_init_links_repo_to_existing_github_project_when_monitoring_exists(tmp_p
         "--repo",
         "paulpai0412/autodev",
     ] in commands
+    config = read(tmp_path / ".autodev.yaml")
+    assert 'github_project_id: "PVT_project_1"' in config
+    env_text = read(tmp_path / ".env")
+    assert "AUTODEV_GITHUB_PROJECT_ID=PVT_project_1" in env_text
+
+
+def test_init_resolves_existing_github_project_by_title_and_backfills_monitoring_block(tmp_path: Path):
+    write(
+        tmp_path / ".autodev.yaml",
+        "\n".join(
+            [
+                'schema_version: "1.0"',
+                "project:",
+                "  name: demo",
+                f"  root: {tmp_path}",
+                "  github_repo: paulpai0412/autodev",
+                "",
+                "# AUTODEV_GITHUB_MONITORING:BEGIN",
+                'github_project_owner: "paulpai0412"',
+                'github_project_title: "Autodev Control Plane"',
+                'github_project_id: "PVT_stale_project"',
+                "github_project_field_ids:",
+                '  state: ""',
+                '  stage: ""',
+                '  pr_workflow: ""',
+                "github_project_field_option_ids:",
+                "  state:",
+                "  pr_workflow:",
+                "# AUTODEV_GITHUB_MONITORING:END",
+                "",
+            ]
+        ),
+    )
+    write(tmp_path / "AGENTS.md", "# Project Agents\n")
+
+    def fake_run(args: list[str], **_kwargs: object) -> CompletedProcess[str]:
+        if args[:3] == ["git", "rev-parse", "--is-inside-work-tree"]:
+            return completed(args, returncode=128, stderr="not a git repository")
+        if args[:4] == ["git", "rev-parse", "--verify", "HEAD"]:
+            return completed(args, returncode=128, stderr="fatal: Needed a single revision")
+        if args[:4] == ["git", "remote", "get-url", "origin"]:
+            return completed(args, returncode=2, stderr="no such remote")
+        if args[:3] == ["gh", "repo", "view"]:
+            return completed(args, returncode=1, stderr="not found")
+        if args[:3] == ["git", "init", "-b"]:
+            return completed(args, stdout="initialized")
+        if args[:3] == ["git", "remote", "add"]:
+            return completed(args)
+        if args[:3] == ["gh", "repo", "create"]:
+            return completed(args, stdout="created")
+        if args[:3] == ["gh", "label", "create"]:
+            return completed(args)
+        if args[:4] == ["gh", "project", "list", "--owner"]:
+            return completed(
+                args,
+                stdout=json.dumps(
+                    [
+                        {
+                            "id": "PVT_project_1",
+                            "number": 7,
+                            "title": "Autodev Control Plane",
+                        }
+                    ]
+                ),
+            )
+        if args[:4] == ["gh", "project", "field-list", "7"]:
+            return completed(
+                args,
+                stdout=json.dumps(
+                    [
+                        {
+                            "id": "PVTF_state",
+                            "name": "Workflow State",
+                            "options": [{"id": "opt_ready", "name": "ready"}],
+                        },
+                        {"id": "PVTF_stage", "name": "Current Stage", "options": []},
+                        {
+                            "id": "PVTF_pr_workflow",
+                            "name": "PR Workflow",
+                            "options": [{"id": "opt_release_pending", "name": "release_pending"}],
+                        },
+                    ]
+                ),
+            )
+        if args[:4] == ["gh", "project", "link", "7"]:
+            return completed(args)
+        raise AssertionError(f"unexpected command: {args}")
+
+    with patch("scripts.autodev_project.subprocess.run", side_effect=fake_run):
+        exit_code = autodev_project.main(
+            [
+                "init",
+                "--project-root",
+                str(tmp_path),
+                "--github-repo",
+                "paulpai0412/autodev",
+            ]
+        )
+
+    assert exit_code == 0
+    config = read(tmp_path / ".autodev.yaml")
+    assert "github_project_number: 7" in config
+    assert 'github_project_id: "PVT_project_1"' in config
+    assert '  state: "PVTF_state"' in config
+    assert '  stage: "PVTF_stage"' in config
+    assert '  pr_workflow: "PVTF_pr_workflow"' in config
+    env_text = read(tmp_path / ".env")
+    assert "AUTODEV_GITHUB_PROJECT_ID=PVT_project_1" in env_text
+
+
+def test_extract_monitoring_prefers_managed_block_over_legacy_top_level_fields() -> None:
+    config_text = "\n".join(
+        [
+            'schema_version: "1.0"',
+            'github_project_id: "PVT_legacy"',
+            'github_project_field_ids:',
+            '  state: "PVTF_legacy_state"',
+            '  stage: "PVTF_legacy_stage"',
+            '',
+            '# AUTODEV_GITHUB_MONITORING:BEGIN',
+            'github_project_owner: "paulpai0412"',
+            'github_project_title: "vocab1 Project"',
+            'github_project_number: 10',
+            'github_project_id: "PVT_managed"',
+            'github_project_field_ids:',
+            '  state: "PVTF_managed_state"',
+            '  stage: "PVTF_managed_stage"',
+            '  pr_workflow: "PVTF_managed_pr"',
+            'github_project_field_option_ids:',
+            '  state:',
+            '    ready: "opt_ready"',
+            '  pr_workflow:',
+            '    opened: "opt_opened"',
+            '# AUTODEV_GITHUB_MONITORING:END',
+            '',
+        ]
+    )
+
+    project_id, field_ids, field_option_ids = autodev_project._extract_monitoring_from_config(config_text)
+
+    assert project_id == "PVT_managed"
+    assert field_ids == {
+        "state": "PVTF_managed_state",
+        "stage": "PVTF_managed_stage",
+        "pr_workflow": "PVTF_managed_pr",
+    }
+    assert field_option_ids == {
+        "state": {"ready": "opt_ready"},
+        "pr_workflow": {"opened": "opt_opened"},
+    }
 
 
 def test_init_dry_run_writes_nothing(tmp_path: Path):

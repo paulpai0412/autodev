@@ -127,6 +127,16 @@ class GitHubProjectSetup:
     field_option_ids: dict[str, dict[str, str]]
 
 
+@dataclass
+class ConfiguredGitHubMonitoring:
+    owner: str
+    title: str
+    number: int
+    project_id: str
+    field_ids: dict[str, str]
+    field_option_ids: dict[str, dict[str, str]]
+
+
 AUTODEV_ISSUE_STATES = TEAM_WORKFLOW_STATES
 
 AUTODEV_PR_WORKFLOW_STATES = [
@@ -214,9 +224,9 @@ def _ensure_env_file(
     env_path = root / ".env"
     existing = _load_dotenv(env_path)
     desired = dict(existing)
-    desired.setdefault("AUTODEV_GITHUB_REPO", github_repo)
+    desired["AUTODEV_GITHUB_REPO"] = github_repo
     if project_id:
-        desired.setdefault("AUTODEV_GITHUB_PROJECT_ID", project_id)
+        desired["AUTODEV_GITHUB_PROJECT_ID"] = project_id
     for key, value in DEFAULT_ENV_VARS.items():
         desired.setdefault(key, value)
 
@@ -398,6 +408,40 @@ def _find_project_by_id(*, owner: str, project_id: str) -> tuple[int, str] | Non
         number = int(project.get("number") or 0)
         if number > 0:
             return number, candidate_id
+    return None
+
+
+def _find_project_by_number(*, owner: str, project_number: int) -> tuple[int, str] | None:
+    if project_number <= 0:
+        return None
+
+    result = _run_command(
+        [
+            "gh",
+            "project",
+            "list",
+            "--owner",
+            owner,
+            "--limit",
+            "100",
+            "--format",
+            "json",
+        ],
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    parsed = _parse_optional_json(cast(str, result.stdout or ""))
+    projects = parsed if isinstance(parsed, list) else []
+    for project in projects:
+        if not isinstance(project, dict):
+            continue
+        candidate_number = int(project.get("number") or 0)
+        if candidate_number != project_number:
+            continue
+        candidate_id = str(project.get("id") or "").strip()
+        if candidate_id:
+            return candidate_number, candidate_id
     return None
 
 
@@ -632,18 +676,66 @@ def _extract_project_number_from_config(config_text: str) -> int:
 
 
 def _extract_monitoring_from_config(config_text: str) -> tuple[str, dict[str, str], dict[str, dict[str, str]]]:
+    monitoring = _extract_configured_monitoring(config_text)
+    return monitoring.project_id, monitoring.field_ids, monitoring.field_option_ids
+
+
+def _extract_configured_monitoring(config_text: str) -> ConfiguredGitHubMonitoring:
+    owner = ""
+    title = ""
+    number = 0
     project_id = ""
     field_ids: dict[str, str] = {}
     field_option_ids: dict[str, dict[str, str]] = {"state": {}, "pr_workflow": {}}
+    in_monitoring_block = False
+    in_field_ids_block = False
     in_option_block = False
     current_option_section = ""
     for raw_line in config_text.splitlines():
         line = raw_line.strip()
+        if line == GITHUB_MONITORING_BEGIN:
+            in_monitoring_block = True
+            in_field_ids_block = False
+            in_option_block = False
+            current_option_section = ""
+            continue
+        if line == GITHUB_MONITORING_END:
+            in_monitoring_block = False
+            in_field_ids_block = False
+            in_option_block = False
+            current_option_section = ""
+            continue
+        if not in_monitoring_block:
+            continue
+        if line.startswith("github_project_owner:"):
+            owner = line.split(":", 1)[1].strip().strip('"')
+        if line.startswith("github_project_title:"):
+            title = line.split(":", 1)[1].strip().strip('"')
+        if line.startswith("github_project_number:"):
+            number = _as_int(line.split(":", 1)[1].strip(), 0)
         if line.startswith("github_project_id:"):
             project_id = line.split(":", 1)[1].strip().strip('"')
 
+        if line == "github_project_field_ids:":
+            in_field_ids_block = True
+            in_option_block = False
+            current_option_section = ""
+            continue
+
+        if in_field_ids_block and not raw_line.startswith("  "):
+            in_field_ids_block = False
+
+        if in_field_ids_block and raw_line.startswith("  ") and ":" in line:
+            key, value = line.split(":", 1)
+            field_key = key.strip()
+            field_value = value.strip().strip('"')
+            if field_key in {"state", "stage", "pr_workflow"} and field_value:
+                field_ids[field_key] = field_value
+            continue
+
         if line == "github_project_field_option_ids:":
             in_option_block = True
+            in_field_ids_block = False
             current_option_section = ""
             continue
 
@@ -663,20 +755,14 @@ def _extract_monitoring_from_config(config_text: str) -> tuple[str, dict[str, st
         if in_option_block and not raw_line.startswith(" "):
             in_option_block = False
             current_option_section = ""
-
-        if line.startswith("state:") and "github_project_field_ids" in config_text and raw_line.startswith("  "):
-            value = line.split(":", 1)[1].strip().strip('"')
-            if value:
-                field_ids.setdefault("state", value)
-        if line.startswith("stage:") and "github_project_field_ids" in config_text and raw_line.startswith("  "):
-            value = line.split(":", 1)[1].strip().strip('"')
-            if value:
-                field_ids.setdefault("stage", value)
-        if line.startswith("pr_workflow:") and "github_project_field_ids" in config_text and raw_line.startswith("  "):
-            value = line.split(":", 1)[1].strip().strip('"')
-            if value:
-                field_ids.setdefault("pr_workflow", value)
-    return project_id, field_ids, field_option_ids
+    return ConfiguredGitHubMonitoring(
+        owner=owner,
+        title=title,
+        number=number,
+        project_id=project_id,
+        field_ids=field_ids,
+        field_option_ids=field_option_ids,
+    )
 
 
 def _ensure_issue_runtime_project_binding(
@@ -1082,26 +1168,103 @@ def init_project(
                 report.findings.append(f"failed to set up GitHub project monitoring: {error}")
     else:
         config_for_link = _read_text(config_path) if config_path.exists() else expected_config
-        configured_project_number = _extract_project_number_from_config(config_for_link)
-        configured_project_id, _field_ids_unused, _field_option_ids_unused = _extract_monitoring_from_config(config_for_link)
+        configured_monitoring = _extract_configured_monitoring(config_for_link)
+        configured_project_number = configured_monitoring.number or _extract_project_number_from_config(config_for_link)
+        configured_project_id = configured_monitoring.project_id
+        configured_project_owner = configured_monitoring.owner or project_owner
+        configured_project_title = configured_monitoring.title
 
-        if configured_project_number > 0 or configured_project_id:
+        has_configured_monitoring = bool(configured_project_number > 0 or configured_project_id or configured_project_title)
+        if has_configured_monitoring:
             report.actions.append("ensure repository is linked to configured GitHub Project")
 
-        if not dry_run and not check:
+        if has_configured_monitoring and not dry_run and not check:
             try:
                 project_number_to_link = configured_project_number
+                project_id_to_sync = configured_project_id
+
                 if project_number_to_link <= 0 and configured_project_id:
-                    found_by_id = _find_project_by_id(owner=project_owner, project_id=configured_project_id)
+                    found_by_id = _find_project_by_id(owner=configured_project_owner, project_id=configured_project_id)
                     if found_by_id is not None:
-                        project_number_to_link, _project_id_unused = found_by_id
+                        project_number_to_link, project_id_to_sync = found_by_id
+
+                if project_number_to_link > 0 and not project_id_to_sync:
+                    found_by_number = _find_project_by_number(owner=configured_project_owner, project_number=project_number_to_link)
+                    if found_by_number is not None:
+                        project_number_to_link, project_id_to_sync = found_by_number
+
+                if project_number_to_link <= 0 and configured_project_title:
+                    found_by_title = _find_project_by_title(owner=configured_project_owner, title=configured_project_title)
+                    if found_by_title is not None:
+                        project_number_to_link, project_id_to_sync = found_by_title
 
                 if project_number_to_link > 0:
                     _ensure_project_linked(
-                        owner=project_owner,
+                        owner=configured_project_owner,
                         project_number=project_number_to_link,
                         github_repo=github_repo,
                     )
+
+                    if project_id_to_sync:
+                        field_ids = {
+                            "state": _ensure_project_field(
+                                owner=configured_project_owner,
+                                project_number=project_number_to_link,
+                                field_name="Workflow State",
+                                data_type="SINGLE_SELECT",
+                                single_select_options=AUTODEV_ISSUE_STATES,
+                            ),
+                            "stage": _ensure_project_field(
+                                owner=configured_project_owner,
+                                project_number=project_number_to_link,
+                                field_name="Current Stage",
+                                data_type="TEXT",
+                            ),
+                            "pr_workflow": _ensure_project_field(
+                                owner=configured_project_owner,
+                                project_number=project_number_to_link,
+                                field_name="PR Workflow",
+                                data_type="SINGLE_SELECT",
+                                single_select_options=AUTODEV_PR_WORKFLOW_STATES,
+                            ),
+                        }
+                        field_option_ids = {
+                            "state": _option_id_map_for_states(
+                                owner=configured_project_owner,
+                                project_number=project_number_to_link,
+                                field_name="Workflow State",
+                                states=AUTODEV_ISSUE_STATES,
+                            ),
+                            "pr_workflow": _option_id_map_for_states(
+                                owner=configured_project_owner,
+                                project_number=project_number_to_link,
+                                field_name="PR Workflow",
+                                states=AUTODEV_PR_WORKFLOW_STATES,
+                            ),
+                        }
+                        setup = GitHubProjectSetup(
+                            owner=configured_project_owner,
+                            title=configured_project_title,
+                            number=project_number_to_link,
+                            project_id=project_id_to_sync,
+                            field_ids=field_ids,
+                            field_option_ids=field_option_ids,
+                        )
+                        config_after = _replace_monitoring_block(config_for_link, setup=setup)
+                        if config_after != config_for_link:
+                            report.actions.append("update .autodev.yaml github monitoring block")
+                            _write_text(config_path, config_after)
+                            config_for_link = config_after
+
+                        _ensure_issue_runtime_project_binding(
+                            root=root,
+                            project_id=project_id_to_sync,
+                            field_ids=field_ids,
+                            field_option_ids=field_option_ids,
+                            dry_run=dry_run,
+                            check=check,
+                            report=report,
+                        )
             except Exception as error:
                 report.findings.append(f"failed to link repository to configured GitHub project: {error}")
 
