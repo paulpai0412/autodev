@@ -441,6 +441,7 @@ class OpenCodeHostAdapter(HostAdapter):
             "release": "autodev-release.md",
             "inspect": "autodev-show-session.md",
             "doctor": "autodev-doctor.md",
+            "full_cycle": "autodev-full-cycle.md",
         }
 
     def capabilities(self) -> dict[str, object]:

@@ -41,6 +41,7 @@ def command_templates(*, root: Path, entrypoints: dict[str, str]) -> dict[str, s
     release_filename = entrypoints.get("release", "autodev-release.md")
     inspect_filename = entrypoints.get("inspect", "autodev-show-session.md")
     doctor_filename = entrypoints.get("doctor", "autodev-doctor.md")
+    full_cycle_filename = entrypoints.get("full_cycle", "autodev-full-cycle.md")
     return {
         start_filename: f"""---
 description: Start autodev workflow for the current project and issue number
@@ -114,5 +115,22 @@ Run:
 Report any missing config, runtime state, or command install problems.
 
 Set `AUTODEV_HOME` first if the shared workflow repo is not installed at `~/apps/autodev`.
+""",
+        full_cycle_filename: f"""---
+description: Run autodev full-cycle loop for current project
+agent: build
+subtask: false
+---
+
+Run the shared full-cycle loop script against the current consumer project.
+
+Run:
+!`AUTODEV_HOME="{autodev_home}" PROJECT_ROOT="$PWD" REPO="${{AUTODEV_GITHUB_REPO:-}}" bash "$AUTODEV_HOME/autodev_full_cycle.sh"`
+
+Report the final cycle status and the latest control-plane summary.
+
+Notes:
+- This command does **not** copy the script into the consumer repo; it always runs the shared script from `AUTODEV_HOME`.
+- If `AUTODEV_GITHUB_REPO` is unset, export it first (example: `owner/repo`).
 """,
     }

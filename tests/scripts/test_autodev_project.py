@@ -175,6 +175,7 @@ def test_install_commands_writes_autodev_prefixed_global_commands(tmp_path: Path
     assert (commands_dir / entrypoints["release"]).exists()
     assert (commands_dir / entrypoints["inspect"]).exists()
     assert (commands_dir / entrypoints["doctor"]).exists()
+    assert (commands_dir / entrypoints["full_cycle"]).exists()
 
 
 def test_install_commands_uses_fake_host_adapter_entrypoints(tmp_path: Path):
@@ -188,6 +189,7 @@ def test_install_commands_uses_fake_host_adapter_entrypoints(tmp_path: Path):
                 "release": "fake-release.md",
                 "inspect": "fake-inspect.md",
                 "doctor": "fake-doctor.md",
+                "full_cycle": "fake-full-cycle.md",
             }
 
         def capabilities(self) -> dict[str, object]:
@@ -202,6 +204,7 @@ def test_install_commands_uses_fake_host_adapter_entrypoints(tmp_path: Path):
     assert (commands_dir / "fake-release.md").exists()
     assert (commands_dir / "fake-inspect.md").exists()
     assert (commands_dir / "fake-doctor.md").exists()
+    assert (commands_dir / "fake-full-cycle.md").exists()
 
 
 def test_install_commands_defaults_to_host_adapter_commands_dir(tmp_path: Path):
@@ -215,6 +218,7 @@ def test_install_commands_defaults_to_host_adapter_commands_dir(tmp_path: Path):
                 "release": "fake-release.md",
                 "inspect": "fake-inspect.md",
                 "doctor": "fake-doctor.md",
+                "full_cycle": "fake-full-cycle.md",
             }
 
         def capabilities(self) -> dict[str, object]:
@@ -229,6 +233,7 @@ def test_install_commands_defaults_to_host_adapter_commands_dir(tmp_path: Path):
     assert (commands_dir / "fake-release.md").exists()
     assert (commands_dir / "fake-inspect.md").exists()
     assert (commands_dir / "fake-doctor.md").exists()
+    assert (commands_dir / "fake-full-cycle.md").exists()
 
 
 def test_repo_local_commands_use_autodev_project_wrappers():
@@ -236,12 +241,14 @@ def test_repo_local_commands_use_autodev_project_wrappers():
     reconcile_command = read(autodev_project.ROOT / ".opencode/commands/autodev-reconcile.md")
     release_command = read(autodev_project.ROOT / ".opencode/commands/autodev-release.md")
     show_command = read(autodev_project.ROOT / ".opencode/commands/autodev-show-session.md")
+    full_cycle_command = read(autodev_project.ROOT / ".opencode/commands/autodev-full-cycle.md")
 
     assert f'AUTODEV_HOME="${{AUTODEV_HOME:-{autodev_project.ROOT}}}"' in start_command
     assert 'PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" start --project-root "$PWD" --issue-number "$1"' in start_command
     assert 'PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" reconcile --project-root "$PWD"' in reconcile_command
     assert 'PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" release --project-root "$PWD" --issue-number "$1" --auto-approve' in release_command
     assert 'PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" show-session --project-root "$PWD"' in show_command
+    assert 'bash "$AUTODEV_HOME/autodev_full_cycle.sh"' in full_cycle_command
 
 
 def test_doctor_reports_missing_control_plane_db(tmp_path: Path, capsys: CaptureFixture[str]):
