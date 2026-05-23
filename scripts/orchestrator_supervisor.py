@@ -173,11 +173,21 @@ def _ensure_issue_worktree(
     updated_at: str,
 ) -> Path:
     del updated_at
+    normalized_branch = branch.strip()
+    normalized_base_branch = (base_branch or "").strip() or "main"
+    if not normalized_branch:
+        raise RuntimeError(f"issue #{issue_number} target branch is empty; refusing to prepare issue worktree")
+    if normalized_branch == normalized_base_branch:
+        raise RuntimeError(
+            f"issue #{issue_number} target branch {normalized_branch!r} must differ from base branch {normalized_base_branch!r} "
+            "to avoid worktree checkout conflicts"
+        )
+
     if not _is_git_repo(base_dir):
         return base_dir
 
     branch_worktrees = _list_branch_worktrees(base_dir)
-    existing = branch_worktrees.get(branch)
+    existing = branch_worktrees.get(normalized_branch)
     if existing is not None:
         return existing
 
@@ -188,10 +198,10 @@ def _ensure_issue_worktree(
             f"issue #{issue_number} worktree path {worktree_path} already exists but is not registered; clean it before retry"
         )
 
-    if _branch_exists_locally(base_dir, branch):
-        add_command = ["git", "worktree", "add", str(worktree_path), branch]
+    if _branch_exists_locally(base_dir, normalized_branch):
+        add_command = ["git", "worktree", "add", str(worktree_path), normalized_branch]
     else:
-        add_command = ["git", "worktree", "add", "-b", branch, str(worktree_path), base_branch or "main"]
+        add_command = ["git", "worktree", "add", "-b", normalized_branch, str(worktree_path), normalized_base_branch]
     completed = _run_git_command(base_dir, add_command)
     if completed.returncode != 0:
         error = (completed.stderr or completed.stdout).strip() or "git worktree add failed"
@@ -1057,13 +1067,53 @@ def start_issue(
     resolved_base_branch = _resolve_issue_base_branch(base_dir, packet)
     if not resolved_base_branch:
         raise RuntimeError(f"issue #{issue_number} has unresolved stacked dependencies; refusing start until exactly one parent PR is stackable or all dependencies are completed")
-    issue_worktree = _ensure_issue_worktree(
-        base_dir=base_dir,
-        issue_number=issue_number,
-        branch=packet.branch,
-        base_branch=resolved_base_branch,
-        updated_at=timestamp,
-    )
+    try:
+        issue_worktree = _ensure_issue_worktree(
+            base_dir=base_dir,
+            issue_number=issue_number,
+            branch=packet.branch,
+            base_branch=resolved_base_branch,
+            updated_at=timestamp,
+        )
+    except RuntimeError as error:
+        rollback_command_id = f"start-issue:{issue_number}:worktree-rollback"
+        _ = upsert_issue_state(
+            base_dir,
+            issue_number=issue_number,
+            state="ready",
+            command_id=rollback_command_id,
+            updated_at=timestamp,
+            current_session_id="",
+        )
+        _ = sync_issue_runtime_context(
+            base_dir,
+            issue_number=issue_number,
+            updated_at=timestamp,
+            last_failure={
+                "kind": "worktree_prepare_failed",
+                "retryable": True,
+                "summary": str(error),
+                "rollback_reason": f"worktree_prepare_error:{str(error)}",
+            },
+        )
+        _ = append_issue_history(
+            base_dir,
+            issue_number=issue_number,
+            entry_type="admin_action",
+            created_at=timestamp,
+            status="rollback",
+            command_id=rollback_command_id,
+            from_state="claimed",
+            to_state="ready",
+            summary=f"Rollback issue #{issue_number} to ready after worktree prepare failure.",
+            payload={
+                "decision_type": "admin_worktree_prepare_failure",
+                "rollback_reason": f"worktree_prepare_error:{str(error)}",
+                "restored_ready_for_agent": True,
+            },
+            unique_key=f"admin-worktree-rollback:{issue_number}:{timestamp}",
+        )
+        raise RuntimeError(str(error)) from error
     _ = sync_issue_runtime_context(
         base_dir,
         issue_number=issue_number,

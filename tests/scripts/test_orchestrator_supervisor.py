@@ -6263,6 +6263,73 @@ def test_start_issue_blocks_rollback_when_latest_dispatch_result_has_active_root
             raise AssertionError("expected rollback guard to block")
 
 
+def test_start_issue_rejects_target_branch_equal_to_base_branch_and_rolls_back_ready(tmp_path: Path):
+    same_branch_packet = SAMPLE_ISSUE_PACKET.replace('agent/issue-42-demo', 'main')
+    issue_packet = parse_issue_packet_text(same_branch_packet, "docs/agents/issue-packets/issue-42.yaml")
+    orchestrator_supervisor._sync_issue_packet_to_db(tmp_path, issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+
+    try:
+        orchestrator_supervisor.start_issue(
+            base_dir=tmp_path,
+            issue_number="42",
+            source_session_id="workspace_reconcile",
+            updated_at="2026-05-07T17:10:00+08:00",
+        )
+    except RuntimeError as error:
+        assert "must differ from base branch" in str(error)
+    else:
+        raise AssertionError("expected branch/base-branch guardrail to reject start")
+
+    issue = read_issue(tmp_path, "42")
+    rollback = read_latest_issue_history(tmp_path, "42", entry_type="admin_action")
+    assert issue is not None
+    assert issue["state"] == "ready"
+    assert issue["last_command_id"] == "start-issue:42:worktree-rollback"
+    assert issue["current_session_id"] == ""
+    assert rollback is not None
+    payload = json.loads(str(rollback["payload_json"] or "{}"))
+    assert payload["decision_type"] == "admin_worktree_prepare_failure"
+    assert payload["restored_ready_for_agent"] is True
+    assert str(payload["rollback_reason"]).startswith("worktree_prepare_error:")
+
+
+def test_start_issue_rolls_back_ready_when_worktree_prepare_fails(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    orchestrator_supervisor._sync_issue_packet_to_db(tmp_path, issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+
+    with patch(
+        "scripts.orchestrator_supervisor._ensure_issue_worktree",
+        side_effect=RuntimeError("failed to prepare worktree for issue #42: simulated git failure"),
+    ):
+        try:
+            orchestrator_supervisor.start_issue(
+                base_dir=tmp_path,
+                issue_number="42",
+                source_session_id="workspace_reconcile",
+                updated_at="2026-05-07T17:10:00+08:00",
+            )
+        except RuntimeError as error:
+            assert "simulated git failure" in str(error)
+        else:
+            raise AssertionError("expected start_issue to fail when worktree preparation fails")
+
+    issue = read_issue(tmp_path, "42")
+    rollback = read_latest_issue_history(tmp_path, "42", entry_type="admin_action")
+    assert issue is not None
+    assert issue["state"] == "ready"
+    assert issue["last_command_id"] == "start-issue:42:worktree-rollback"
+    assert issue["current_session_id"] == ""
+    last_failure = json.loads(str(issue.get("last_failure_json") or "{}"))
+    assert last_failure["kind"] == "worktree_prepare_failed"
+    assert last_failure["retryable"] is True
+    assert "simulated git failure" in str(last_failure["summary"])
+    assert rollback is not None
+    payload = json.loads(str(rollback["payload_json"] or "{}"))
+    assert payload["decision_type"] == "admin_worktree_prepare_failure"
+    assert payload["restored_ready_for_agent"] is True
+    assert str(payload["rollback_reason"]).startswith("worktree_prepare_error:")
+
+
 def test_reconcile_issue_worker_without_root_session_evidence_keeps_dispatching_state(tmp_path: Path):
     issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
