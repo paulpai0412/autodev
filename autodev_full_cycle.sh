@@ -7,9 +7,9 @@ set -u
 # Runs until no open GitHub issues remain (or max cycles reached).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="${PROJECT_ROOT:-$SCRIPT_DIR}"
 AUTODEV_HOME="${AUTODEV_HOME:-$SCRIPT_DIR}"
-REPO="${REPO:-paulpai0412/vocab}"
+PROJECT_ROOT="${PROJECT_ROOT:-}"
+REPO="${REPO:-}"
 INTERVAL_SECONDS="${INTERVAL_SECONDS:-180}"
 MAX_CYCLES="${MAX_CYCLES:-0}" # 0 = infinite
 AUTO_APPROVE_RELEASE="${AUTO_APPROVE_RELEASE:-1}"
@@ -24,12 +24,167 @@ export GIT_PAGER="${GIT_PAGER:-cat}"
 AUTODEV_PROJECT_PY="$AUTODEV_HOME/scripts/autodev_project.py"
 INTAKE_PY="$AUTODEV_HOME/scripts/issue_packet_intake.py"
 SUPERVISOR_PY="$AUTODEV_HOME/scripts/orchestrator_supervisor.py"
-DB_PATH="$PROJECT_ROOT/.opencode/runtime/control-plane.sqlite3"
-STATE_DIR="$PROJECT_ROOT/.opencode/runtime/full-cycle-state"
+DB_PATH=""
+STATE_DIR=""
 
 RESUME_MAX_ATTEMPTS="${RESUME_MAX_ATTEMPTS:-2}"
 REDISPATCH_MAX_ATTEMPTS="${REDISPATCH_MAX_ATTEMPTS:-2}"
 AUTO_FAIL_QUARANTINED="${AUTO_FAIL_QUARANTINED:-1}"
+
+resolve_consumer_project_root() {
+  local start
+  if [ -n "${PROJECT_ROOT:-}" ]; then
+    start="$PROJECT_ROOT"
+  else
+    start="$PWD"
+  fi
+
+  if [ ! -d "$start" ]; then
+    log "ERROR: project root candidate does not exist: $start"
+    exit 1
+  fi
+
+  local current
+  current="$(cd "$start" && pwd)"
+
+  while true; do
+    if [ -f "$current/.autodev.yaml" ]; then
+      printf '%s' "$current"
+      return 0
+    fi
+    if [ "$current" = "/" ]; then
+      break
+    fi
+    current="$(dirname "$current")"
+  done
+
+  printf '%s' "$(cd "$start" && pwd)"
+  return 0
+}
+
+read_repo_from_env_file() {
+  local root="$1"
+  local env_file="$root/.env"
+  if [ ! -f "$env_file" ]; then
+    printf ''
+    return 0
+  fi
+
+  local value
+  value=$(grep -E '^AUTODEV_GITHUB_REPO=' "$env_file" 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d '"' | tr -d "'" | xargs)
+  printf '%s' "$value"
+}
+
+read_repo_from_autodev_yaml() {
+  local root="$1"
+  local config="$root/.autodev.yaml"
+  if [ ! -f "$config" ]; then
+    printf ''
+    return 0
+  fi
+
+  local value
+  value=$(python3 - "$config" <<'PY'
+import re
+import sys
+
+path = sys.argv[1]
+try:
+    text = open(path, "r", encoding="utf-8").read().splitlines()
+except OSError:
+    print("")
+    raise SystemExit(0)
+
+in_project = False
+for raw in text:
+    line = raw.rstrip("\n")
+    stripped = line.strip()
+    if not stripped:
+        continue
+    indent = len(line) - len(line.lstrip(" "))
+    if indent == 0 and stripped == "project:":
+        in_project = True
+        continue
+    if in_project and indent == 0:
+        break
+    if in_project and indent >= 2 and stripped.startswith("github_repo:"):
+        value = stripped.split(":", 1)[1].strip().strip('"').strip("'")
+        print(value)
+        raise SystemExit(0)
+
+print("")
+PY
+)
+  printf '%s' "$value"
+}
+
+read_repo_from_git_remote() {
+  local root="$1"
+  local remote
+  remote=$(git -C "$root" remote get-url origin 2>/dev/null || true)
+  if [ -z "$remote" ]; then
+    printf ''
+    return 0
+  fi
+
+  local value
+  value=$(python3 - "$remote" <<'PY'
+import re
+import sys
+
+url = (sys.argv[1] or "").strip()
+match = re.search(r"github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?$", url)
+if match:
+    print(f"{match.group(1)}/{match.group(2)}")
+else:
+    print("")
+PY
+)
+  printf '%s' "$value"
+}
+
+resolve_repo() {
+  local root="$1"
+  if [ -n "${REPO:-}" ]; then
+    printf '%s' "$REPO"
+    return 0
+  fi
+
+  local from_env
+  from_env=$(read_repo_from_env_file "$root")
+  if [ -n "$from_env" ]; then
+    printf '%s' "$from_env"
+    return 0
+  fi
+
+  local from_config
+  from_config=$(read_repo_from_autodev_yaml "$root")
+  if [ -n "$from_config" ]; then
+    printf '%s' "$from_config"
+    return 0
+  fi
+
+  local from_git
+  from_git=$(read_repo_from_git_remote "$root")
+  if [ -n "$from_git" ]; then
+    printf '%s' "$from_git"
+    return 0
+  fi
+
+  printf ''
+}
+
+initialize_runtime_context() {
+  PROJECT_ROOT="$(resolve_consumer_project_root)"
+  REPO="$(resolve_repo "$PROJECT_ROOT")"
+  DB_PATH="$PROJECT_ROOT/.opencode/runtime/control-plane.sqlite3"
+  STATE_DIR="$PROJECT_ROOT/.opencode/runtime/full-cycle-state"
+
+  if [ -z "$REPO" ]; then
+    log "ERROR: unable to resolve GitHub repo. Set REPO or AUTODEV_GITHUB_REPO, or configure project.github_repo in .autodev.yaml"
+    exit 1
+  fi
+}
 
 timestamp() {
   date +"%Y-%m-%dT%H:%M:%S%z"
@@ -470,6 +625,7 @@ sleep_with_heartbeat() {
 }
 
 main() {
+  initialize_runtime_context
   require_tools
   ensure_state_dir
 
