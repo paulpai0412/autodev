@@ -604,7 +604,7 @@ def sync_project_fields_projection(
         return error
 
     query = (
-        "query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){issue(number:$number){projectItems(first:100){nodes{id project{id}}}}}}"
+        "query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){issue(number:$number){id projectItems(first:100){nodes{id project{id}}}}}}"
     )
     lookup = run(
         [
@@ -644,15 +644,9 @@ def sync_project_fields_projection(
 
     item_id = ""
     payload = json.loads(lookup.stdout or "{}")
-    nodes = (
-        payload.get("data", {})
-        .get("repository", {})
-        .get("issue", {})
-        .get("projectItems", {})
-        .get("nodes", [])
-        if isinstance(payload, dict)
-        else []
-    )
+    issue_payload = payload.get("data", {}).get("repository", {}).get("issue", {}) if isinstance(payload, dict) else {}
+    issue_node_id = str(issue_payload.get("id") or "") if isinstance(issue_payload, dict) else ""
+    nodes = issue_payload.get("projectItems", {}).get("nodes", []) if isinstance(issue_payload, dict) else []
     if isinstance(nodes, list):
         for node in nodes:
             if not isinstance(node, dict):
@@ -663,20 +657,83 @@ def sync_project_fields_projection(
                 break
 
     if not item_id:
-        if command_id:
-            record_github_sync_attempt(
-                base_dir,
-                command_id=command_id,
-                issue_number=issue_number,
-                add_labels=[],
-                remove_labels=[],
-                status="skipped",
-                updated_at=timestamp,
-                last_error="skipped GitHub project field sync because issue is not linked to configured project",
-                projection_target="project_fields",
-                projection_payload={"repo": repo, "issue_number": issue_number, "project_id": project_id},
+        if not issue_node_id:
+            if command_id:
+                record_github_sync_attempt(
+                    base_dir,
+                    command_id=command_id,
+                    issue_number=issue_number,
+                    add_labels=[],
+                    remove_labels=[],
+                    status="skipped",
+                    updated_at=timestamp,
+                    last_error="skipped GitHub project field sync because issue node id is unavailable",
+                    projection_target="project_fields",
+                    projection_payload={"repo": repo, "issue_number": issue_number, "project_id": project_id},
+                )
+            return ""
+
+        add_item_mutation = (
+            "mutation($project:ID!,$content:ID!){addProjectV2ItemById(input:{projectId:$project,contentId:$content}){item{id}}}"
+        )
+        add_item = run(
+            [
+                "gh",
+                "api",
+                "graphql",
+                "-f",
+                f"query={add_item_mutation}",
+                "-F",
+                f"project={project_id}",
+                "-F",
+                f"content={issue_node_id}",
+            ],
+            cwd=base_dir,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if add_item.returncode != 0:
+            error = (add_item.stderr or add_item.stdout).strip() or (
+                f"gh api graphql add project item failed with exit code {add_item.returncode}"
             )
-        return ""
+            if command_id:
+                record_github_sync_attempt(
+                    base_dir,
+                    command_id=command_id,
+                    issue_number=issue_number,
+                    add_labels=[],
+                    remove_labels=[],
+                    status="failed",
+                    updated_at=timestamp,
+                    last_error=error,
+                    projection_target="project_fields",
+                    projection_payload={"repo": repo, "issue_number": issue_number, "project_id": project_id},
+                )
+            return error
+
+        add_payload = json.loads(add_item.stdout or "{}")
+        item_id = (
+            str(add_payload.get("data", {}).get("addProjectV2ItemById", {}).get("item", {}).get("id") or "")
+            if isinstance(add_payload, dict)
+            else ""
+        )
+        if not item_id:
+            error = "failed to parse GitHub project item id after adding issue to project"
+            if command_id:
+                record_github_sync_attempt(
+                    base_dir,
+                    command_id=command_id,
+                    issue_number=issue_number,
+                    add_labels=[],
+                    remove_labels=[],
+                    status="failed",
+                    updated_at=timestamp,
+                    last_error=error,
+                    projection_target="project_fields",
+                    projection_payload={"repo": repo, "issue_number": issue_number, "project_id": project_id},
+                )
+            return error
 
     runtime_context = read_runtime_context(base_dir, issue_number) or {}
     option_map_payload = runtime_context.get("github_project_field_option_ids")
@@ -812,7 +869,6 @@ def sync_local_main_after_release_merge(
 
     branch = str(issue.get("branch") or "").strip()
     issue_worktree_path = str((read_runtime_context(base_dir, issue_number) or {}).get("issue_worktree_path") or "").strip()
-
     workspace_dir = Path(issue_worktree_path) if issue_worktree_path else base_dir
 
     def _run_git(command: list[str], *, cwd: Path) -> str:
@@ -824,17 +880,7 @@ def sync_local_main_after_release_merge(
         )
 
     if workspace_dir != base_dir:
-        repo_probe = _run_git(["git", "rev-parse", "--is-inside-work-tree"], cwd=workspace_dir)
-        if repo_probe:
-            return ""
-        sync_error = _run_git(["git", "fetch", "origin", "main"], cwd=workspace_dir)
-        if sync_error:
-            return f"failed issue worktree sync after release merge for issue #{issue_number}: {sync_error}"
-        if branch and branch != "main":
-            sync_error = _run_git(["git", "merge", "--ff-only", "origin/main"], cwd=workspace_dir)
-            if sync_error:
-                return f"failed issue worktree branch sync after release merge for issue #{issue_number}: {sync_error}"
-        return ""
+        workspace_dir = base_dir
 
     repo_probe = _run_git(["git", "rev-parse", "--is-inside-work-tree"], cwd=base_dir)
     if repo_probe:

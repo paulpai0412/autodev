@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from subprocess import CompletedProcess
+from unittest.mock import patch
 
 from scripts import orchestrator_lifecycle
-from scripts.control_plane_db import ensure_control_plane_db, ingest_issue_packet, read_github_sync_attempt
+from scripts.control_plane_db import ensure_control_plane_db, ingest_issue_packet, read_github_sync_attempt, record_artifact_fact
 
 
 def _seed_github_backed_issue(tmp_path: Path, issue_number: str = "42") -> None:
@@ -164,3 +165,154 @@ def test_sync_project_fields_projection_skips_when_project_not_configured(tmp_pa
     assert attempt is not None
     assert attempt["status"] == "skipped"
     assert attempt["projection_target"] == "project_fields"
+
+
+def test_sync_project_fields_projection_adds_issue_to_project_when_missing(tmp_path: Path) -> None:
+    _seed_github_backed_issue(tmp_path)
+
+    _ = orchestrator_lifecycle.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-21T10:06:00+08:00",
+        runtime_context={
+            "github_project_id": "PVT_project_1",
+            "github_project_field_ids": {
+                "state": "field-id-state",
+                "pr_workflow": "field-id-pr",
+            },
+            "github_project_field_option_ids": {
+                "state": {"running": "opt-running"},
+                "pr_workflow": {},
+            },
+        },
+    )
+
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], **_: object) -> CompletedProcess[str]:
+        calls.append(command)
+        if command[:3] == ["gh", "api", "graphql"] and "number=42" in command:
+            return CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps(
+                    {
+                        "data": {
+                            "repository": {
+                                "issue": {
+                                    "id": "ISSUE_node_42",
+                                    "projectItems": {"nodes": []},
+                                }
+                            }
+                        }
+                    }
+                ),
+                stderr="",
+            )
+        if command[:3] == ["gh", "api", "graphql"] and "content=ISSUE_node_42" in command:
+            return CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps({"data": {"addProjectV2ItemById": {"item": {"id": "ITEM_42"}}}}),
+                stderr="",
+            )
+        if command[:3] == ["gh", "api", "graphql"] and "option=opt-running" in command:
+            return CompletedProcess(command, 0, stdout=json.dumps({"data": {"projectV2Item": {"id": "ITEM_42"}}}), stderr="")
+        return CompletedProcess(command, 1, stdout="", stderr="unexpected command")
+
+    error = orchestrator_lifecycle.sync_project_fields_projection(
+        base_dir=tmp_path,
+        issue_number="42",
+        repo="example/repo",
+        fields={"field-id-state": "running"},
+        now=lambda explicit: explicit or "2026-05-21T10:06:00+08:00",
+        run=fake_run,
+        command_id="cmd-project-fields-add-item",
+        updated_at="2026-05-21T10:06:00+08:00",
+    )
+
+    assert error == ""
+    assert any("content=ISSUE_node_42" in part for call in calls for part in call)
+    attempt = read_github_sync_attempt(tmp_path, "cmd-project-fields-add-item")
+    assert attempt is not None
+    assert attempt["status"] == "success"
+    assert attempt["projection_target"] == "project_fields"
+
+
+def test_sync_local_main_after_release_merge_skips_missing_issue_worktree(tmp_path: Path) -> None:
+    _seed_github_backed_issue(tmp_path)
+
+    _ = orchestrator_lifecycle.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-23T13:50:00+08:00",
+        runtime_context={"issue_worktree_path": str(tmp_path / ".opencode/runtime/issue-worktrees/issue-42")},
+    )
+
+    _ = orchestrator_lifecycle.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-23T13:50:01+08:00",
+        artifact_refs={
+            "release_result_ref": "db:release_result:history:1:sha256:test",
+        },
+    )
+
+    record_artifact_fact(
+        tmp_path,
+        issue_number="42",
+        entry_type="release_result",
+        created_at="2026-05-23T13:50:02+08:00",
+        command_id="release-result-test",
+        payload={"status": "success", "parse_ok": True, "merge": {"merged": True, "merged_sha": "abc123"}},
+    )
+
+    error = orchestrator_lifecycle.sync_local_main_after_release_merge(
+        base_dir=tmp_path,
+        issue_number="42",
+    )
+
+    assert error == ""
+
+
+def test_sync_local_main_after_release_merge_only_syncs_base_dir_main_for_separate_worktree(tmp_path: Path) -> None:
+    _seed_github_backed_issue(tmp_path)
+    issue_worktree = tmp_path / ".opencode/runtime/issue-worktrees/issue-42"
+    issue_worktree.mkdir(parents=True, exist_ok=True)
+
+    _ = orchestrator_lifecycle.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-23T14:00:00+08:00",
+        runtime_context={"issue_worktree_path": str(issue_worktree)},
+    )
+
+    record_artifact_fact(
+        tmp_path,
+        issue_number="42",
+        entry_type="release_result",
+        created_at="2026-05-23T14:00:01+08:00",
+        command_id="release-result-base-dir-only-test",
+        payload={"status": "success", "parse_ok": True, "merge": {"merged": True, "merged_sha": "abc123"}},
+    )
+
+    calls: list[tuple[list[str], Path | None]] = []
+
+    def fake_run(command: list[str], *, cwd: Path | None = None, **_: object) -> CompletedProcess[str]:
+        calls.append((command, cwd))
+        return CompletedProcess(command, 0, stdout="", stderr="")
+
+    with patch("scripts.orchestrator_lifecycle.subprocess.run", side_effect=fake_run):
+        error = orchestrator_lifecycle.sync_local_main_after_release_merge(
+            base_dir=tmp_path,
+            issue_number="42",
+        )
+
+    assert error == ""
+    assert calls[:4] == [
+        (["git", "rev-parse", "--is-inside-work-tree"], tmp_path),
+        (["git", "fetch", "origin", "main"], tmp_path),
+        (["git", "checkout", "main"], tmp_path),
+        (["git", "pull", "--ff-only", "origin", "main"], tmp_path),
+    ]
+    assert all(cwd == tmp_path for _command, cwd in calls)
