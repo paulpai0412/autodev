@@ -81,6 +81,28 @@ def fake_init_with_project_bootstrap_run(args: list[str], **_kwargs: object) -> 
     raise AssertionError(f"unexpected command: {args}")
 
 
+def fake_init_with_existing_project_link_run(args: list[str], **_kwargs: object) -> CompletedProcess[str]:
+    if args[:3] == ["git", "rev-parse", "--is-inside-work-tree"]:
+        return completed(args, returncode=128, stderr="not a git repository")
+    if args[:4] == ["git", "rev-parse", "--verify", "HEAD"]:
+        return completed(args, returncode=128, stderr="fatal: Needed a single revision")
+    if args[:4] == ["git", "remote", "get-url", "origin"]:
+        return completed(args, returncode=2, stderr="no such remote")
+    if args[:3] == ["gh", "repo", "view"]:
+        return completed(args, returncode=1, stderr="not found")
+    if args[:3] == ["git", "init", "-b"]:
+        return completed(args, stdout="initialized")
+    if args[:3] == ["git", "remote", "add"]:
+        return completed(args)
+    if args[:3] == ["gh", "repo", "create"]:
+        return completed(args, stdout="created")
+    if args[:3] == ["gh", "label", "create"]:
+        return completed(args)
+    if args[:4] == ["gh", "project", "link", "7"]:
+        return completed(args)
+    raise AssertionError(f"unexpected command: {args}")
+
+
 def test_init_creates_project_contract_dirs_and_agents_managed_block(tmp_path: Path):
     write(tmp_path / "AGENTS.md", "# Project Agents\n\nKeep this project-specific guidance.\n")
 
@@ -143,6 +165,63 @@ def test_init_create_github_project_writes_monitoring_block(tmp_path: Path):
     assert 'state: "PVTF_state"' in config
     assert 'stage: "PVTF_stage"' in config
     assert 'pr_workflow: "PVTF_pr_workflow"' in config
+
+
+def test_init_links_repo_to_existing_github_project_when_monitoring_exists(tmp_path: Path):
+    write(
+        tmp_path / ".autodev.yaml",
+        "\n".join(
+            [
+                'schema_version: "1.0"',
+                "project:",
+                "  name: demo",
+                f"  root: {tmp_path}",
+                "  github_repo: paulpai0412/autodev",
+                "",
+                "# AUTODEV_GITHUB_MONITORING:BEGIN",
+                'github_project_owner: "paulpai0412"',
+                'github_project_title: "Autodev Control Plane"',
+                "github_project_number: 7",
+                'github_project_id: "PVT_project_1"',
+                "github_project_field_ids:",
+                '  state: "PVTF_state"',
+                '  stage: "PVTF_stage"',
+                '  pr_workflow: "PVTF_pr_workflow"',
+                "github_project_field_option_ids:",
+                "  state:",
+                '    ready: "opt_ready"',
+                "  pr_workflow:",
+                '    release_pending: "opt_release_pending"',
+                "# AUTODEV_GITHUB_MONITORING:END",
+                "",
+            ]
+        ),
+    )
+    write(tmp_path / "AGENTS.md", "# Project Agents\n")
+
+    with patch("scripts.autodev_project.subprocess.run", side_effect=fake_init_with_existing_project_link_run) as run:
+        exit_code = autodev_project.main(
+            [
+                "init",
+                "--project-root",
+                str(tmp_path),
+                "--github-repo",
+                "paulpai0412/autodev",
+            ]
+        )
+
+    assert exit_code == 0
+    commands = [call.args[0] for call in run.call_args_list]
+    assert [
+        "gh",
+        "project",
+        "link",
+        "7",
+        "--owner",
+        "paulpai0412",
+        "--repo",
+        "paulpai0412/autodev",
+    ] in commands
 
 
 def test_init_dry_run_writes_nothing(tmp_path: Path):

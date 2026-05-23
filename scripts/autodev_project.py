@@ -366,6 +366,41 @@ def _find_project_by_title(*, owner: str, title: str) -> tuple[int, str] | None:
     return None
 
 
+def _find_project_by_id(*, owner: str, project_id: str) -> tuple[int, str] | None:
+    target_id = project_id.strip()
+    if not target_id:
+        return None
+
+    result = _run_command(
+        [
+            "gh",
+            "project",
+            "list",
+            "--owner",
+            owner,
+            "--limit",
+            "100",
+            "--format",
+            "json",
+        ],
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    parsed = _parse_optional_json(cast(str, result.stdout or ""))
+    projects = parsed if isinstance(parsed, list) else []
+    for project in projects:
+        if not isinstance(project, dict):
+            continue
+        candidate_id = str(project.get("id") or "").strip()
+        if candidate_id != target_id:
+            continue
+        number = int(project.get("number") or 0)
+        if number > 0:
+            return number, candidate_id
+    return None
+
+
 def _create_project(*, owner: str, title: str) -> tuple[int, str]:
     result = _run_command(
         [
@@ -585,6 +620,15 @@ def _replace_monitoring_block(config_text: str, *, setup: GitHubProjectSetup) ->
         separator = "" if config_text.endswith("\n") else "\n"
         merged = f"{config_text}{separator}{block}"
     return merged
+
+
+def _extract_project_number_from_config(config_text: str) -> int:
+    for raw_line in config_text.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("github_project_number:"):
+            continue
+        return _as_int(line.split(":", 1)[1].strip(), 0)
+    return 0
 
 
 def _extract_monitoring_from_config(config_text: str) -> tuple[str, dict[str, str], dict[str, dict[str, str]]]:
@@ -1036,6 +1080,30 @@ def init_project(
                 )
             except Exception as error:
                 report.findings.append(f"failed to set up GitHub project monitoring: {error}")
+    else:
+        config_for_link = _read_text(config_path) if config_path.exists() else expected_config
+        configured_project_number = _extract_project_number_from_config(config_for_link)
+        configured_project_id, _field_ids_unused, _field_option_ids_unused = _extract_monitoring_from_config(config_for_link)
+
+        if configured_project_number > 0 or configured_project_id:
+            report.actions.append("ensure repository is linked to configured GitHub Project")
+
+        if not dry_run and not check:
+            try:
+                project_number_to_link = configured_project_number
+                if project_number_to_link <= 0 and configured_project_id:
+                    found_by_id = _find_project_by_id(owner=project_owner, project_id=configured_project_id)
+                    if found_by_id is not None:
+                        project_number_to_link, _project_id_unused = found_by_id
+
+                if project_number_to_link > 0:
+                    _ensure_project_linked(
+                        owner=project_owner,
+                        project_number=project_number_to_link,
+                        github_repo=github_repo,
+                    )
+            except Exception as error:
+                report.findings.append(f"failed to link repository to configured GitHub project: {error}")
 
     config_text_for_env = _read_text(config_path) if config_path.exists() else expected_config
     project_id_for_env, _field_ids_for_env, _field_option_ids_for_env = _extract_monitoring_from_config(config_text_for_env)
