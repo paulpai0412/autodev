@@ -60,6 +60,8 @@ DEVELOPMENT_SLOT_STATES = ("claimed", "dispatching", "running", "verifying")
 def canonical_control_plane_base_dir(base_dir: Path) -> Path:
     resolved = base_dir.resolve()
     for candidate in (resolved, *resolved.parents):
+        if candidate.name == "runtime" and candidate.parent.name == ".opencode":
+            return candidate.parent.parent.resolve()
         parent = candidate.parent
         runtime_dir = parent.parent
         opencode_dir = runtime_dir.parent

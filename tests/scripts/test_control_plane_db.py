@@ -89,6 +89,18 @@ def test_control_plane_db_path_uses_canonical_project_root_from_issue_worktree(t
     assert not (issue_worktree / ".opencode/runtime/control-plane.sqlite3").exists()
 
 
+def test_control_plane_db_path_uses_canonical_project_root_from_runtime_dir(tmp_path: Path):
+    runtime_dir = tmp_path / ".opencode/runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+
+    db_path = ensure_control_plane_db(runtime_dir)
+
+    assert canonical_control_plane_base_dir(runtime_dir) == tmp_path
+    assert db_path == tmp_path / ".opencode/runtime/control-plane.sqlite3"
+    assert control_plane_db_path(runtime_dir) == tmp_path / ".opencode/runtime/control-plane.sqlite3"
+    assert not (runtime_dir / ".opencode/runtime/control-plane.sqlite3").exists()
+
+
 def test_transition_issue_state_records_issue_and_history(tmp_path: Path):
     ensure_control_plane_db(tmp_path)
 
