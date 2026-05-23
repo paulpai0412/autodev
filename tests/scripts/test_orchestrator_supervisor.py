@@ -5408,6 +5408,10 @@ verifier_manual_qa:
     cast(dict[str, str], ledger["artifacts"])["worker_result_ref"] = "docs/agents/worker-results/issue-42.yaml"
     cast(dict[str, str], ledger["artifacts"])["evidence_packet_ref"] = "docs/agents/evidence/issue-42-pr-77.yaml"
 
+    browser_artifact = tmp_path / "artifacts/browser-e2e/report.html"
+    browser_artifact.parent.mkdir(parents=True, exist_ok=True)
+    browser_artifact.write_text("ok", encoding="utf-8")
+
     _submit_artifact(
         tmp_path,
         issue_number="42",
@@ -5492,6 +5496,353 @@ def test_reconcile_release_worker_running_without_release_result_stays_no_change
     assert request is None
     assert issue is not None
     assert issue["state"] == "release_pending"
+
+
+def test_reconcile_verifier_pass_retries_when_browser_artifact_missing(tmp_path: Path):
+    issue_packet_text = """schema_version: \"1.0\"
+kind: issue_packet
+line_cap: 80
+
+issue:
+  number: \"42\"
+  title: \"Demo issue\"
+  url: \"https://github.com/example/issues/42\"
+  labels: [ready-for-agent]
+  parent: {type: \"prd\", reference: \"https://github.com/example/issues/1\"}
+
+branch: {name: \"agent/issue-42-demo\", base: \"main\"}
+
+bootstrap_context:
+  required_reads: [\"AGENTS.md\"]
+  context_budget: {checkpoint_warning_at_percent: 45, stop_and_rotate_at_percent: 50}
+  relevant_paths: [\"frontend\"]
+  prior_handoff: \"docs/agents/handoffs/issue-41.yaml\"
+
+verifier_manual_qa:
+  surface: \"browser\"
+  required_gates: [\"diagnostics_and_build_gate\", \"surface_qa_gate\", \"review_gate\"]
+"""
+    issue_packet = parse_issue_packet_text(issue_packet_text, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    _ingest_issue_packet_text(tmp_path, "42", issue_packet_text)
+    ledger["current"] = {"role": "pr_verifier", "stage": "pr_verifier_execution", "status": "queued"}
+    cast(dict[str, str], ledger["artifacts"])["worker_result_ref"] = "docs/agents/worker-results/issue-42.yaml"
+    cast(dict[str, str], ledger["artifacts"])["evidence_packet_ref"] = "docs/agents/evidence/issue-42-pr-77.yaml"
+
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="worker_result",
+        payload={
+            "status": "success",
+            "pr_number": "77",
+            "worker_session_id": "ses-w",
+            "files_changed": [{"path": "frontend/src/App.tsx", "summary": "UI update"}],
+            "failure_kind": "none",
+            "retryable": True,
+        },
+        updated_at="2026-05-07T17:10:00+08:00",
+    )
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="evidence_packet",
+        payload={
+            "status": "pass",
+            "pr_number": "77",
+            "verifier_session_id": "ses-v",
+            "next_recommended_step": "Release it",
+            "failure_kind": "none",
+            "retryable": True,
+            "gates": {
+                "surface_qa_gate": {
+                    "status": "pass",
+                    "evidence_ref": "artifacts/browser-e2e/missing.png",
+                    "evidence_kind": "browser",
+                }
+            },
+        },
+        updated_at="2026-05-07T17:11:00+08:00",
+    )
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="running",
+        command_id="cmd-running",
+        updated_at="2026-05-07T17:09:00+08:00",
+        current_session_id="ses-root-42",
+    )
+
+    updated_ledger, decision, request = reconcile_ledger(
+        ledger,
+        artifact_base_dir=tmp_path,
+        updated_at="2026-05-07T17:11:00+08:00",
+    )
+
+    issue = read_issue(tmp_path, "42")
+
+    assert updated_ledger is not None
+    assert decision["action"] == "delegate_subagent"
+    assert decision["next_role"] == "pr_verifier"
+    assert request is None
+    assert "missing browser artifact" in cast(str, decision["summary"])
+    assert cast(dict[str, object], updated_ledger["lastFailure"])["kind"] == "contract_invalid"
+    assert issue is not None
+    assert issue["state"] == "verifying"
+
+
+def test_reconcile_verifier_pass_accepts_when_browser_artifact_exists(tmp_path: Path):
+    issue_packet_text = """schema_version: \"1.0\"
+kind: issue_packet
+line_cap: 80
+
+issue:
+  number: \"42\"
+  title: \"Demo issue\"
+  url: \"https://github.com/example/issues/42\"
+  labels: [ready-for-agent]
+  parent: {type: \"prd\", reference: \"https://github.com/example/issues/1\"}
+
+branch: {name: \"agent/issue-42-demo\", base: \"main\"}
+
+bootstrap_context:
+  required_reads: [\"AGENTS.md\"]
+  context_budget: {checkpoint_warning_at_percent: 45, stop_and_rotate_at_percent: 50}
+  relevant_paths: [\"frontend\"]
+  prior_handoff: \"docs/agents/handoffs/issue-41.yaml\"
+
+verifier_manual_qa:
+  surface: \"browser\"
+  required_gates: [\"diagnostics_and_build_gate\", \"surface_qa_gate\", \"review_gate\"]
+"""
+    issue_packet = parse_issue_packet_text(issue_packet_text, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    _ingest_issue_packet_text(tmp_path, "42", issue_packet_text)
+    ledger["current"] = {"role": "pr_verifier", "stage": "pr_verifier_execution", "status": "queued"}
+    cast(dict[str, str], ledger["artifacts"])["worker_result_ref"] = "docs/agents/worker-results/issue-42.yaml"
+    cast(dict[str, str], ledger["artifacts"])["evidence_packet_ref"] = "docs/agents/evidence/issue-42-pr-77.yaml"
+
+    browser_artifact = tmp_path / "artifacts/browser-e2e/report.html"
+    browser_artifact.parent.mkdir(parents=True, exist_ok=True)
+    browser_artifact.write_text("ok", encoding="utf-8")
+
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="worker_result",
+        payload={
+            "status": "success",
+            "pr_number": "77",
+            "worker_session_id": "ses-w",
+            "files_changed": [{"path": "frontend/src/App.tsx", "summary": "UI update"}],
+            "failure_kind": "none",
+            "retryable": True,
+        },
+        updated_at="2026-05-07T17:10:00+08:00",
+    )
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="evidence_packet",
+        payload={
+            "status": "pass",
+            "pr_number": "77",
+            "verifier_session_id": "ses-v",
+            "next_recommended_step": "Release it",
+            "failure_kind": "none",
+            "retryable": True,
+            "gates": {
+                "surface_qa_gate": {
+                    "status": "pass",
+                    "evidence_ref": "artifacts/browser-e2e/report.html",
+                    "evidence_kind": "browser",
+                }
+            },
+        },
+        updated_at="2026-05-07T17:11:00+08:00",
+    )
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="running",
+        command_id="cmd-running",
+        updated_at="2026-05-07T17:09:00+08:00",
+        current_session_id="ses-root-42",
+    )
+
+    updated_ledger, decision, request = reconcile_ledger(
+        ledger,
+        artifact_base_dir=tmp_path,
+        updated_at="2026-05-07T17:11:00+08:00",
+    )
+
+    issue = read_issue(tmp_path, "42")
+
+    assert updated_ledger is not None
+    assert decision["action"] == "release_waiting"
+    assert request is None
+    assert issue is not None
+    assert issue["state"] == "verified"
+
+
+def test_reconcile_verifier_pass_retries_with_invalid_browser_evidence_ref(tmp_path: Path):
+    issue_packet_text = """schema_version: \"1.0\"
+kind: issue_packet
+line_cap: 80
+
+issue:
+  number: \"42\"
+  title: \"Demo issue\"
+  url: \"https://github.com/example/issues/42\"
+  labels: [ready-for-agent]
+  parent: {type: \"prd\", reference: \"https://github.com/example/issues/1\"}
+
+branch: {name: \"agent/issue-42-demo\", base: \"main\"}
+
+bootstrap_context:
+  required_reads: [\"AGENTS.md\"]
+  context_budget: {checkpoint_warning_at_percent: 45, stop_and_rotate_at_percent: 50}
+  relevant_paths: [\"frontend\"]
+  prior_handoff: \"docs/agents/handoffs/issue-41.yaml\"
+
+verifier_manual_qa:
+  surface: \"browser\"
+  required_gates: [\"diagnostics_and_build_gate\", \"surface_qa_gate\", \"review_gate\"]
+"""
+    issue_packet = parse_issue_packet_text(issue_packet_text, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    _ingest_issue_packet_text(tmp_path, "42", issue_packet_text)
+    ledger["current"] = {"role": "pr_verifier", "stage": "pr_verifier_execution", "status": "queued"}
+    cast(dict[str, str], ledger["artifacts"])["worker_result_ref"] = "docs/agents/worker-results/issue-42.yaml"
+    cast(dict[str, str], ledger["artifacts"])["evidence_packet_ref"] = "docs/agents/evidence/issue-42-pr-77.yaml"
+
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="worker_result",
+        payload={
+            "status": "success",
+            "pr_number": "77",
+            "worker_session_id": "ses-w",
+            "files_changed": [{"path": "frontend/src/App.tsx", "summary": "UI update"}],
+            "failure_kind": "none",
+            "retryable": True,
+        },
+        updated_at="2026-05-07T17:10:00+08:00",
+    )
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="evidence_packet",
+        payload={
+            "status": "pass",
+            "pr_number": "77",
+            "verifier_session_id": "ses-v",
+            "next_recommended_step": "Release it",
+            "failure_kind": "none",
+            "retryable": True,
+            "gates": {
+                "surface_qa_gate": {
+                    "status": "pass",
+                    "evidence_ref": "#trace",
+                    "evidence_kind": "browser",
+                }
+            },
+        },
+        updated_at="2026-05-07T17:11:00+08:00",
+    )
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="running",
+        command_id="cmd-running",
+        updated_at="2026-05-07T17:09:00+08:00",
+        current_session_id="ses-root-42",
+    )
+
+    updated_ledger, decision, request = reconcile_ledger(
+        ledger,
+        artifact_base_dir=tmp_path,
+        updated_at="2026-05-07T17:11:00+08:00",
+    )
+
+    issue = read_issue(tmp_path, "42")
+
+    assert updated_ledger is not None
+    assert decision["action"] == "delegate_subagent"
+    assert decision["next_role"] == "pr_verifier"
+    assert request is None
+    assert "invalid evidence_ref" in cast(str, decision["summary"])
+    assert cast(dict[str, object], updated_ledger["lastFailure"])["kind"] == "contract_invalid"
+    assert issue is not None
+    assert issue["state"] == "verifying"
+
+
+def test_reconcile_verifier_pass_does_not_validate_browser_artifact_when_not_required(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "pr_verifier", "stage": "pr_verifier_execution", "status": "queued"}
+    cast(dict[str, str], ledger["artifacts"])["worker_result_ref"] = "docs/agents/worker-results/issue-42.yaml"
+    cast(dict[str, str], ledger["artifacts"])["evidence_packet_ref"] = "docs/agents/evidence/issue-42-pr-77.yaml"
+
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="worker_result",
+        payload={
+            "status": "success",
+            "pr_number": "77",
+            "branch": "agent/issue-42-demo",
+            "worker_session_id": "ses-w",
+            "files_changed": [{"path": "scripts/orchestrator_reconcile.py", "summary": "logic update"}],
+            "failure_kind": "none",
+            "retryable": True,
+        },
+        updated_at="2026-05-07T17:10:00+08:00",
+    )
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="evidence_packet",
+        payload={
+            "status": "pass",
+            "pr_number": "77",
+            "verifier_session_id": "ses-v",
+            "next_recommended_step": "Release it",
+            "failure_kind": "none",
+            "retryable": True,
+            "gates": {
+                "surface_qa_gate": {
+                    "status": "pass",
+                    "evidence_ref": "artifacts/browser-e2e/missing.png",
+                    "evidence_kind": "browser",
+                }
+            },
+        },
+        updated_at="2026-05-07T17:11:00+08:00",
+    )
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="running",
+        command_id="cmd-running",
+        updated_at="2026-05-07T17:09:00+08:00",
+        current_session_id="ses-root-42",
+    )
+
+    updated_ledger, decision, request = reconcile_ledger(
+        ledger,
+        artifact_base_dir=tmp_path,
+        updated_at="2026-05-07T17:11:00+08:00",
+    )
+
+    issue = read_issue(tmp_path, "42")
+
+    assert updated_ledger is not None
+    assert decision["action"] == "release_waiting"
+    assert request is None
+    assert issue is not None
+    assert issue["state"] == "verified"
 
 
 def test_reconcile_release_worker_terminal_without_release_result_redispatches_subagent(tmp_path: Path):

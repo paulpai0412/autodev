@@ -152,6 +152,43 @@ def _browser_e2e_gate_deficiency(evidence_packet: dict[str, object]) -> str:
     return "missing browser_e2e evidence contract fields"
 
 
+def _browser_surface_artifact_validation_deficiency(base_dir: Path, evidence_packet: dict[str, object]) -> str:
+    gates_raw = evidence_packet.get("gates")
+    if not isinstance(gates_raw, dict):
+        return "invalid evidence_ref: missing key gates.surface_qa_gate"
+
+    surface_gate_raw = gates_raw.get("surface_qa_gate")
+    if not isinstance(surface_gate_raw, dict):
+        return "invalid evidence_ref: gates.surface_qa_gate must be an object"
+
+    surface_gate = cast(dict[str, object], surface_gate_raw)
+    status = str(surface_gate.get("status") or "").strip().lower()
+    if status != "pass":
+        return "invalid evidence_ref: gates.surface_qa_gate.status must be 'pass'"
+
+    evidence_ref = str(surface_gate.get("evidence_ref") or "").strip()
+    if not evidence_ref:
+        return "invalid evidence_ref: gates.surface_qa_gate.evidence_ref is empty"
+
+    normalized_ref = evidence_ref.split("#", 1)[0].split("?", 1)[0].strip()
+    if not normalized_ref:
+        return "invalid evidence_ref: gates.surface_qa_gate.evidence_ref is blank after normalization"
+
+    if normalized_ref.startswith("db:"):
+        if normalized_ref == "db:":
+            return "invalid evidence_ref: db reference is missing target"
+        return ""
+
+    artifact_path = Path(normalized_ref)
+    if not artifact_path.is_absolute():
+        artifact_path = base_dir / artifact_path
+
+    if not artifact_path.exists() or not artifact_path.is_file():
+        return f"missing browser artifact: {normalized_ref}"
+
+    return ""
+
+
 class IssuePacketRecord(Protocol):
     issue_number: str
     title: str
@@ -628,6 +665,44 @@ def reconcile_pr_verifier(
                 summary=summary,
                 final_state="failed",
             )
+        if browser_e2e_required:
+            artifact_deficiency = _browser_surface_artifact_validation_deficiency(base_dir, persisted_evidence)
+            if artifact_deficiency:
+                summary = (
+                    f"Verifier for issue #{issue['number']} reported pass but browser artifact validation failed "
+                    f"({artifact_deficiency}). Retry pr_verifier with a resolvable evidence_ref that points to an existing browser artifact."
+                )
+                set_failure_func(ledger, kind="contract_invalid", summary=summary, retryable=True)
+                if attempts["pr_verifier"] < limits["pr_verifier"]:
+                    attempts["pr_verifier"] += 1
+                    transition_issue_state_if_possible(
+                        base_dir=base_dir,
+                        issue_number=issue["number"],
+                        to_state="verifying",
+                        command_id=uuid4().hex,
+                        updated_at=updated_at,
+                        reason=f"Retry pr_verifier for issue #{issue['number']} after browser artifact validation failure.",
+                    )
+                    queue_transition_func(
+                        ledger,
+                        next_role="pr_verifier",
+                        next_stage="pr_verifier_execution",
+                        summary=summary,
+                        updated_at=updated_at,
+                    )
+                    return ledger, subagent_decision_func(
+                        ledger,
+                        next_role="pr_verifier",
+                        next_stage="pr_verifier_execution",
+                        summary=summary,
+                    ), None
+                return queue_orchestrator_recovery_func(
+                    ledger,
+                    base_dir=base_dir,
+                    updated_at=updated_at,
+                    summary=summary,
+                    final_state="failed",
+                )
         if current_issue_state in {"completed", "failed", "quarantined"}:
             summary = (
                 f"Verifier for issue #{issue['number']} passed, but the issue is already {current_issue_state}. "
