@@ -5,6 +5,14 @@ project:
   root: /home/timmypai/apps/autodev
   github_repo: paulpai0412/autodev
 
+# Optional: enable GitHub Projects V2 projection by filling these values.
+# If github_project_id is empty, autodev falls back to AUTODEV_GITHUB_PROJECT_ID.
+github_project_id: ""
+github_project_field_ids:
+  state: ""
+  stage: ""
+  pr_workflow: ""
+
 context:
   required_reads:
     - AGENTS.md
