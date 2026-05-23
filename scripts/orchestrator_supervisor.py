@@ -65,6 +65,11 @@ from scripts.orchestrator_artifacts import (
     issue_packet_record_to_json,
     parse_issue_packet_text,
 )
+from scripts.state_projection import (
+    issue_projection,
+    label_delta_for_projection,
+    load_state_projection_config,
+)
 
 
 JsonObject = dict[str, object]
@@ -554,7 +559,8 @@ DEFAULT_ROOT_SESSION_AGENT = "build"
 READY_FOR_AGENT_LABEL = "ready-for-agent"
 AGENT_DISPATCHING_LABEL = "agent-dispatching"
 AGENT_IN_PROGRESS_LABEL = "agent-in-progress"
-QUARANTINED_LABEL = "quarantined"
+AGENT_IN_REVIEW_LABEL = "agent-in-review"
+AGENT_COMPLETED_LABEL = "agent-completed"
 MAX_ROLE_ATTEMPTS = 3
 DEFAULT_DEVELOPMENT_CAPACITY = 1
 DEFAULT_RELEASE_CAPACITY = 1
@@ -1079,15 +1085,14 @@ def start_issue(
         payload={"issue_number": issue_number, "target_branch": packet.branch, "base_branch": resolved_base_branch},
         unique_key=f"stack-base:{issue_number}:{resolved_base_branch}:{timestamp}",
     )
-    sync_error = _sync_issue_progress_label(
-        base_dir=base_dir,
-        issue_number=issue_number,
-        add_labels=[AGENT_DISPATCHING_LABEL],
-        remove_labels=[READY_FOR_AGENT_LABEL, AGENT_IN_PROGRESS_LABEL, QUARANTINED_LABEL],
-        command_id=f"start-issue:{issue_number}:labels",
-        updated_at=timestamp,
-    )
-    if sync_error:
+    try:
+        _sync_projected_issue_labels_or_raise(
+            base_dir=base_dir,
+            issue_number=issue_number,
+            command_id=f"start-issue:{issue_number}:labels",
+            updated_at=timestamp,
+        )
+    except RuntimeError as error:
         _ = upsert_issue_state(
             base_dir,
             issue_number=issue_number,
@@ -1096,7 +1101,7 @@ def start_issue(
             updated_at=timestamp,
             current_session_id="",
         )
-        raise RuntimeError(f"failed to sync GitHub in-progress state for issue #{issue_number}: {sync_error}")
+        raise RuntimeError(str(error)) from error
     ledger = create_initial_ledger(
         issue_packet=packet,
         workflow_policy_path=DEFAULT_WORKFLOW_POLICY_PATH,
@@ -1157,11 +1162,9 @@ def start_issue(
             issue_number=issue_number,
             session_result=session_result,
         )
-        sync_error = _sync_issue_progress_label(
+        sync_error = _sync_projected_issue_labels(
             base_dir=base_dir,
             issue_number=issue_number,
-            add_labels=[AGENT_IN_PROGRESS_LABEL],
-            remove_labels=[AGENT_DISPATCHING_LABEL],
             command_id=f"start-issue:{issue_number}:running-labels",
             updated_at=recorded_at,
         )
@@ -1663,6 +1666,89 @@ def _sync_issue_progress_label(
     )
 
 
+def _projected_issue_state_and_workflows(
+    *,
+    base_dir: Path,
+    issue_number: str,
+) -> tuple[str, str, str]:
+    issue = read_issue(base_dir, issue_number) or {}
+    issue_state = str(issue.get("state") or "")
+    pr_opened = read_latest_history_entry(base_dir, issue_number=issue_number, entry_type="pr_opened")
+    has_pr_opened = pr_opened is not None
+
+    evidence_packet = _read_db_artifact_fact(base_dir=base_dir, issue_number=issue_number, artifact_kind="evidence_packet")
+    evidence_status = str(evidence_packet.get("status") or "").strip().lower()
+
+    release_result = _read_db_artifact_fact(base_dir=base_dir, issue_number=issue_number, artifact_kind="release_result")
+    release_status = str(release_result.get("status") or "").strip().lower()
+    merge_payload_raw = release_result.get("merge")
+    merge_payload = cast(dict[str, object], merge_payload_raw) if isinstance(merge_payload_raw, dict) else {}
+    release_merged = bool(release_result.get("merged")) or bool(merge_payload.get("merged"))
+
+    projection = issue_projection(
+        issue_state=issue_state,
+        has_pr_opened=has_pr_opened,
+        evidence_status=evidence_status,
+        release_status=release_status,
+        release_merged=release_merged,
+        config=load_state_projection_config(base_dir),
+    )
+    return issue_state, projection.team_workflow, projection.pr_workflow_state
+
+
+def _sync_projected_issue_labels(
+    *,
+    base_dir: Path,
+    issue_number: str,
+    command_id: str | None = None,
+    updated_at: str | None = None,
+) -> str:
+    issue = read_issue(base_dir, issue_number) or {}
+    pr_opened = read_latest_history_entry(base_dir, issue_number=issue_number, entry_type="pr_opened")
+    has_pr_opened = pr_opened is not None
+    evidence_packet = _read_db_artifact_fact(base_dir=base_dir, issue_number=issue_number, artifact_kind="evidence_packet")
+    evidence_status = str(evidence_packet.get("status") or "").strip().lower()
+    release_result = _read_db_artifact_fact(base_dir=base_dir, issue_number=issue_number, artifact_kind="release_result")
+    release_status = str(release_result.get("status") or "").strip().lower()
+    merge_payload_raw = release_result.get("merge")
+    merge_payload = cast(dict[str, object], merge_payload_raw) if isinstance(merge_payload_raw, dict) else {}
+    release_merged = bool(release_result.get("merged")) or bool(merge_payload.get("merged"))
+    projection = issue_projection(
+        issue_state=str(issue.get("state") or ""),
+        has_pr_opened=has_pr_opened,
+        evidence_status=evidence_status,
+        release_status=release_status,
+        release_merged=release_merged,
+        config=load_state_projection_config(base_dir),
+    )
+    add_labels, remove_labels = label_delta_for_projection(projection)
+    return _sync_issue_progress_label(
+        base_dir=base_dir,
+        issue_number=issue_number,
+        add_labels=add_labels,
+        remove_labels=remove_labels,
+        command_id=command_id,
+        updated_at=updated_at,
+    )
+
+
+def _sync_projected_issue_labels_or_raise(
+    *,
+    base_dir: Path,
+    issue_number: str,
+    command_id: str,
+    updated_at: str,
+) -> None:
+    sync_error = _sync_projected_issue_labels(
+        base_dir=base_dir,
+        issue_number=issue_number,
+        command_id=command_id,
+        updated_at=updated_at,
+    )
+    if sync_error:
+        raise RuntimeError(f"failed to sync projected issue labels for issue #{issue_number}: {sync_error}")
+
+
 def _render_issue_body_projection_markdown(*, base_dir: Path, issue_number: str, updated_at: str) -> str:
     issue = read_issue(base_dir, issue_number) or {}
     issue_packet = _load_json_dict(issue.get("issue_packet_json"))
@@ -1773,40 +1859,22 @@ def _sync_project_fields_projection(
 ) -> str:
     sync_fields = cast(Callable[..., str], _lifecycle_helpers.sync_project_fields_projection)
     timestamp = _now(updated_at)
-    issue = read_issue(base_dir, issue_number) or {}
     configured = _load_json_dict((read_runtime_context(base_dir, issue_number) or {}).get("github_project_field_ids"))
     fields: dict[str, str] = {}
     state_field_id = str(configured.get("state") or "").strip()
     stage_field_id = str(configured.get("stage") or "").strip()
     pr_workflow_field_id = str(configured.get("pr_workflow") or "").strip()
+
+    issue = read_issue(base_dir, issue_number) or {}
+    issue_state, team_workflow_state, pr_workflow_status = _projected_issue_state_and_workflows(
+        base_dir=base_dir,
+        issue_number=issue_number,
+    )
     if state_field_id:
-        fields[state_field_id] = str(issue.get("state") or "")
+        fields[state_field_id] = team_workflow_state
     if stage_field_id:
         fields[stage_field_id] = str(issue.get("current_stage") or "")
     if pr_workflow_field_id:
-        pr_workflow_status = "not_opened"
-        pr_opened = read_latest_history_entry(base_dir, issue_number=issue_number, entry_type="pr_opened")
-        if pr_opened is not None:
-            pr_workflow_status = "opened"
-
-        evidence_packet = _read_db_artifact_fact(base_dir=base_dir, issue_number=issue_number, artifact_kind="evidence_packet")
-        evidence_status = str(evidence_packet.get("status") or "").strip().lower()
-        if evidence_status == "pass":
-            pr_workflow_status = "verifier_passed"
-        elif evidence_status in {"fail", "blocked"}:
-            pr_workflow_status = f"verifier_{evidence_status}"
-
-        release_result = _read_db_artifact_fact(base_dir=base_dir, issue_number=issue_number, artifact_kind="release_result")
-        release_status = str(release_result.get("status") or "").strip().lower()
-        merge_payload_raw = release_result.get("merge")
-        merge_payload = cast(dict[str, object], merge_payload_raw) if isinstance(merge_payload_raw, dict) else {}
-        merged = bool(release_result.get("merged")) or bool(merge_payload.get("merged"))
-        if merged or release_status in {"success", "completed"}:
-            pr_workflow_status = "merged"
-        elif release_status in {"blocked", "failed"}:
-            blocked_reason = str(release_result.get("blocked_reason") or "").strip()
-            pr_workflow_status = f"release_{blocked_reason or release_status}"
-
         fields[pr_workflow_field_id] = pr_workflow_status
     try:
         return sync_fields(
@@ -1824,35 +1892,14 @@ def _sync_project_fields_projection(
 
 
 def _project_pr_workflow_projection(base_dir: Path, issue_number: str) -> dict[str, str]:
-    status = "not_opened"
-    detail = "no pr_opened fact"
-
-    pr_opened = read_latest_history_entry(base_dir, issue_number=issue_number, entry_type="pr_opened")
-    if pr_opened is not None:
-        status = "opened"
-        detail = "pr_opened fact exists"
+    issue_state, _team_workflow_state, status = _projected_issue_state_and_workflows(
+        base_dir=base_dir,
+        issue_number=issue_number,
+    )
+    detail = f"projected from issue state {issue_state}"
 
     evidence_packet = _read_db_artifact_fact(base_dir=base_dir, issue_number=issue_number, artifact_kind="evidence_packet")
-    evidence_status = str(evidence_packet.get("status") or "").strip().lower()
-    if evidence_status == "pass":
-        status = "verifier_passed"
-        detail = "evidence_packet passed"
-    elif evidence_status in {"fail", "blocked"}:
-        status = f"verifier_{evidence_status}"
-        detail = f"evidence_packet {evidence_status}"
-
     release_result = _read_db_artifact_fact(base_dir=base_dir, issue_number=issue_number, artifact_kind="release_result")
-    release_status = str(release_result.get("status") or "").strip().lower()
-    merge_payload_raw = release_result.get("merge")
-    merge_payload = cast(dict[str, object], merge_payload_raw) if isinstance(merge_payload_raw, dict) else {}
-    merged = bool(release_result.get("merged")) or bool(merge_payload.get("merged"))
-    if merged or release_status in {"success", "completed"}:
-        status = "merged"
-        detail = "release result indicates merged"
-    elif release_status in {"blocked", "failed"}:
-        blocked_reason = str(release_result.get("blocked_reason") or "").strip()
-        status = f"release_{blocked_reason or release_status}"
-        detail = f"release result {release_status}"
 
     return {
         "status": status,
@@ -1869,11 +1916,20 @@ def _sync_github_projection_bundle(
     updated_at: str,
 ) -> None:
     sync_commands = {
+        "labels": f"start-issue:{issue_number}:{phase}:labels",
         "body": f"start-issue:{issue_number}:{phase}:body",
         "comment": f"start-issue:{issue_number}:{phase}:status-comment",
         "project": f"start-issue:{issue_number}:{phase}:project-fields",
     }
     sync_errors: list[tuple[str, str]] = []
+    label_error = _sync_projected_issue_labels(
+        base_dir=base_dir,
+        issue_number=issue_number,
+        command_id=sync_commands["labels"],
+        updated_at=updated_at,
+    )
+    if label_error:
+        sync_errors.append(("labels", label_error))
     body_error = _sync_issue_body_projection(
         base_dir=base_dir,
         issue_number=issue_number,
@@ -2683,7 +2739,7 @@ def claim_issue_execution(
         branch=branch,
         source_session_id=source_session_id,
         now=_now,
-        sync_progress_label=_sync_issue_progress_label,
+        sync_progress_label=_sync_projected_issue_labels,
         transition_state=_transition_issue_state_if_possible,
         updated_at=updated_at,
     )
@@ -2704,7 +2760,7 @@ def release_issue_execution(
         issue_number=issue_number,
         restore_ready_for_agent=restore_ready_for_agent,
         now=_now,
-        sync_progress_label=_sync_issue_progress_label,
+        sync_progress_label=_sync_projected_issue_labels,
         sync_local_main_after_release_merge=cast(Callable[..., str], _lifecycle_helpers.sync_local_main_after_release_merge),
         close_github_issue_after_release_merge=_close_github_issue_after_release_merge,
         cleanup_issue_worktree_after_release_merge=cast(
@@ -2730,7 +2786,7 @@ def quarantine_issue_execution(
         issue_number=issue_number,
         reason=reason,
         now=_now,
-        sync_progress_label=_sync_issue_progress_label,
+        sync_progress_label=_sync_projected_issue_labels,
         transition_state=_transition_issue_state_if_possible,
         updated_at=updated_at,
     )
@@ -2749,7 +2805,7 @@ def resume_quarantined_issue_execution(
         issue_number=issue_number,
         reason=reason,
         now=_now,
-        sync_progress_label=_sync_issue_progress_label,
+        sync_progress_label=_sync_projected_issue_labels,
         transition_state=_transition_issue_state_if_possible,
         updated_at=updated_at,
     )
@@ -2772,7 +2828,7 @@ def redispatch_quarantined_issue_execution(
         source_session_id=source_session_id,
         reason=reason,
         now=_now,
-        sync_progress_label=_sync_issue_progress_label,
+        sync_progress_label=_sync_projected_issue_labels,
         transition_state=_transition_issue_state_if_possible,
         updated_at=updated_at,
     )
@@ -3055,11 +3111,9 @@ def _dispatch_request_via_db(
                     "recordedAt": recorded_at,
                 },
             )
-            sync_error = _sync_issue_progress_label(
+            sync_error = _sync_projected_issue_labels(
                 base_dir=base_dir,
                 issue_number=request["issueNumber"],
-                add_labels=[AGENT_IN_PROGRESS_LABEL],
-                remove_labels=[AGENT_DISPATCHING_LABEL],
                 command_id=f"{dispatch_command_id}:running-labels",
                 updated_at=dispatch_timestamp,
             )
@@ -3117,11 +3171,9 @@ def _dispatch_request_via_db(
                     updated_at=failure_updated_at,
                     current_session_id="",
                 )
-                _ = _sync_issue_progress_label(
+                _ = _sync_projected_issue_labels(
                     base_dir=base_dir,
                     issue_number=request["issueNumber"],
-                    add_labels=[QUARANTINED_LABEL],
-                    remove_labels=[READY_FOR_AGENT_LABEL, AGENT_DISPATCHING_LABEL, AGENT_IN_PROGRESS_LABEL],
                     command_id=f"{dispatch_command_id}:quarantine-labels",
                     updated_at=failure_updated_at,
                 )
@@ -3568,11 +3620,9 @@ def retry_failed_issue_execution(
         updated_at=timestamp,
         current_session_id="",
     )
-    sync_error = _sync_issue_progress_label(
+    sync_error = _sync_projected_issue_labels(
         base_dir=base_dir,
         issue_number=issue_number,
-        add_labels=[READY_FOR_AGENT_LABEL],
-        remove_labels=[AGENT_DISPATCHING_LABEL, AGENT_IN_PROGRESS_LABEL, QUARANTINED_LABEL],
         command_id=command_id,
         updated_at=timestamp,
     )
@@ -3636,11 +3686,9 @@ def clear_ready_issue_session_fence(
         updated_at=timestamp,
         current_session_id="",
     )
-    sync_error = _sync_issue_progress_label(
+    sync_error = _sync_projected_issue_labels(
         base_dir=base_dir,
         issue_number=issue_number,
-        add_labels=[READY_FOR_AGENT_LABEL],
-        remove_labels=[AGENT_DISPATCHING_LABEL, AGENT_IN_PROGRESS_LABEL, QUARANTINED_LABEL],
         command_id=command_id,
         updated_at=timestamp,
     )

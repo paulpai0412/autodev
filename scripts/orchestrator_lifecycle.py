@@ -34,10 +34,6 @@ CloseGitHubIssueAfterReleaseMerge = Callable[..., str]
 CleanupIssueWorktreeAfterReleaseMerge = Callable[..., str]
 
 
-READY_FOR_AGENT_LABEL = "ready-for-agent"
-AGENT_DISPATCHING_LABEL = "agent-dispatching"
-AGENT_IN_PROGRESS_LABEL = "agent-in-progress"
-QUARANTINED_LABEL = "quarantined"
 PROJECTION_BODY_START = "<!-- autodev:projection:start -->"
 PROJECTION_BODY_END = "<!-- autodev:projection:end -->"
 STATUS_COMMENT_MARKER = "<!-- autodev:status-comment -->"
@@ -1038,8 +1034,6 @@ def claim_issue_execution(
     sync_error = sync_progress_label(
         base_dir=base_dir,
         issue_number=issue_number,
-        add_labels=[AGENT_DISPATCHING_LABEL],
-        remove_labels=[READY_FOR_AGENT_LABEL],
         command_id=command_id,
         updated_at=timestamp,
     )
@@ -1073,16 +1067,10 @@ def release_issue_execution(
     timestamp = now(updated_at)
     ensure_control_plane_db(base_dir)
 
-    remove_labels = [AGENT_DISPATCHING_LABEL, AGENT_IN_PROGRESS_LABEL, QUARANTINED_LABEL]
-    if not restore_ready_for_agent:
-        remove_labels = [READY_FOR_AGENT_LABEL, *remove_labels]
-    add_labels = [READY_FOR_AGENT_LABEL] if restore_ready_for_agent else []
     command_id = uuid4().hex
     _ = sync_progress_label(
         base_dir=base_dir,
         issue_number=issue_number,
-        add_labels=add_labels,
-        remove_labels=remove_labels,
         command_id=command_id,
         updated_at=timestamp,
     )
@@ -1339,8 +1327,6 @@ def quarantine_issue_execution(
     _ = sync_progress_label(
         base_dir=base_dir,
         issue_number=issue_number,
-        add_labels=[QUARANTINED_LABEL],
-        remove_labels=[READY_FOR_AGENT_LABEL, AGENT_IN_PROGRESS_LABEL, AGENT_DISPATCHING_LABEL],
         command_id=uuid4().hex,
         updated_at=timestamp,
     )
@@ -1370,8 +1356,6 @@ def resume_quarantined_issue_execution(
     _ = sync_progress_label(
         base_dir=base_dir,
         issue_number=issue_number,
-        add_labels=[AGENT_IN_PROGRESS_LABEL],
-        remove_labels=[READY_FOR_AGENT_LABEL, QUARANTINED_LABEL, AGENT_DISPATCHING_LABEL],
         command_id=uuid4().hex,
         updated_at=timestamp,
     )
@@ -1425,8 +1409,6 @@ def redispatch_quarantined_issue_execution(
     sync_error = sync_progress_label(
         base_dir=base_dir,
         issue_number=issue_number,
-        add_labels=[AGENT_DISPATCHING_LABEL],
-        remove_labels=[READY_FOR_AGENT_LABEL, QUARANTINED_LABEL, AGENT_IN_PROGRESS_LABEL],
         command_id=f"{command_id}:dispatching-labels",
         updated_at=timestamp,
     )

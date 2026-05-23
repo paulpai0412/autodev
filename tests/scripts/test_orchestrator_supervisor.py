@@ -1145,9 +1145,96 @@ def test_sync_project_fields_projection_includes_pr_workflow_status(tmp_path: Pa
         )
 
     assert error == ""
-    assert captured_fields["PVTF_state"] == "running"
+    assert captured_fields["PVTF_state"] == "in progress"
     assert captured_fields["PVTF_stage"] == ""
     assert captured_fields["PVTF_pr_workflow"] == "verifier_passed"
+
+
+def test_sync_project_fields_projection_sets_release_pending_pr_workflow_to_verifier_passed(tmp_path: Path):
+    _ingest_issue_packet_text(tmp_path, "42", SAMPLE_ISSUE_PACKET)
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="release_pending",
+        command_id="cmd-release-pending",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_session_id="ses-release-42",
+    )
+    orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:01:00+08:00",
+        runtime_context={
+            "github_project_id": "PVT_project_1",
+            "github_project_field_ids": {
+                "state": "PVTF_state",
+                "stage": "PVTF_stage",
+                "pr_workflow": "PVTF_pr_workflow",
+            },
+        },
+    )
+
+    captured_fields: dict[str, str] = {}
+
+    def fake_sync_fields(*, fields: dict[str, str], **_kwargs: object) -> str:
+        captured_fields.update(fields)
+        return ""
+
+    with patch("scripts.orchestrator_supervisor._read_project_github_repo", return_value="example/repo"), patch(
+        "scripts.orchestrator_supervisor._lifecycle_helpers.sync_project_fields_projection",
+        side_effect=fake_sync_fields,
+    ):
+        error = orchestrator_supervisor._sync_project_fields_projection(
+            base_dir=tmp_path,
+            issue_number="42",
+            command_id="cmd-project-sync",
+            updated_at="2026-05-07T17:03:00+08:00",
+        )
+
+    assert error == ""
+    assert captured_fields["PVTF_state"] == "in review"
+    assert captured_fields["PVTF_pr_workflow"] == "verifier_passed"
+
+
+def test_sync_projected_issue_labels_uses_autodev_yaml_override_for_release_pending(tmp_path: Path):
+    _ingest_issue_packet_text(tmp_path, "42", SAMPLE_ISSUE_PACKET)
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="release_pending",
+        command_id="cmd-release-pending",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_session_id="ses-release-42",
+    )
+    config_path = tmp_path / ".autodev.yaml"
+    _ = config_path.write_text(
+        '\n'.join(
+            [
+                'schema_version: "1.0"',
+                'project:',
+                '  name: demo',
+                '  root: /tmp/demo',
+                '  github_repo: example/repo',
+                'state_projection:',
+                '  sqlite_to_primary_label:',
+                '    release_pending: agent-in-review',
+                '',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value="") as sync_labels:
+        error = orchestrator_supervisor._sync_projected_issue_labels(
+            base_dir=tmp_path,
+            issue_number="42",
+            command_id="cmd-project-sync",
+            updated_at="2026-05-07T17:03:00+08:00",
+        )
+
+    assert error == ""
+    sync_kwargs = sync_labels.call_args.kwargs
+    assert sync_kwargs["add_labels"] == ["agent-in-review", "pr-verifier-passed"]
 
 
 def test_inspect_project_pr_workflow_reflects_merged_release(tmp_path: Path):
@@ -3700,8 +3787,9 @@ def test_release_issue_execution_clears_session_ids_on_completed_terminal_state(
     assert "status" not in artifact_refs
     sync_labels.assert_called_once()
     sync_kwargs = sync_labels.call_args.kwargs
-    assert sync_kwargs["add_labels"] == []
-    assert sync_kwargs["remove_labels"] == ["ready-for-agent", "agent-dispatching", "agent-in-progress", "quarantined"]
+    assert sync_kwargs["add_labels"] == ["agent-in-progress", "pr-opened"]
+    assert "ready-for-agent" in sync_kwargs["remove_labels"]
+    assert "agent-dispatching" in sync_kwargs["remove_labels"]
 
 
 def test_release_issue_execution_clears_session_ids_on_failed_terminal_state(tmp_path: Path):
@@ -3745,8 +3833,9 @@ def test_release_issue_execution_clears_session_ids_on_failed_terminal_state(tmp
     assert "status" not in artifact_refs
     sync_labels.assert_called_once()
     sync_kwargs = sync_labels.call_args.kwargs
-    assert sync_kwargs["add_labels"] == []
-    assert sync_kwargs["remove_labels"] == ["ready-for-agent", "agent-dispatching", "agent-in-progress", "quarantined"]
+    assert sync_kwargs["add_labels"] == ["agent-in-progress", "pr-not-opened"]
+    assert "ready-for-agent" in sync_kwargs["remove_labels"]
+    assert "agent-dispatching" in sync_kwargs["remove_labels"]
 
 
 def test_release_issue_execution_returns_release_pending_to_verified_for_non_terminal_release_block(tmp_path: Path):
@@ -3790,8 +3879,9 @@ def test_release_issue_execution_returns_release_pending_to_verified_for_non_ter
     assert "status" not in artifact_refs
     sync_labels.assert_called_once()
     sync_kwargs = sync_labels.call_args.kwargs
-    assert sync_kwargs["add_labels"] == []
-    assert sync_kwargs["remove_labels"] == ["ready-for-agent", "agent-dispatching", "agent-in-progress", "quarantined"]
+    assert sync_kwargs["add_labels"] == ["agent-in-progress", "pr-verifier-passed"]
+    assert "ready-for-agent" in sync_kwargs["remove_labels"]
+    assert "agent-dispatching" in sync_kwargs["remove_labels"]
 
 
 def test_release_issue_execution_completed_syncs_local_main_and_branch(tmp_path: Path):
@@ -4181,7 +4271,7 @@ def test_retry_github_sync_command_rejects_stale_failed_attempt(tmp_path: Path):
         tmp_path,
         command_id="cmd-new",
         issue_number="42",
-        add_labels=["quarantined"],
+        add_labels=["agent-in-review"],
         remove_labels=["agent-in-progress"],
         status="failed",
         updated_at="2026-05-07T17:03:00+08:00",
@@ -5557,8 +5647,9 @@ def test_resume_quarantined_issue_execution_restores_running(tmp_path: Path):
     assert issue["state"] == "running"
     sync_labels.assert_called_once()
     sync_kwargs = sync_labels.call_args.kwargs
-    assert sync_kwargs["add_labels"] == ["agent-in-progress"]
-    assert sync_kwargs["remove_labels"] == ["ready-for-agent", "quarantined", "agent-dispatching"]
+    assert sync_kwargs["add_labels"] == ["agent-in-progress", "pr-not-opened"]
+    assert "ready-for-agent" in sync_kwargs["remove_labels"]
+    assert "agent-dispatching" in sync_kwargs["remove_labels"]
 
 
 def test_redispatch_quarantined_command_creates_fresh_root_session(tmp_path: Path, capsys) -> None:
@@ -5608,8 +5699,9 @@ def test_redispatch_quarantined_command_creates_fresh_root_session(tmp_path: Pat
     assert artifact_refs["status"] == "root_session_started"
     assert sync_labels.call_count >= 2
     dispatch_sync_kwargs = sync_labels.call_args_list[0].kwargs
-    assert dispatch_sync_kwargs["add_labels"] == ["agent-dispatching"]
-    assert dispatch_sync_kwargs["remove_labels"] == ["ready-for-agent", "quarantined", "agent-in-progress"]
+    assert dispatch_sync_kwargs["add_labels"] == ["agent-dispatching", "pr-not-opened"]
+    assert "ready-for-agent" in dispatch_sync_kwargs["remove_labels"]
+    assert "agent-in-progress" in dispatch_sync_kwargs["remove_labels"]
 
 
 def test_redispatch_quarantined_command_does_not_write_legacy_runtime_files(tmp_path: Path) -> None:
@@ -5733,8 +5825,10 @@ def test_dispatch_failure_quarantine_rollback_removes_ready_label(tmp_path: Path
 
     assert sync_labels.call_count == 1
     sync_kwargs = sync_labels.call_args.kwargs
-    assert sync_kwargs["add_labels"] == ["quarantined"]
-    assert sync_kwargs["remove_labels"] == ["ready-for-agent", "agent-dispatching", "agent-in-progress"]
+    assert sync_kwargs["add_labels"] == ["agent-in-review", "pr-verifier-blocked"]
+    assert "ready-for-agent" in sync_kwargs["remove_labels"]
+    assert "agent-dispatching" in sync_kwargs["remove_labels"]
+    assert "agent-in-progress" in sync_kwargs["remove_labels"]
 
 
 def test_fail_quarantined_issue_execution_marks_issue_failed(tmp_path: Path):
