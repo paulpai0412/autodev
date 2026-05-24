@@ -188,10 +188,14 @@ def test_build_prompt_for_pr_verifier_requires_evidence_packet_before_completion
 
     assert "Persist verifier acceptance or failure as an evidence_packet via submit-artifact" in prompt
     assert "Evidence payload contract" in prompt
+    assert "include pr_number and base_branch as TOP-LEVEL evidence_packet fields" in prompt
     assert "gates.surface_qa_gate must be an object {status: 'pass', evidence_ref: '<non-empty>', evidence_kind: 'browser'}" in prompt
+    assert "not a prose description" in prompt
     assert "Do not stop, summarize, or report verification progress until the evidence_packet payload is stored in SQLite" in prompt
     assert "Immediately after submit-artifact for evidence_packet, run inspect" in prompt
     assert "Inspect command: python3 scripts/orchestrator_supervisor.py inspect --base-dir" in prompt
+    assert "artifact_status_json.evidence_packet.parse_ok=true" in prompt
+    assert "browser evidence_ref file is missing" in prompt
     assert "If inspect does not show persisted evidence_packet" in prompt
     assert "Only return after SQLite persistence is visible via inspect" in prompt
     assert 'load_skills containing "review-work"' in prompt
@@ -255,9 +259,9 @@ def test_build_prompt_for_pr_verifier_owns_formal_pr_creation() -> None:
     )
 
     assert "create or record the formal PR" in prompt
-    assert "include pr_number in the evidence_packet payload" in prompt
+    assert "include top-level pr_number in the evidence_packet payload" in prompt
     assert "head branch agent/issue-18-demo and base branch agent/issue-17-parent" in prompt
-    assert "include base_branch in the evidence_packet payload" in prompt
+    assert "include top-level base_branch in the evidence_packet payload" in prompt
 
 
 def test_build_prompt_for_local_seeded_issue_avoids_github_issue_assumptions() -> None:
