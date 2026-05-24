@@ -407,6 +407,15 @@ def _to_worktree_relative_or_staged_path(*, base_dir: Path, issue_number: str, e
     return cleaned_ref
 
 
+def _browser_evidence_ref_is_path_like(evidence_ref: str) -> bool:
+    cleaned_ref = _strip_evidence_ref_suffix(evidence_ref)
+    if not cleaned_ref or cleaned_ref.startswith("db:"):
+        return True
+
+    decoded_ref = _decode_supported_evidence_uri(cleaned_ref)
+    return "/" in decoded_ref or "\\" in decoded_ref or "." in Path(decoded_ref).name
+
+
 def _normalize_evidence_packet_refs(*, base_dir: Path, issue_number: str, payload: JsonObject) -> None:
     status = str(payload.get("status") or "").strip().lower()
     if status != "pass":
@@ -481,6 +490,15 @@ def _validated_artifact_payload(*, base_dir: Path, issue_number: str, artifact_k
     normalized_payload["status"] = status
 
     if artifact_kind == "evidence_packet":
+        subject_raw = normalized_payload.get("subject")
+        if isinstance(subject_raw, dict):
+            subject = cast(dict[str, object], subject_raw)
+            subject_pr_number = str(subject.get("pr_number") or subject.get("prNumber") or "").strip()
+            if subject_pr_number and not str(normalized_payload.get("pr_number") or "").strip():
+                normalized_payload["pr_number"] = subject_pr_number
+            subject_base_branch = str(subject.get("base_branch") or subject.get("baseBranch") or "").strip()
+            if subject_base_branch and not str(normalized_payload.get("base_branch") or "").strip():
+                normalized_payload["base_branch"] = subject_base_branch
         _normalize_evidence_packet_refs(base_dir=base_dir, issue_number=issue_number, payload=normalized_payload)
         if status == "pass":
             gates_raw = normalized_payload.get("gates")
@@ -493,6 +511,12 @@ def _validated_artifact_payload(*, base_dir: Path, issue_number: str, artifact_k
             evidence_ref = str(surface_gate.get("evidence_ref") or "").strip()
             if not evidence_ref:
                 raise ValueError("evidence_packet payload requires non-empty string field 'gates.surface_qa_gate.evidence_ref' when status is pass")
+            evidence_kind = str(surface_gate.get("evidence_kind") or "").strip().lower()
+            if evidence_kind == "browser" and not _browser_evidence_ref_is_path_like(evidence_ref):
+                raise ValueError(
+                    "evidence_packet browser surface_qa_gate.evidence_ref must be a worktree file path, "
+                    "not a prose description, when status is pass"
+                )
 
     if artifact_kind == "worker_result":
         branch = str(normalized_payload.get("branch") or "").strip()

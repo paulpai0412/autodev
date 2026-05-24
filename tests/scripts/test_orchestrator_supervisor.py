@@ -5397,6 +5397,62 @@ def test_reconcile_verifier_pass_without_evidence_pr_number_retries_verifier(tmp
     assert latest_pr_opened is None
 
 
+def test_submit_evidence_packet_promotes_subject_pr_binding_to_top_level(tmp_path: Path):
+    orchestrator_supervisor.ensure_issue_row(tmp_path, issue_number="42", updated_at="2026-05-07T17:00:00+08:00")
+
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="evidence_packet",
+        payload={
+            "status": "pass",
+            "subject": {
+                "issue": "42",
+                "pr_number": "77",
+                "base_branch": "main",
+            },
+            "verifier_session_id": "ses-v",
+            "next_recommended_step": "Release it",
+            "gates": {"surface_qa_gate": {"status": "pass", "evidence_ref": "db:evidence:42"}},
+        },
+        updated_at="2026-05-07T17:11:00+08:00",
+    )
+
+    issue = read_issue(tmp_path, "42")
+    artifact_status = _artifact_status(issue)
+    evidence_packet = cast(dict[str, object], artifact_status["evidence_packet"])
+
+    assert evidence_packet["parse_ok"] is True
+    assert evidence_packet["pr_number"] == "77"
+    assert evidence_packet["base_branch"] == "main"
+
+
+def test_submit_evidence_packet_rejects_prose_browser_evidence_ref(tmp_path: Path):
+    orchestrator_supervisor.ensure_issue_row(tmp_path, issue_number="42", updated_at="2026-05-07T17:00:00+08:00")
+
+    with pytest.raises(ValueError, match="not a prose description"):
+        _submit_artifact(
+            tmp_path,
+            issue_number="42",
+            artifact_kind="evidence_packet",
+            payload={
+                "status": "pass",
+                "pr_number": "77",
+                "base_branch": "main",
+                "verifier_session_id": "ses-v",
+                "next_recommended_step": "Release it",
+                "gates": {
+                    "surface_qa_gate": {
+                        "status": "pass",
+                        "evidence_ref": "Playwright headless browser run verified happy path",
+                        "evidence_kind": "browser",
+                    }
+                },
+            },
+            updated_at="2026-05-07T17:11:00+08:00",
+        )
+
+
 def test_reconcile_verifier_pass_with_mismatched_pr_number_retries_verifier(tmp_path: Path):
     issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")

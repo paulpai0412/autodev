@@ -87,6 +87,9 @@ def run() -> None:
         assert worker_ref.startswith("db:worker_result:history:")
 
         # 4) Successful pass evidence updates artifact_refs_json.evidence_packet_ref.
+        browser_report = base_dir / "artifacts/browser/report.html"
+        browser_report.parent.mkdir(parents=True, exist_ok=True)
+        browser_report.write_text("<html>browser evidence</html>", encoding="utf-8")
         orchestrator_supervisor.submit_artifact(
             base_dir=base_dir,
             issue_number=issue_number,
@@ -99,6 +102,7 @@ def run() -> None:
                     "surface_qa_gate": {
                         "status": "pass",
                         "evidence_ref": "artifacts/browser/report.html",
+                        "evidence_kind": "browser",
                     }
                 },
             },
