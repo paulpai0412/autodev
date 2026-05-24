@@ -2,22 +2,22 @@ schema_version: "1.0"
 kind: evidence_packet
 line_cap: 60
 raw_evidence_policy: index_only_manifest_no_raw_logs_or_traces
-
+pr_number: "<pr-number-or-empty>"
+base_branch: "<base-branch-or-empty>"
 subject:
   type: "<issue_pr|phase>"
   issue_number: "<issue-number-or-empty>"
   pr_number: "<pr-number-or-empty>"
+  base_branch: "<base-branch-or-empty>"
   phase: "<phase-name-or-empty>"
   branch: "<branch-name>"
   sha: "<commit-sha>"
-
 verifier:
   actor: "<verifier-worker-session-or-agent-name>"
   actor_role: "pr_verifier"
   verifier_session_id: "<session-id-or-artifact-ref>"
   started_at: "<ISO-8601 timestamp>"
   completed_at: "<ISO-8601 timestamp>"
-
 proof_of_separation:
   worker_result_ref: "<worker-result-artifact-ref>"
   worker_actor: "<worker-session-or-agent-name>"
@@ -29,15 +29,13 @@ proof_of_separation:
   verifier_read_worker_result_only: true
 status: "<pass|blocked|fail>"
 failure_classification: {kind: "<none|contract_invalid|transient_tool_failure|verification_failed|spec_drift|dependency_blocked>", retryable: true, routed_to: "<issue_worker|pr_verifier|release_worker|main_orchestrator|none>", root_cause_signature: "<stable-signature-or-none>"}
-
 test_case_verification: {applies: false, test_case_id: "<E2E-id-or-empty>", target_case: "<pass|blocked|fail|n/a>", regression_bucket: "<pass|blocked|fail|n/a>", failure_signature: "<stable-signature-or-none>", artifact_manifest_ref: "<bundle-ref-or-empty>"}
-
 acceptance_criteria_matrix:
   - {ac_id: "AC1", status: "<pass|blocked|fail>", evidence_ref: "<artifact-id-or-handoff-path>", note: "<one-line observed result>"}
 
 gates:
   diagnostics_and_build_gate: {status: "<pass|not_applicable|blocked|fail>", evidence_ref: "<artifact-id-or-check-run-url>"}
-  surface_qa_gate: {status: "<pass|not_applicable|blocked|fail>", evidence_ref: "<artifact-id-or-check-run-url>"}
+  surface_qa_gate: {status: "<pass|not_applicable|blocked|fail>", evidence_ref: "<worktree-relative-browser-report-path>", evidence_kind: "<browser|manual|cli|not_applicable>"}
   review_gate: {status: "<pass|not_applicable|blocked|fail>", evidence_ref: "<artifact-id-or-check-run-url>"}
   security_gate: {status: "<pass|not_applicable|blocked|fail>", evidence_ref: "<artifact-id-or-check-run-url>"}
 

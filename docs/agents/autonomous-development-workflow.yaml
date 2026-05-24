@@ -640,6 +640,8 @@ evidence_packet_policy:
     main_agent_consumes: evidence_packet_index_only
     raw_evidence_policy: index_only_no_raw_logs_or_traces_in_repo_docs
   required_fields:
+    - pr_number_when_subject_is_issue_pr
+    - base_branch_when_subject_is_issue_pr
     - subject
     - verifier
     - proof_of_separation
@@ -1082,6 +1084,8 @@ evidence_templates:
     - evidence_packet_refs
     - role_boundary
   evidence_packet_fields:
+    - pr_number_when_subject_is_issue_pr
+    - base_branch_when_subject_is_issue_pr
     - subject
     - verifier
     - proof_of_separation

@@ -70,6 +70,14 @@ AUTODEV_HOME="${AUTODEV_HOME:-~/apps/autodev}" PYTHONPATH="$AUTODEV_HOME" python
 
 Reconcile must treat SQLite artifact facts as authoritative and avoid runtime YAML/JSON artifact gates.
 
+For `evidence_packet` facts produced by `pr_verifier` on an issue PR, verifier preflight must confirm before returning:
+
+- top-level `pr_number` and `base_branch` are present, with the same values mirrored under `subject` when `subject` is an object;
+- `artifact_status_json.evidence_packet.parse_ok` is `true` after `inspect`;
+- when `browser_e2e_gate` is required and `surface_qa_gate.status=pass`, `gates.surface_qa_gate.evidence_ref` is an existing worktree-relative file path such as `artifacts/browser-e2e/report.json`, not a prose description.
+
+If any preflight check fails, the same verifier session must repair and re-submit the artifact before returning control.
+
 ## Dispatch policy
 
 - Child subagents run from the same root orchestrator session in foreground (`run_in_background=false`) when executing issue_worker/pr_verifier steps.
