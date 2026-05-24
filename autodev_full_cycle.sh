@@ -7,29 +7,79 @@ set -u
 # Runs until no open GitHub issues remain (or max cycles reached).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-AUTODEV_HOME="${AUTODEV_HOME:-$SCRIPT_DIR}"
+AUTODEV_HOME="${AUTODEV_HOME:-}"
 PROJECT_ROOT="${PROJECT_ROOT:-}"
 REPO="${REPO:-}"
-INTERVAL_SECONDS="${INTERVAL_SECONDS:-180}"
-MAX_CYCLES="${MAX_CYCLES:-0}" # 0 = infinite
-AUTO_APPROVE_RELEASE="${AUTO_APPROVE_RELEASE:-1}"
-AUTO_LABEL_READY="${AUTO_LABEL_READY:-0}" # 1 => add ready-for-agent to all open issues
-HEARTBEAT_SECONDS="${HEARTBEAT_SECONDS:-10}"
+INTERVAL_SECONDS="${INTERVAL_SECONDS:-}"
+MAX_CYCLES="${MAX_CYCLES:-}" # 0 = infinite
+AUTO_APPROVE_RELEASE="${AUTO_APPROVE_RELEASE:-}"
+AUTO_LABEL_READY="${AUTO_LABEL_READY:-}" # 1 => add ready-for-agent to all open issues
+HEARTBEAT_SECONDS="${HEARTBEAT_SECONDS:-}"
 
 # Force non-interactive output in shell dashboards (avoid pager freeze on gh lists).
 export GH_PAGER="${GH_PAGER:-cat}"
 export PAGER="${PAGER:-cat}"
 export GIT_PAGER="${GIT_PAGER:-cat}"
 
-AUTODEV_PROJECT_PY="$AUTODEV_HOME/scripts/autodev_project.py"
-INTAKE_PY="$AUTODEV_HOME/scripts/issue_packet_intake.py"
-SUPERVISOR_PY="$AUTODEV_HOME/scripts/orchestrator_supervisor.py"
+AUTODEV_PROJECT_PY=""
+INTAKE_PY=""
+SUPERVISOR_PY=""
 DB_PATH=""
 STATE_DIR=""
 
-RESUME_MAX_ATTEMPTS="${RESUME_MAX_ATTEMPTS:-2}"
-REDISPATCH_MAX_ATTEMPTS="${REDISPATCH_MAX_ATTEMPTS:-2}"
-AUTO_FAIL_QUARANTINED="${AUTO_FAIL_QUARANTINED:-1}"
+RESUME_MAX_ATTEMPTS="${RESUME_MAX_ATTEMPTS:-}"
+REDISPATCH_MAX_ATTEMPTS="${REDISPATCH_MAX_ATTEMPTS:-}"
+AUTO_FAIL_QUARANTINED="${AUTO_FAIL_QUARANTINED:-}"
+
+apply_runtime_defaults() {
+  AUTODEV_HOME="${AUTODEV_HOME:-$SCRIPT_DIR}"
+  INTERVAL_SECONDS="${INTERVAL_SECONDS:-180}"
+  MAX_CYCLES="${MAX_CYCLES:-0}"
+  AUTO_APPROVE_RELEASE="${AUTO_APPROVE_RELEASE:-1}"
+  AUTO_LABEL_READY="${AUTO_LABEL_READY:-0}"
+  HEARTBEAT_SECONDS="${HEARTBEAT_SECONDS:-10}"
+  RESUME_MAX_ATTEMPTS="${RESUME_MAX_ATTEMPTS:-2}"
+  REDISPATCH_MAX_ATTEMPTS="${REDISPATCH_MAX_ATTEMPTS:-2}"
+  AUTO_FAIL_QUARANTINED="${AUTO_FAIL_QUARANTINED:-1}"
+}
+
+refresh_autodev_script_paths() {
+  AUTODEV_PROJECT_PY="$AUTODEV_HOME/scripts/autodev_project.py"
+  INTAKE_PY="$AUTODEV_HOME/scripts/issue_packet_intake.py"
+  SUPERVISOR_PY="$AUTODEV_HOME/scripts/orchestrator_supervisor.py"
+}
+
+load_consumer_env_file() {
+  local root="$1"
+  local env_file="$root/.env"
+  if [ ! -f "$env_file" ]; then
+    return 0
+  fi
+
+  local had_nounset=0
+  case $- in
+    *u*)
+      had_nounset=1
+      set +u
+      ;;
+  esac
+
+  set -a
+  # shellcheck disable=SC1090
+  if ! . "$env_file"; then
+    set +a
+    if [ "$had_nounset" -eq 1 ]; then
+      set -u
+    fi
+    log "ERROR: failed to load consumer .env: $env_file"
+    exit 1
+  fi
+  set +a
+
+  if [ "$had_nounset" -eq 1 ]; then
+    set -u
+  fi
+}
 
 resolve_consumer_project_root() {
   local start
@@ -145,8 +195,10 @@ PY
 
 resolve_repo() {
   local root="$1"
-  if [ -n "${REPO:-}" ]; then
-    printf '%s' "$REPO"
+  local from_config
+  from_config=$(read_repo_from_autodev_yaml "$root")
+  if [ -n "$from_config" ]; then
+    printf '%s' "$from_config"
     return 0
   fi
 
@@ -157,10 +209,8 @@ resolve_repo() {
     return 0
   fi
 
-  local from_config
-  from_config=$(read_repo_from_autodev_yaml "$root")
-  if [ -n "$from_config" ]; then
-    printf '%s' "$from_config"
+  if [ -n "${REPO:-}" ]; then
+    printf '%s' "$REPO"
     return 0
   fi
 
@@ -176,12 +226,15 @@ resolve_repo() {
 
 initialize_runtime_context() {
   PROJECT_ROOT="$(resolve_consumer_project_root)"
+  load_consumer_env_file "$PROJECT_ROOT"
+  apply_runtime_defaults
+  refresh_autodev_script_paths
   REPO="$(resolve_repo "$PROJECT_ROOT")"
   DB_PATH="$PROJECT_ROOT/.opencode/runtime/control-plane.sqlite3"
   STATE_DIR="$PROJECT_ROOT/.opencode/runtime/full-cycle-state"
 
   if [ -z "$REPO" ]; then
-    log "ERROR: unable to resolve GitHub repo. Set REPO or AUTODEV_GITHUB_REPO, or configure project.github_repo in .autodev.yaml"
+    log "ERROR: unable to resolve GitHub repo from consumer project. Configure project.github_repo in .autodev.yaml, or set consumer .env AUTODEV_GITHUB_REPO, or set REPO"
     exit 1
   fi
 }
