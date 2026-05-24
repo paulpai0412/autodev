@@ -8,6 +8,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -17,6 +18,7 @@ from pathlib import Path
 from types import ModuleType
 from uuid import uuid4
 from typing import Callable, NotRequired, Protocol, TypedDict, cast
+from urllib.parse import unquote, urlparse
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -357,7 +359,107 @@ def _artifact_fact_ref(artifact_kind: str, persisted: dict[str, object]) -> str:
     return ""
 
 
-def _validated_artifact_payload(*, artifact_kind: str, payload: JsonObject) -> JsonObject:
+def _strip_evidence_ref_suffix(value: str) -> str:
+    return value.split("#", 1)[0].split("?", 1)[0].strip()
+
+
+def _decode_supported_evidence_uri(value: str) -> str:
+    parsed = urlparse(value)
+    if parsed.scheme not in {"file", "browser"}:
+        return value
+
+    decoded_path = unquote(parsed.path or "")
+    host = (parsed.netloc or "").strip()
+    if host and host not in {"localhost", "127.0.0.1"}:
+        decoded_path = f"//{host}{decoded_path}"
+
+    if len(decoded_path) >= 3 and decoded_path[0] == "/" and decoded_path[1].isalpha() and decoded_path[2] == ":":
+        decoded_path = decoded_path[1:]
+
+    return decoded_path or value
+
+
+def _to_worktree_relative_or_staged_path(*, base_dir: Path, issue_number: str, evidence_ref: str, evidence_kind: str) -> str:
+    cleaned_ref = _strip_evidence_ref_suffix(evidence_ref)
+    if not cleaned_ref or cleaned_ref.startswith("db:"):
+        return cleaned_ref
+
+    decoded_ref = _decode_supported_evidence_uri(cleaned_ref)
+    candidate = Path(decoded_ref)
+    absolute_candidate = candidate if candidate.is_absolute() else (base_dir / candidate)
+
+    try:
+        relative_candidate = absolute_candidate.resolve(strict=False).relative_to(base_dir.resolve(strict=False))
+        return relative_candidate.as_posix()
+    except ValueError:
+        pass
+
+    if absolute_candidate.exists() and absolute_candidate.is_file():
+        target_dir = base_dir / ".opencode" / "runtime" / "evidence" / f"issue-{issue_number}" / (evidence_kind or "artifact")
+        target_dir.mkdir(parents=True, exist_ok=True)
+        stat = absolute_candidate.stat()
+        digest = hashlib.sha256(f"{absolute_candidate}:{stat.st_size}:{stat.st_mtime_ns}".encode("utf-8")).hexdigest()[:12]
+        target_path = target_dir / f"{digest}-{absolute_candidate.name}"
+        if not target_path.exists():
+            shutil.copy2(absolute_candidate, target_path)
+        return target_path.relative_to(base_dir).as_posix()
+
+    return cleaned_ref
+
+
+def _normalize_evidence_packet_refs(*, base_dir: Path, issue_number: str, payload: JsonObject) -> None:
+    status = str(payload.get("status") or "").strip().lower()
+    if status != "pass":
+        return
+
+    gates_raw = payload.get("gates")
+    if not isinstance(gates_raw, dict):
+        return
+
+    surface_gate_raw = gates_raw.get("surface_qa_gate")
+    if not isinstance(surface_gate_raw, dict):
+        return
+
+    gates = dict(gates_raw)
+    surface_gate = dict(cast(dict[str, object], surface_gate_raw))
+    evidence_ref = str(surface_gate.get("evidence_ref") or "").strip()
+    if evidence_ref:
+        evidence_kind = str(surface_gate.get("evidence_kind") or "browser").strip().lower() or "browser"
+        normalized_ref = _to_worktree_relative_or_staged_path(
+            base_dir=base_dir,
+            issue_number=issue_number,
+            evidence_ref=evidence_ref,
+            evidence_kind=evidence_kind,
+        )
+        if normalized_ref and normalized_ref != evidence_ref:
+            surface_gate["evidence_ref"] = normalized_ref
+            gates["surface_qa_gate"] = surface_gate
+            payload["gates"] = gates
+
+    artifact_manifest_raw = payload.get("artifact_manifest")
+    if not isinstance(artifact_manifest_raw, list):
+        return
+
+    normalized_manifest: list[object] = []
+    changed = False
+    for entry in artifact_manifest_raw:
+        if isinstance(entry, str):
+            normalized_entry = _to_worktree_relative_or_staged_path(
+                base_dir=base_dir,
+                issue_number=issue_number,
+                evidence_ref=entry,
+                evidence_kind="browser",
+            )
+            normalized_manifest.append(normalized_entry)
+            changed = changed or normalized_entry != entry
+        else:
+            normalized_manifest.append(entry)
+
+    if changed:
+        payload["artifact_manifest"] = normalized_manifest
+
+
+def _validated_artifact_payload(*, base_dir: Path, issue_number: str, artifact_kind: str, payload: JsonObject) -> JsonObject:
     normalized_payload: JsonObject = dict(payload)
     status_raw = normalized_payload.get("status")
     if not isinstance(status_raw, str) or not status_raw.strip():
@@ -377,6 +479,20 @@ def _validated_artifact_payload(*, artifact_kind: str, payload: JsonObject) -> J
         )
 
     normalized_payload["status"] = status
+
+    if artifact_kind == "evidence_packet":
+        _normalize_evidence_packet_refs(base_dir=base_dir, issue_number=issue_number, payload=normalized_payload)
+        if status == "pass":
+            gates_raw = normalized_payload.get("gates")
+            if not isinstance(gates_raw, dict):
+                raise ValueError("evidence_packet payload requires object field 'gates' when status is pass")
+            surface_gate_raw = gates_raw.get("surface_qa_gate")
+            if not isinstance(surface_gate_raw, dict):
+                raise ValueError("evidence_packet payload requires object field 'gates.surface_qa_gate' when status is pass")
+            surface_gate = cast(dict[str, object], surface_gate_raw)
+            evidence_ref = str(surface_gate.get("evidence_ref") or "").strip()
+            if not evidence_ref:
+                raise ValueError("evidence_packet payload requires non-empty string field 'gates.surface_qa_gate.evidence_ref' when status is pass")
 
     if artifact_kind == "worker_result":
         branch = str(normalized_payload.get("branch") or "").strip()
@@ -608,6 +724,7 @@ RUNTIME_PHASE_PROJECTION_WHITELISTS: dict[str, set[tuple[str, str, str]]] = {
     "running": {
         ("main_orchestrator", "orchestrator_bootstrap", "running"),
         ("issue_worker", "issue_worker_execution", "queued"),
+        ("pr_verifier", "pr_verifier_execution", "queued"),
     },
     "verifying": {("pr_verifier", "pr_verifier_execution", "queued")},
 }
@@ -1252,6 +1369,11 @@ def start_issue(
         )
         # Persist the initial bootstrap -> issue_worker handoff in SQLite before the
         # first issue_worker launch so verifier evidence can come from the control plane.
+        ledger["current"] = {
+            "role": "main_orchestrator",
+            "stage": "orchestrator_bootstrap",
+            "status": "running",
+        }
         ledger["lastSessionResult"] = dict(session_result)
         _bump_ledger_revision(ledger, recorded_at)
         reconcile_ledger(
@@ -3956,7 +4078,12 @@ def submit_artifact(
     issue = read_issue(base_dir, issue_number)
     if issue is None:
         raise ValueError(f"unknown issue #{issue_number}")
-    normalized_payload = _validated_artifact_payload(artifact_kind=artifact_kind, payload=payload)
+    normalized_payload = _validated_artifact_payload(
+        base_dir=base_dir,
+        issue_number=issue_number,
+        artifact_kind=artifact_kind,
+        payload=payload,
+    )
     if artifact_kind in {"worker_result", "evidence_packet"}:
         pr_payload_raw = normalized_payload.get("pr")
         if isinstance(pr_payload_raw, dict):
@@ -4334,7 +4461,9 @@ def reconcile_ledger(
             reconcile_pr_verifier = cast(Callable[..., tuple[JsonObject, JsonObject, JsonObject | None]], _reconcile_helpers.reconcile_pr_verifier)
             next_ledger, decision, request = reconcile_pr_verifier(
                 ledger,
-                base_dir=base_dir,
+                # Use artifact lookup base so browser artifact evidence_ref is resolved
+                # against the issue worktree when verifier stores relative paths.
+                base_dir=artifact_lookup_base_dir,
                 issue=issue,
                 current=current,
                 attempts=attempts,
@@ -4348,6 +4477,7 @@ def reconcile_ledger(
                     issue_number=issue["number"],
                     artifact_kind=entry_type,
                 ),
+                read_session_outcome=lambda runtime_session_id: _default_host_adapter().read_session_outcome(runtime_session_id),
                 record_pr_opened=record_pr_opened,
                 record_current_verifier_session=_record_current_verifier_session,
                 transition_issue_state_if_possible=_transition_issue_state_if_possible,

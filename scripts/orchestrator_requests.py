@@ -188,6 +188,8 @@ def _pr_verifier_prompt_lines(
         "Read the DB-backed issue packet context and the persisted worker_result context before touching anything else.",
         "Persist verifier acceptance or failure as an evidence_packet via submit-artifact instead of writing YAML files.",
         "Evidence payload contract: gates.surface_qa_gate must be an object {status: 'pass', evidence_ref: '<non-empty>', evidence_kind: 'browser'} when browser_e2e_gate is required. Flat gate strings are not accepted.",
+        "For browser evidence_ref, prefer issue-worktree relative paths (for example artifacts/browser-e2e/report.json) so evidence stays portable across environments.",
+        "If your browser runtime returns browser:/ or file:// URIs, include them only when unavoidable; supervisor will normalize/stage them into worktree-managed evidence paths.",
         'Run pr_verifier with load_skills containing "review-work" for every verification run.',
         "If the worker changed web UI or static HTML surface files, browser_e2e_gate is mandatory before status=pass.",
         'When browser_e2e_gate is mandatory, include both "browser-qa" and "e2e-testing" in pr_verifier load_skills before executing checks.',

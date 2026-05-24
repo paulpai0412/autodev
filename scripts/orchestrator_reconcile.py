@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Callable, Protocol, cast
+from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
 
@@ -178,6 +179,17 @@ def _browser_surface_artifact_validation_deficiency(base_dir: Path, evidence_pac
         if normalized_ref == "db:":
             return "invalid evidence_ref: db reference is missing target"
         return ""
+
+    parsed_ref = urlparse(normalized_ref)
+    if parsed_ref.scheme in {"file", "browser"}:
+        decoded_path = unquote(parsed_ref.path or "")
+        host = (parsed_ref.netloc or "").strip()
+        if host and host not in {"localhost", "127.0.0.1"}:
+            decoded_path = f"//{host}{decoded_path}"
+        if len(decoded_path) >= 3 and decoded_path[0] == "/" and decoded_path[1].isalpha() and decoded_path[2] == ":":
+            decoded_path = decoded_path[1:]
+        if decoded_path:
+            normalized_ref = decoded_path
 
     artifact_path = Path(normalized_ref)
     if not artifact_path.is_absolute():
@@ -566,6 +578,7 @@ def reconcile_pr_verifier(
     read_issue: Callable[[Path, str], JsonObject | None],
     read_issue_packet: Callable[[Path, str], JsonObject],
     read_artifact_fact: Callable[[str], dict[str, object]],
+    read_session_outcome: Callable[[str], object | None],
     record_pr_opened: Callable[..., dict[str, object]],
     record_current_verifier_session: Callable[..., None],
     transition_issue_state_if_possible: Callable[..., None],
@@ -577,8 +590,39 @@ def reconcile_pr_verifier(
 ) -> ReconcileResult:
     issue_state = read_issue(base_dir, issue["number"])
     current_issue_state = str(issue_state.get("state") or "") if issue_state else ""
+    verifier_session_id = str(issue_state.get("current_session_id") or "") if issue_state else ""
     persisted_evidence = _stored_fact(artifacts, "evidence_packet", read_artifact_fact)
     if not bool(persisted_evidence.get("parse_ok")):
+        current_status = str(current.get("status") or "")
+        outcome_status = ""
+        session_terminal_without_artifact = False
+        if verifier_session_id and current_status in {"running", "queued"}:
+            outcome = read_session_outcome(verifier_session_id)
+            if isinstance(outcome, dict):
+                outcome_status = str(outcome.get("status") or "")
+            else:
+                outcome_status = str(getattr(outcome, "status", "") or "")
+            if outcome_status and outcome_status not in {"running", "queued", "unknown"}:
+                session_terminal_without_artifact = True
+        session_inflight = current_status == "running" or (
+            current_status == "queued" and outcome_status in {"running", "queued", "unknown"}
+        )
+        if session_inflight and not session_terminal_without_artifact:
+            summary = (
+                f"pr_verifier for issue #{issue['number']} is {current_status} and SQLite has not recorded "
+                "evidence_packet yet. Keep the queued/running dispatch state unchanged."
+            )
+            return (
+                ledger,
+                {
+                    "action": "no_change",
+                    "next_role": current.get("role") or "pr_verifier",
+                    "next_stage": current.get("stage") or "pr_verifier_execution",
+                    "summary": summary,
+                    "request_title": "",
+                },
+                None,
+            )
         summary = (
             f"pr_verifier for issue #{issue['number']} ended without recording evidence_packet in SQLite. "
             "Retry the verifier once before recovery."
