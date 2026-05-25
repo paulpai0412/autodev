@@ -748,6 +748,7 @@ RUNTIME_PHASE_PROJECTION_WHITELISTS: dict[str, set[tuple[str, str, str]]] = {
     "running": {
         ("main_orchestrator", "orchestrator_bootstrap", "running"),
         ("issue_worker", "issue_worker_execution", "queued"),
+        ("issue_worker", "issue_worker_repair", "queued"),
         ("pr_verifier", "pr_verifier_execution", "queued"),
     },
     "verifying": {("pr_verifier", "pr_verifier_execution", "queued")},
@@ -4472,6 +4473,7 @@ def reconcile_ledger(
                     issue_number=issue["number"],
                     artifact_kind=entry_type,
                 ),
+                record_pr_opened=record_pr_opened,
                 set_failure_func=_set_failure,
                 requeue_issue_worker_func=_requeue_issue_worker,
                 queue_orchestrator_recovery_func=_queue_orchestrator_recovery,
@@ -4479,6 +4481,25 @@ def reconcile_ledger(
                 subagent_decision_func=_subagent_decision,
             )
             _sync_runtime_phase_metadata(base_dir=base_dir, issue_number=_ledger_issue_number(next_ledger, issue["number"]), current=cast(dict[str, str], next_ledger["current"]), attempts=cast(dict[str, int], next_ledger.get("attempts", {})), limits=cast(dict[str, int], next_ledger.get("limits", {})), last_failure=cast(dict[str, object], next_ledger.get("lastFailure", {})), workflow=cast(dict[str, object], next_ledger.get("workflow", {})), automation=cast(dict[str, object], next_ledger.get("automation", {})), artifacts=cast(dict[str, object], next_ledger.get("artifacts", {})), queued_next_issue=cast(dict[str, object], next_ledger.get("queuedNextIssue", {})), updated_at=timestamp)
+            if str(cast(dict[str, object], decision).get("next_role") or "") == "pr_verifier":
+                sync_error = _sync_projected_issue_labels(
+                    base_dir=base_dir,
+                    issue_number=issue["number"],
+                    command_id=f"reconcile:{issue['number']}:issue-worker-pr-opened:labels",
+                    updated_at=timestamp,
+                )
+                if sync_error:
+                    record_admin_decision(
+                        base_dir,
+                        command_id=f"reconcile:{issue['number']}:issue-worker-pr-opened:labels:admin-failed",
+                        issue_number=issue["number"],
+                        decision_type="admin_github_projection_failure",
+                        reason=(
+                            f"GitHub projected label sync failed after worker_result success for issue #{issue['number']}: "
+                            f"{sync_error}"
+                        ),
+                        updated_at=timestamp,
+                    )
             return next_ledger, decision, request
 
         def _route_pr_verifier() -> tuple[JsonObject, JsonObject, JsonObject | None]:
@@ -4524,6 +4545,25 @@ def reconcile_ledger(
                     updated_at=timestamp,
                 )
             _sync_runtime_phase_metadata(base_dir=base_dir, issue_number=_ledger_issue_number(next_ledger, issue["number"]), current=cast(dict[str, str], next_ledger["current"]), attempts=cast(dict[str, int], next_ledger.get("attempts", {})), limits=cast(dict[str, int], next_ledger.get("limits", {})), last_failure=cast(dict[str, object], next_ledger.get("lastFailure", {})), workflow=cast(dict[str, object], next_ledger.get("workflow", {})), automation=cast(dict[str, object], next_ledger.get("automation", {})), artifacts=cast(dict[str, object], next_ledger.get("artifacts", {})), queued_next_issue=cast(dict[str, object], next_ledger.get("queuedNextIssue", {})), updated_at=timestamp)
+            if str(cast(dict[str, object], decision).get("action") or "") == "release_waiting":
+                sync_error = _sync_projected_issue_labels(
+                    base_dir=base_dir,
+                    issue_number=issue["number"],
+                    command_id=f"reconcile:{issue['number']}:pr-verifier-release-waiting:labels",
+                    updated_at=timestamp,
+                )
+                if sync_error:
+                    record_admin_decision(
+                        base_dir,
+                        command_id=f"reconcile:{issue['number']}:pr-verifier-release-waiting:labels:admin-failed",
+                        issue_number=issue["number"],
+                        decision_type="admin_github_projection_failure",
+                        reason=(
+                            f"GitHub projected label sync failed after verifier pass for issue #{issue['number']}: "
+                            f"{sync_error}"
+                        ),
+                        updated_at=timestamp,
+                    )
             return next_ledger, decision, request
 
         def _route_release_root_execution() -> tuple[JsonObject, JsonObject, JsonObject | None]:

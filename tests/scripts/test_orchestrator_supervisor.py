@@ -354,10 +354,19 @@ metadata:
     assert "pr_verifier subagent" in cast(str, decision.get("subagent_prompt", ""))
     assert request is None
     issue = read_issue(tmp_path, "42")
+    latest_pr_opened = read_latest_issue_history(tmp_path, "42", entry_type="pr_opened")
+    latest_sync = read_latest_github_sync_attempt(tmp_path, "42")
     artifact_status = _artifact_status(issue)
     assert cast(dict[str, object], artifact_status["worker_result"])["parse_ok"] is True
     assert cast(dict[str, object], artifact_status["worker_result"])["status"] == "success"
     assert cast(dict[str, object], artifact_status["worker_result"])["pr_number"] == "77"
+    assert latest_pr_opened is not None
+    assert latest_pr_opened["status"] == "opened"
+    opened_payload = json.loads(str(latest_pr_opened["payload_json"] or "{}"))
+    assert opened_payload["source_artifact"] == "worker_result"
+    assert latest_sync is not None
+    assert latest_sync["projection_target"] == "labels"
+    assert latest_sync["command_id"] == "reconcile:42:issue-worker-pr-opened:labels"
 
 
 def test_reconcile_worker_success_accepts_nested_pr_payload(tmp_path: Path):
@@ -2708,6 +2717,11 @@ def test_normalize_runtime_phase_projection_enforces_active_state_whitelists(tmp
             "running",
             {"role": "issue_worker", "stage": "issue_worker_execution", "status": "queued"},
             {"role": "issue_worker", "stage": "issue_worker_execution", "status": "queued"},
+        ),
+        (
+            "running",
+            {"role": "issue_worker", "stage": "issue_worker_repair", "status": "queued"},
+            {"role": "issue_worker", "stage": "issue_worker_repair", "status": "queued"},
         ),
         (
             "running",
@@ -5272,6 +5286,7 @@ next_recommended_step: \"Release it\"
 
     issue = read_issue(tmp_path, "42")
     latest_root_event = read_latest_issue_history(tmp_path, "42", entry_type="root_event")
+    latest_sync = read_latest_github_sync_attempt(tmp_path, "42")
     artifact_status = _artifact_status(issue)
 
     assert cast(dict[str, object], updated_ledger["current"])["role"] == "main_orchestrator"
@@ -5284,6 +5299,9 @@ next_recommended_step: \"Release it\"
     assert cast(dict[str, object], artifact_status["evidence_packet"])["parse_ok"] is True
     assert cast(dict[str, object], artifact_status["evidence_packet"])["status"] == "pass"
     assert cast(dict[str, object], artifact_status["evidence_packet"])["pr_number"] == "77"
+    assert latest_sync is not None
+    assert latest_sync["projection_target"] == "labels"
+    assert latest_sync["command_id"] == "reconcile:42:pr-verifier-release-waiting:labels"
     assert latest_root_event is not None
     assert latest_root_event["status"] == "root_terminal"
     assert latest_root_event["session_seq"] == 2

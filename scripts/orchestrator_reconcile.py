@@ -454,6 +454,7 @@ def reconcile_issue_worker(
     updated_at: str,
     is_successful_release_status: Callable[[str], bool],
     read_artifact_fact: Callable[[str], dict[str, object]],
+    record_pr_opened: Callable[..., dict[str, object]],
     set_failure_func: Callable[..., None],
     requeue_issue_worker_func: Callable[..., tuple[JsonObject, None]],
     queue_orchestrator_recovery_func: Callable[..., tuple[JsonObject, JsonObject, JsonObject]],
@@ -502,9 +503,32 @@ def reconcile_issue_worker(
         )
     status = cast(str, persisted_worker.get("status") or "")
     if is_successful_release_status(status):
-        pr_number = cast(str, persisted_worker.get("pr_number") or "")
+        pr_number = _extract_pr_number_from_fact(persisted_worker)
         attempts["pr_verifier"] += 1
         if pr_number and pr_number != "none":
+            worker_session_id = str(
+                persisted_worker.get("worker_session_id")
+                or persisted_worker.get("session_id")
+                or ""
+            )
+            record_pr_opened(
+                base_dir=base_dir,
+                issue_number=issue["number"],
+                pr_number=pr_number,
+                created_at=updated_at,
+                verifier_session_id=worker_session_id,
+                command_id=str(persisted_worker.get("command_id") or ""),
+                summary=(
+                    f"Record PR #{pr_number} opened for issue #{issue['number']} from worker_result before verifier handoff."
+                ),
+                payload={
+                    "issue_number": issue["number"],
+                    "pr_number": pr_number,
+                    "head_branch": issue.get("branch", ""),
+                    "base_branch": issue.get("baseBranch", "main"),
+                    "source_artifact": "worker_result",
+                },
+            )
             summary = (
                 f"Issue worker for issue #{issue['number']} succeeded. The main_orchestrator should delegate a "
                 f"pr_verifier subagent for PR #{pr_number}."
