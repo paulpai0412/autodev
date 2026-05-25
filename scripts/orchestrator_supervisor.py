@@ -1243,6 +1243,9 @@ def start_issue(
     issue_number = _validate_start_packet_issue_number(requested_issue_number=normalized_issue_number, packet=packet)
     timestamp = _now(updated_at)
     ensure_issue_row(base_dir, issue_number=issue_number, updated_at=timestamp)
+    resolved_base_branch = _resolve_issue_base_branch(base_dir, packet)
+    if not resolved_base_branch:
+        raise RuntimeError(f"issue #{issue_number} has unresolved stacked dependencies; refusing start until exactly one parent PR is stackable or all dependencies are completed")
     claim_command_id = f"start-issue:{issue_number}:claimed"
     try:
         _ = claim_issue_if_ready(
@@ -1255,9 +1258,6 @@ def start_issue(
         )
     except ValueError as error:
         raise RuntimeError(str(error)) from error
-    resolved_base_branch = _resolve_issue_base_branch(base_dir, packet)
-    if not resolved_base_branch:
-        raise RuntimeError(f"issue #{issue_number} has unresolved stacked dependencies; refusing start until exactly one parent PR is stackable or all dependencies are completed")
     try:
         issue_worktree = _ensure_issue_worktree(
             base_dir=base_dir,
