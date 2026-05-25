@@ -122,7 +122,14 @@ read_repo_from_env_file() {
   fi
 
   local value
-  value=$(grep -E '^AUTODEV_GITHUB_REPO=' "$env_file" 2>/dev/null | tail -n 1 | cut -d= -f2- | tr -d '"' | tr -d "'" | xargs)
+  value=$(
+    grep -E '^AUTODEV_GITHUB_REPO=' "$env_file" 2>/dev/null \
+      | tail -n 1 \
+      | cut -d= -f2- \
+      | tr -d '"' \
+      | tr -d "'" \
+      | xargs
+  )
   printf '%s' "$value"
 }
 
@@ -236,7 +243,10 @@ initialize_runtime_context() {
   FULL_CYCLE_LOG_PATH="$PROJECT_ROOT/.opencode/runtime/full-cycle.log"
 
   if [ -z "$REPO" ]; then
-    log "ERROR: unable to resolve GitHub repo from consumer project. Configure project.github_repo in .autodev.yaml, or set consumer .env AUTODEV_GITHUB_REPO, or set REPO"
+    log \
+      "ERROR: unable to resolve GitHub repo from consumer project." \
+      "Configure project.github_repo in .autodev.yaml, or set consumer .env" \
+      "AUTODEV_GITHUB_REPO, or set REPO"
     exit 1
   fi
 }
@@ -415,7 +425,13 @@ open_issue_count() {
 }
 
 first_ready_issue_number() {
-  gh issue list --repo "$REPO" --state open --label ready-for-agent --limit 200 --json number --jq '.[0].number // empty'
+  gh issue list \
+    --repo "$REPO" \
+    --state open \
+    --label ready-for-agent \
+    --limit 200 \
+    --json number \
+    --jq '.[0].number // empty'
 }
 
 print_github_snapshot() {
@@ -440,7 +456,14 @@ con = sqlite3.connect(db)
 con.row_factory = sqlite3.Row
 rows = con.execute(
     """
-    select issue_number, state, current_role, current_stage, current_status, current_session_id, updated_at
+    select
+      issue_number,
+      state,
+      current_role,
+      current_stage,
+      current_status,
+      current_session_id,
+      updated_at
     from issues
     order by cast(issue_number as integer)
     """
@@ -471,7 +494,10 @@ autodev_start_one() {
   local issue
   issue=$(first_ready_issue_number)
   if [ -n "$issue" ]; then
-    run_cmd python3 "$AUTODEV_PROJECT_PY" start --project-root "$PROJECT_ROOT" --issue-number "$issue"
+    run_cmd \
+      python3 "$AUTODEV_PROJECT_PY" start \
+      --project-root "$PROJECT_ROOT" \
+      --issue-number "$issue"
   else
     log "No ready-for-agent issue found for explicit start step"
   fi
@@ -485,7 +511,11 @@ autodev_recovery() {
   # failed -> retry-failed
   while IFS= read -r issue; do
     [ -z "$issue" ] && continue
-    run_cmd python3 "$SUPERVISOR_PY" retry-failed --base-dir "$PROJECT_ROOT" --issue-number "$issue" --reason "auto-recovery loop: retry failed issue"
+    run_cmd \
+      python3 "$SUPERVISOR_PY" retry-failed \
+      --base-dir "$PROJECT_ROOT" \
+      --issue-number "$issue" \
+      --reason "auto-recovery loop: retry failed issue"
   done < <(python3 - "$DB_PATH" <<'PY'
 import sqlite3, sys
 db = sys.argv[1]
@@ -500,7 +530,11 @@ PY
   # ready with stale fence -> clear-ready-session-fence
   while IFS= read -r issue; do
     [ -z "$issue" ] && continue
-    run_cmd python3 "$SUPERVISOR_PY" clear-ready-session-fence --base-dir "$PROJECT_ROOT" --issue-number "$issue" --reason "auto-recovery loop: clear stale ready fence"
+    run_cmd \
+      python3 "$SUPERVISOR_PY" clear-ready-session-fence \
+      --base-dir "$PROJECT_ROOT" \
+      --issue-number "$issue" \
+      --reason "auto-recovery loop: clear stale ready fence"
   done < <(python3 - "$DB_PATH" <<'PY'
 import sqlite3, sys
 db = sys.argv[1]
@@ -522,10 +556,16 @@ PY
     redispatch_fail_count=$(read_state_value "$issue" "redispatch_fail_count")
 
     if [ "$resume_fail_count" -lt "$RESUME_MAX_ATTEMPTS" ]; then
-      if run_cmd python3 "$SUPERVISOR_PY" resume-quarantined --base-dir "$PROJECT_ROOT" --issue-number "$issue" --reason "auto-recovery loop: resume quarantined issue"; then
+      if run_cmd \
+        python3 "$SUPERVISOR_PY" resume-quarantined \
+        --base-dir "$PROJECT_ROOT" \
+        --issue-number "$issue" \
+        --reason "auto-recovery loop: resume quarantined issue"; then
         if is_issue_still_quarantined "$issue"; then
           resume_fail_count=$((resume_fail_count + 1))
-          log "WARN: issue #$issue still quarantined after resume attempt (count=$resume_fail_count/$RESUME_MAX_ATTEMPTS)"
+          log \
+            "WARN: issue #$issue still quarantined after resume attempt" \
+            "(count=$resume_fail_count/$RESUME_MAX_ATTEMPTS)"
         else
           log "INFO: issue #$issue resumed from quarantined"
           reset_issue_state "$issue"
@@ -539,10 +579,17 @@ PY
     fi
 
     if [ "$redispatch_fail_count" -lt "$REDISPATCH_MAX_ATTEMPTS" ]; then
-      if run_cmd python3 "$SUPERVISOR_PY" redispatch-quarantined --base-dir "$PROJECT_ROOT" --issue-number "$issue" --reason "auto-recovery loop: redispatch quarantined issue" --source-session-id "full-cycle-auto-recovery"; then
+      if run_cmd \
+        python3 "$SUPERVISOR_PY" redispatch-quarantined \
+        --base-dir "$PROJECT_ROOT" \
+        --issue-number "$issue" \
+        --reason "auto-recovery loop: redispatch quarantined issue" \
+        --source-session-id "full-cycle-auto-recovery"; then
         if is_issue_still_quarantined "$issue"; then
           redispatch_fail_count=$((redispatch_fail_count + 1))
-          log "WARN: issue #$issue still quarantined after redispatch (count=$redispatch_fail_count/$REDISPATCH_MAX_ATTEMPTS)"
+          log \
+            "WARN: issue #$issue still quarantined after redispatch" \
+            "(count=$redispatch_fail_count/$REDISPATCH_MAX_ATTEMPTS)"
         else
           log "INFO: issue #$issue redispatched from quarantined"
           reset_issue_state "$issue"
@@ -556,11 +603,17 @@ PY
     fi
 
     if [ "$AUTO_FAIL_QUARANTINED" = "1" ]; then
-      run_cmd python3 "$SUPERVISOR_PY" fail-quarantined --base-dir "$PROJECT_ROOT" --issue-number "$issue" --reason "auto-recovery loop: exceeded resume/redispatch limits"
+      run_cmd \
+        python3 "$SUPERVISOR_PY" fail-quarantined \
+        --base-dir "$PROJECT_ROOT" \
+        --issue-number "$issue" \
+        --reason "auto-recovery loop: exceeded resume/redispatch limits"
       reset_issue_state "$issue"
       log "WARN: issue #$issue marked failed after exceeding quarantine recovery limits"
     else
-      log "WARN: issue #$issue exceeded recovery limits but AUTO_FAIL_QUARANTINED=0, leaving quarantined"
+      log \
+        "WARN: issue #$issue exceeded recovery limits but" \
+        "AUTO_FAIL_QUARANTINED=0, leaving quarantined"
       write_state_values "$issue" "$resume_fail_count" "$redispatch_fail_count"
     fi
   done < <(python3 - "$DB_PATH" <<'PY'
@@ -587,9 +640,16 @@ autodev_release_verified() {
   while IFS= read -r issue; do
     [ -z "$issue" ] && continue
     if [ "$AUTO_APPROVE_RELEASE" = "1" ]; then
-      run_cmd python3 "$AUTODEV_PROJECT_PY" release --project-root "$PROJECT_ROOT" --issue-number "$issue" --auto-approve
+      run_cmd \
+        python3 "$AUTODEV_PROJECT_PY" release \
+        --project-root "$PROJECT_ROOT" \
+        --issue-number "$issue" \
+        --auto-approve
     else
-      run_cmd python3 "$AUTODEV_PROJECT_PY" release --project-root "$PROJECT_ROOT" --issue-number "$issue"
+      run_cmd \
+        python3 "$AUTODEV_PROJECT_PY" release \
+        --project-root "$PROJECT_ROOT" \
+        --issue-number "$issue"
     fi
   done < <(python3 - "$DB_PATH" <<'PY'
 import sqlite3, sys
