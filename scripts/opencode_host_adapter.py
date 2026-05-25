@@ -301,7 +301,7 @@ class OpenCodeHostAdapter(HostAdapter):
             return SessionStartResult(status="error", launch_title=launch_title, error=str(error))
         session_id, stdout_text, stderr_text = read_initial_session_id(
             process,
-            timeout_seconds=10.0,
+            timeout_seconds=20.0,
             extract_session_id=extract_session_id_from_run_output,
             supports_fileno=stream_supports_fileno,
         )
