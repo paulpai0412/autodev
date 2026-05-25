@@ -770,6 +770,7 @@ RUNTIME_PHASE_PROJECTION_WHITELISTS: dict[str, set[tuple[str, str, str]]] = {
     "release_pending": {
         ("main_orchestrator", "release_root_execution", "queued"),
         ("main_orchestrator", "release_root_execution", "running"),
+        ("main_orchestrator", "release_root_execution", "pending_approval"),
     },
     "dispatching": {("issue_worker", "issue_worker_execution", "queued")},
     "running": {
@@ -4765,6 +4766,7 @@ def reconcile_ledger(
                 queue_orchestrator_recovery_func=_queue_orchestrator_recovery,
                 queue_transition_func=_queue_transition,
                 subagent_decision_func=_subagent_decision,
+                sync_issue_runtime_context=sync_issue_runtime_context,
             )
             _sync_runtime_phase_metadata(base_dir=base_dir, issue_number=_ledger_issue_number(next_ledger, issue["number"]), current=cast(dict[str, str], next_ledger["current"]), attempts=cast(dict[str, int], next_ledger.get("attempts", {})), limits=cast(dict[str, int], next_ledger.get("limits", {})), last_failure=cast(dict[str, object], next_ledger.get("lastFailure", {})), workflow=cast(dict[str, object], next_ledger.get("workflow", {})), automation=cast(dict[str, object], next_ledger.get("automation", {})), artifacts=cast(dict[str, object], next_ledger.get("artifacts", {})), queued_next_issue=cast(dict[str, object], next_ledger.get("queuedNextIssue", {})), updated_at=timestamp)
             return next_ledger, decision, request

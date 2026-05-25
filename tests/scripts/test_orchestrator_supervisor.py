@@ -8482,7 +8482,7 @@ def test_reconcile_release_blocked_exhaustion_marks_issue_failed(tmp_path: Path)
     assert issue["current_session_id"] == ""
 
 
-def test_reconcile_release_human_approval_block_returns_issue_to_verified(tmp_path: Path):
+def test_reconcile_release_human_approval_block_stays_release_pending(tmp_path: Path):
     issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
     ledger["current"] = {"role": "main_orchestrator", "stage": "release_root_execution", "status": "queued"}
@@ -8521,14 +8521,16 @@ def test_reconcile_release_human_approval_block_returns_issue_to_verified(tmp_pa
     issue = read_issue(tmp_path, "42")
 
     assert updated_ledger is not None
-    assert decision["action"] == "queue_next_session"
-    assert request is not None
+    assert decision["action"] == "release_waiting"
+    assert decision["next_role"] == "operator"
+    assert decision["next_stage"] == "release_command"
+    assert request is None
     assert issue is not None
-    assert issue["state"] == "verified"
-    assert issue["current_session_id"] == ""
+    assert issue["state"] == "release_pending"
+    assert issue["current_session_id"] == "ses-v"
     assert issue["current_role"] == "main_orchestrator"
-    assert issue["current_stage"] == "issue_selection_or_recovery"
-    assert issue["current_status"] == "queued"
+    assert issue["current_stage"] == "release_root_execution"
+    assert issue["current_status"] == "pending_approval"
 
 
 def test_submit_artifact_release_result_normalizes_human_approval_block_reason(tmp_path: Path) -> None:

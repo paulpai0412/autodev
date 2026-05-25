@@ -1006,6 +1006,7 @@ def reconcile_release_worker(
     queue_orchestrator_recovery_func: Callable[..., tuple[JsonObject, JsonObject, JsonObject]],
     queue_transition_func: Callable[..., None],
     subagent_decision_func: Callable[..., JsonObject],
+    sync_issue_runtime_context: Callable[..., JsonObject],
 ) -> ReconcileResult:
     issue_state = read_issue(base_dir, issue["number"])
     verifier_session_id = str(issue_state.get("current_session_id") or "") if issue_state else ""
@@ -1146,6 +1147,57 @@ def reconcile_release_worker(
             next_stage="release_root_execution",
             summary=retry_summary,
         ), None
+    if failure_kind == "human_approval_pending" or blocked_reason == "release_human_approval_missing":
+        recovery_summary = (
+            f"Release worker for issue #{issue['number']} is blocked by {blocked_reason or failure_kind}. "
+            "Keep the issue parked in release_pending with pending_approval status until human approval is satisfied to avoid duplicate release dispatches."
+        )
+        transition_issue_state_if_possible(
+            base_dir=base_dir,
+            issue_number=issue["number"],
+            to_state="release_pending",
+            command_id=uuid4().hex,
+            updated_at=updated_at,
+            reason=(
+                f"Keep issue #{issue['number']} in release_pending while waiting for human merge approval."
+            ),
+            current_session_id=verifier_session_id or None,
+        )
+        _ = sync_issue_runtime_context(
+            base_dir,
+            issue_number=issue["number"],
+            updated_at=updated_at,
+            current_role="main_orchestrator",
+            current_stage="release_root_execution",
+            current_status="pending_approval",
+        )
+        queue_transition_func(
+            ledger,
+            next_role="main_orchestrator",
+            next_stage="release_root_execution",
+            summary=recovery_summary,
+            updated_at=updated_at,
+        )
+        _ = sync_issue_runtime_context(
+            base_dir,
+            issue_number=issue["number"],
+            updated_at=updated_at,
+            current_status="pending_approval",
+        )
+        next_current = cast(dict[str, str], ledger.get("current", {}))
+        if next_current:
+            next_current["status"] = "pending_approval"
+        return (
+            ledger,
+            {
+                "action": "release_waiting",
+                "next_role": "operator",
+                "next_stage": "release_command",
+                "summary": recovery_summary,
+                "request_title": "/autodev-release",
+            },
+            None,
+        )
     if failure_kind in non_terminal_release_failure_kinds:
         recovery_summary = (
             f"Release worker for issue #{issue['number']} is blocked by {blocked_reason or failure_kind}. "
