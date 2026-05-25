@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Callable, cast
 from uuid import uuid4
 
+import yaml
+
 from scripts.control_plane_db import (
     append_issue_history,
     claim_issue_if_ready,
@@ -63,6 +65,168 @@ def _issue_backing_type(base_dir: Path, issue_number: str) -> str:
 
 def scheduler_id(base_dir: Path) -> str:
     return f"scheduler:{base_dir.resolve()}"
+
+
+def _read_autodev_config(base_dir: Path) -> dict[str, object]:
+    config_path = base_dir / ".autodev.yaml"
+    if not config_path.exists():
+        return {}
+    try:
+        parsed = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return {}
+    return cast(dict[str, object], parsed) if isinstance(parsed, dict) else {}
+
+
+def _string_map(raw: object) -> dict[str, str]:
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, str] = {}
+    for key, value in raw.items():
+        normalized_key = str(key or "").strip()
+        normalized_value = str(value or "").strip()
+        if normalized_key and normalized_value:
+            result[normalized_key] = normalized_value
+    return result
+
+
+def _nested_string_map(raw: object) -> dict[str, dict[str, str]]:
+    if not isinstance(raw, dict):
+        return {}
+    nested: dict[str, dict[str, str]] = {}
+    for key, value in raw.items():
+        normalized_key = str(key or "").strip()
+        if not normalized_key:
+            continue
+        normalized_value = _string_map(value)
+        if normalized_value:
+            nested[normalized_key] = normalized_value
+    return nested
+
+
+def _resolve_project_sync_bindings(
+    *,
+    base_dir: Path,
+    issue_number: str,
+) -> tuple[str, dict[str, str], dict[str, dict[str, str]]]:
+    runtime_context = read_runtime_context(base_dir, issue_number) or {}
+    runtime_field_ids = _string_map(runtime_context.get("github_project_field_ids"))
+    runtime_option_ids = _nested_string_map(runtime_context.get("github_project_field_option_ids"))
+
+    config_payload = _read_autodev_config(base_dir)
+    config_field_ids = _string_map(config_payload.get("github_project_field_ids"))
+    config_option_ids = _nested_string_map(config_payload.get("github_project_field_option_ids"))
+
+    field_ids: dict[str, str] = {}
+    for key in ("state", "stage", "pr_workflow"):
+        value = str(runtime_field_ids.get(key) or config_field_ids.get(key) or "").strip()
+        if value:
+            field_ids[key] = value
+
+    option_ids: dict[str, dict[str, str]] = {}
+    for key in ("state", "pr_workflow"):
+        merged = dict(config_option_ids.get(key, {}))
+        merged.update(runtime_option_ids.get(key, {}))
+        if merged:
+            option_ids[key] = merged
+
+    project_id = str(runtime_context.get("github_project_id") or "").strip()
+    if not project_id:
+        project_id = str(os.environ.get("AUTODEV_GITHUB_PROJECT_ID", "")).strip()
+    if not project_id:
+        project_id = str(config_payload.get("github_project_id") or "").strip()
+
+    return project_id, field_ids, option_ids
+
+
+def _resolve_project_single_select_option_ids(
+    *,
+    base_dir: Path,
+    project_id: str,
+    run: Callable[..., subprocess.CompletedProcess[str]],
+) -> tuple[dict[str, dict[str, str]], str]:
+    query = (
+        "query($project:ID!){node(id:$project){... on ProjectV2{fields(first:100){nodes{... on ProjectV2SingleSelectField{id options{id name}}}}}}}"
+    )
+    completed = run(
+        [
+            "gh",
+            "api",
+            "graphql",
+            "-f",
+            f"query={query}",
+            "-F",
+            f"project={project_id}",
+        ],
+        cwd=base_dir,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        error = (completed.stderr or completed.stdout).strip() or (
+            f"gh api graphql project field metadata lookup failed with exit code {completed.returncode}"
+        )
+        return {}, error
+
+    try:
+        payload = json.loads(completed.stdout or "{}")
+    except json.JSONDecodeError:
+        return {}, "failed to parse GitHub project field metadata lookup payload"
+
+    nodes_payload = payload.get("data", {}).get("node", {}).get("fields", {}).get("nodes", []) if isinstance(payload, dict) else []
+    nodes = nodes_payload if isinstance(nodes_payload, list) else []
+    mapping: dict[str, dict[str, str]] = {}
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        field_id = str(node.get("id") or "").strip()
+        if not field_id:
+            continue
+        options_payload = node.get("options")
+        options = options_payload if isinstance(options_payload, list) else []
+        option_map: dict[str, str] = {}
+        for option in options:
+            if not isinstance(option, dict):
+                continue
+            name = str(option.get("name") or "").strip()
+            option_id = str(option.get("id") or "").strip()
+            if name and option_id:
+                option_map[name] = option_id
+        if option_map:
+            mapping[field_id] = option_map
+
+    return mapping, ""
+
+
+def _select_single_select_option_id(options: dict[str, str], value: str) -> str:
+    normalized_value = str(value or "").strip()
+    if not normalized_value:
+        return ""
+    direct = str(options.get(normalized_value) or "").strip()
+    if direct:
+        return direct
+
+    normalized_options: dict[str, str] = {}
+    for key, option_id in options.items():
+        normalized_key = str(key or "").strip().lower()
+        normalized_option_id = str(option_id or "").strip()
+        if normalized_key and normalized_option_id:
+            normalized_options[normalized_key] = normalized_option_id
+
+    lower_value = normalized_value.lower()
+    for candidate in {
+        lower_value,
+        lower_value.replace("_", " "),
+        lower_value.replace(" ", "_"),
+        lower_value.replace("-", " "),
+        lower_value.replace(" ", "-"),
+    }:
+        candidate_option_id = str(normalized_options.get(candidate) or "").strip()
+        if candidate_option_id:
+            return candidate_option_id
+
+    return ""
 
 
 def transition_issue_state_if_possible(
@@ -565,9 +729,10 @@ def sync_project_fields_projection(
     updated_at: str | None = None,
 ) -> str:
     timestamp = now(updated_at)
-    project_id = str((read_runtime_context(base_dir, issue_number) or {}).get("github_project_id") or "").strip()
-    if not project_id:
-        project_id = str(os.environ.get("AUTODEV_GITHUB_PROJECT_ID", "")).strip()
+    project_id, configured_field_ids, configured_option_ids = _resolve_project_sync_bindings(
+        base_dir=base_dir,
+        issue_number=issue_number,
+    )
 
     if not repo or not project_id:
         if command_id:
@@ -735,25 +900,64 @@ def sync_project_fields_projection(
                 )
             return error
 
-    runtime_context = read_runtime_context(base_dir, issue_number) or {}
-    option_map_payload = runtime_context.get("github_project_field_option_ids")
-    option_map = option_map_payload if isinstance(option_map_payload, dict) else {}
-    state_options_payload = option_map.get("state")
-    state_options = state_options_payload if isinstance(state_options_payload, dict) else {}
-    pr_workflow_options_payload = option_map.get("pr_workflow")
-    pr_workflow_options = pr_workflow_options_payload if isinstance(pr_workflow_options_payload, dict) else {}
+    state_field_id = str(configured_field_ids.get("state") or "").strip()
+    pr_workflow_field_id = str(configured_field_ids.get("pr_workflow") or "").strip()
+    state_options = _string_map(configured_option_ids.get("state"))
+    pr_workflow_options = _string_map(configured_option_ids.get("pr_workflow"))
+    dynamic_single_select_options: dict[str, dict[str, str]] = {}
+    dynamic_option_lookup_error = ""
 
     for field_id, field_value in fields.items():
         field_id = str(field_id or "").strip()
         field_value = str(field_value or "").strip()
         if not field_id:
             continue
+
+        is_single_select_field = field_id in {state_field_id, pr_workflow_field_id}
         option_id = ""
         if field_value:
-            if field_id == str((read_runtime_context(base_dir, issue_number) or {}).get("github_project_field_ids", {}).get("state", "")).strip():
-                option_id = str(state_options.get(field_value, "")).strip()
-            elif field_id == str((read_runtime_context(base_dir, issue_number) or {}).get("github_project_field_ids", {}).get("pr_workflow", "")).strip():
-                option_id = str(pr_workflow_options.get(field_value, "")).strip()
+            if field_id == state_field_id:
+                option_id = _select_single_select_option_id(state_options, field_value)
+            elif field_id == pr_workflow_field_id:
+                option_id = _select_single_select_option_id(pr_workflow_options, field_value)
+
+            if is_single_select_field and not option_id:
+                if not dynamic_single_select_options and not dynamic_option_lookup_error:
+                    dynamic_single_select_options, dynamic_option_lookup_error = _resolve_project_single_select_option_ids(
+                        base_dir=base_dir,
+                        project_id=project_id,
+                        run=run,
+                    )
+                option_id = _select_single_select_option_id(dynamic_single_select_options.get(field_id, {}), field_value)
+
+        if is_single_select_field and not field_value:
+            continue
+
+        if is_single_select_field and field_value and not option_id:
+            error = dynamic_option_lookup_error or (
+                f"missing GitHub project single-select option id for field {field_id} value {field_value!r}"
+            )
+            if command_id:
+                record_github_sync_attempt(
+                    base_dir,
+                    command_id=command_id,
+                    issue_number=issue_number,
+                    add_labels=[],
+                    remove_labels=[],
+                    status="failed",
+                    updated_at=timestamp,
+                    last_error=error,
+                    projection_target="project_fields",
+                    projection_payload={
+                        "repo": repo,
+                        "issue_number": issue_number,
+                        "project_id": project_id,
+                        "item_id": item_id,
+                        "field_id": field_id,
+                        "field_value": field_value,
+                    },
+                )
+            return error
 
         if option_id:
             mutation = (
