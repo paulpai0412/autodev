@@ -26,6 +26,7 @@ INTAKE_PY=""
 SUPERVISOR_PY=""
 DB_PATH=""
 STATE_DIR=""
+FULL_CYCLE_LOG_PATH=""
 
 RESUME_MAX_ATTEMPTS="${RESUME_MAX_ATTEMPTS:-}"
 REDISPATCH_MAX_ATTEMPTS="${REDISPATCH_MAX_ATTEMPTS:-}"
@@ -232,6 +233,7 @@ initialize_runtime_context() {
   REPO="$(resolve_repo "$PROJECT_ROOT")"
   DB_PATH="$PROJECT_ROOT/.opencode/runtime/control-plane.sqlite3"
   STATE_DIR="$PROJECT_ROOT/.opencode/runtime/full-cycle-state"
+  FULL_CYCLE_LOG_PATH="$PROJECT_ROOT/.opencode/runtime/full-cycle.log"
 
   if [ -z "$REPO" ]; then
     log "ERROR: unable to resolve GitHub repo from consumer project. Configure project.github_repo in .autodev.yaml, or set consumer .env AUTODEV_GITHUB_REPO, or set REPO"
@@ -243,60 +245,61 @@ timestamp() {
   date +"%Y-%m-%dT%H:%M:%S%z"
 }
 
-dashboard_touch() {
-  if [ ! -t 1 ]; then
-    return 0
-  fi
-
-  local stamp label cols row col
-  stamp=$(date +"%Y-%m-%d %H:%M:%S")
-  label="Last update: ${stamp}"
-
-  cols=$(tput cols 2>/dev/null || printf '0')
-  if [ "$cols" -le 0 ]; then
-    return 0
-  fi
-
-  row=1
-  col=$((cols - ${#label} + 1))
-  if [ "$col" -lt 1 ]; then
-    col=1
-  fi
-
-  # Save cursor, draw top-right timestamp, restore cursor.
-  printf '\033[s\033[%d;%dH\033[1;36m%s\033[0m\033[u' "$row" "$col" "$label"
-}
-
 log() {
-  dashboard_touch
-  printf '[%s] %s\n' "$(timestamp)" "$*"
+  local line
+  line=$(printf '[%s] %s\n' "$(timestamp)" "$*")
+  printf '%s' "$line"
+  if [ -n "$FULL_CYCLE_LOG_PATH" ]; then
+    mkdir -p "$(dirname "$FULL_CYCLE_LOG_PATH")"
+    printf '%s' "$line" >> "$FULL_CYCLE_LOG_PATH"
+  fi
 }
 
 run_cmd() {
   log "RUN: $*"
   local cmd_pid=""
-  local monitor_pid=""
+  local stdout_fifo=""
+  local stderr_fifo=""
+  local stdout_pump_pid=""
+  local stderr_pump_pid=""
 
-  "$@" &
-  cmd_pid=$!
+  stdout_fifo=$(mktemp -u "${TMPDIR:-/tmp}/autodev-full-cycle-stdout.XXXXXX")
+  stderr_fifo=$(mktemp -u "${TMPDIR:-/tmp}/autodev-full-cycle-stderr.XXXXXX")
+  mkfifo "$stdout_fifo" "$stderr_fifo"
 
-  if [ -t 1 ]; then
-    (
-      while kill -0 "$cmd_pid" 2>/dev/null; do
-        dashboard_touch
-        sleep 1
-      done
-    ) &
-    monitor_pid=$!
+  if [ -n "$FULL_CYCLE_LOG_PATH" ]; then
+    mkdir -p "$(dirname "$FULL_CYCLE_LOG_PATH")"
   fi
+
+  {
+    while IFS= read -r line || [ -n "$line" ]; do
+      printf '%s\n' "$line"
+      if [ -n "$FULL_CYCLE_LOG_PATH" ]; then
+        printf '%s\n' "$line" >> "$FULL_CYCLE_LOG_PATH"
+      fi
+    done < "$stdout_fifo"
+  } &
+  stdout_pump_pid=$!
+
+  {
+    while IFS= read -r line || [ -n "$line" ]; do
+      printf '%s\n' "$line" >&2
+      if [ -n "$FULL_CYCLE_LOG_PATH" ]; then
+        printf '%s\n' "$line" >> "$FULL_CYCLE_LOG_PATH"
+      fi
+    done < "$stderr_fifo"
+  } &
+  stderr_pump_pid=$!
+
+  "$@" > "$stdout_fifo" 2> "$stderr_fifo" &
+  cmd_pid=$!
 
   wait "$cmd_pid"
   local rc=$?
 
-  if [ -n "$monitor_pid" ]; then
-    kill "$monitor_pid" 2>/dev/null || true
-    wait "$monitor_pid" 2>/dev/null || true
-  fi
+  wait "$stdout_pump_pid"
+  wait "$stderr_pump_pid"
+  rm -f "$stdout_fifo" "$stderr_fifo"
 
   if [ $rc -ne 0 ]; then
     log "WARN: command failed (exit=$rc): $*"
@@ -323,6 +326,7 @@ require_tools() {
 
 ensure_state_dir() {
   mkdir -p "$STATE_DIR"
+  mkdir -p "$(dirname "$FULL_CYCLE_LOG_PATH")"
 }
 
 state_file_for_issue() {
@@ -683,6 +687,7 @@ main() {
   ensure_state_dir
 
   log "Start autodev full cycle"
+  log "FULL_CYCLE_LOG_PATH=$FULL_CYCLE_LOG_PATH"
   log "PROJECT_ROOT=$PROJECT_ROOT"
   log "AUTODEV_HOME=$AUTODEV_HOME"
   log "REPO=$REPO"
