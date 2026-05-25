@@ -1171,6 +1171,21 @@ def reconcile_release_worker(
     persisted_release = _stored_fact(artifacts, "release_result", read_artifact_fact)
     if not bool(persisted_release.get("parse_ok")):
         current_status = str(current.get("status") or "")
+        if current_status == "pending_approval":
+            summary = (
+                f"release_worker for issue #{issue['number']} is waiting on human approval. Keep the release_pending approval fence until supervisor confirms GitHub approval/merge recovery."
+            )
+            return (
+                ledger,
+                {
+                    "action": "release_waiting",
+                    "next_role": "operator",
+                    "next_stage": "release_command",
+                    "summary": summary,
+                    "request_title": "",
+                },
+                None,
+            )
         session_terminal_without_artifact = False
         if verifier_session_id and current_status in {"running", "queued"}:
             outcome = read_session_outcome(verifier_session_id)

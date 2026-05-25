@@ -1118,6 +1118,8 @@ def _repair_stale_release_pending_fences(*, base_dir: Path, updated_at: str) -> 
         current_session_id = str(issue.get("current_session_id") or "")
         if current_role != "main_orchestrator" or current_stage != "release_root_execution" or (not current_status and not current_session_id):
             continue
+        if current_status == "pending_approval":
+            continue
         if _has_role_stage_dispatch_evidence(
             base_dir=base_dir,
             issue_number=issue_number,
@@ -1223,6 +1225,154 @@ def _ensure_release_pr_opened_fact(*, base_dir: Path, issue_number: str, updated
     )
 
     return read_latest_history_entry(base_dir, issue_number=issue_number, entry_type="pr_opened")
+
+
+def _latest_pr_opened_payload(base_dir: Path, issue_number: str) -> dict[str, object]:
+    entry = read_latest_history_entry(base_dir, issue_number=issue_number, entry_type="pr_opened")
+    if entry is None:
+        return {}
+    return _load_json_dict(entry.get("payload_json"))
+
+
+def _read_release_pending_pr_merge_status(
+    *,
+    base_dir: Path,
+    issue_number: str,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> dict[str, object]:
+    repo = _read_project_github_repo(base_dir)
+    if not repo:
+        return {}
+    payload = _latest_pr_opened_payload(base_dir, issue_number)
+    pr_number = str(payload.get("pr_number") or "").strip()
+    if not pr_number.isdigit():
+        return {}
+    owner, _, name = repo.partition("/")
+    if not owner or not name:
+        return {}
+
+    query = (
+        "query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){merged reviewDecision mergeStateStatus url mergedAt}}}"
+    )
+    result = run(
+        [
+            "gh",
+            "api",
+            "graphql",
+            "-f",
+            f"query={query}",
+            "-F",
+            f"owner={owner}",
+            "-F",
+            f"repo={name}",
+            "-F",
+            f"number={pr_number}",
+        ],
+        cwd=base_dir,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return {}
+    try:
+        response = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return {}
+    pr = response.get("data", {}).get("repository", {}).get("pullRequest", {}) if isinstance(response, dict) else {}
+    if not isinstance(pr, dict):
+        return {}
+    return {
+        "pr_number": pr_number,
+        "merged": bool(pr.get("merged")),
+        "reviewDecision": str(pr.get("reviewDecision") or "").strip(),
+        "mergeStateStatus": str(pr.get("mergeStateStatus") or "").strip(),
+        "url": str(pr.get("url") or "").strip(),
+        "mergedAt": str(pr.get("mergedAt") or "").strip(),
+    }
+
+
+def _recover_approved_merged_release_pending_issue(
+    *,
+    base_dir: Path,
+    issue_number: str,
+    updated_at: str,
+    run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> bool:
+    issue = read_issue(base_dir, issue_number)
+    if issue is None:
+        return False
+    if str(issue.get("state") or "") != "release_pending":
+        return False
+    if str(issue.get("current_status") or "") != "pending_approval":
+        return False
+
+    pr_status = _read_release_pending_pr_merge_status(
+        base_dir=base_dir,
+        issue_number=issue_number,
+        run=run,
+    )
+    if not pr_status:
+        return False
+    if not bool(pr_status.get("merged")):
+        return False
+    if str(pr_status.get("reviewDecision") or "") != "APPROVED":
+        return False
+
+    _ = sync_issue_runtime_context(
+        base_dir,
+        issue_number=issue_number,
+        updated_at=updated_at,
+        current_role="main_orchestrator",
+        current_stage="release_root_execution",
+        current_status="",
+    )
+    _ = upsert_issue_state(
+        base_dir,
+        issue_number=issue_number,
+        state="release_pending",
+        command_id=f"release-approval-merge-recovery:{issue_number}",
+        updated_at=updated_at,
+        current_session_id="",
+    )
+    _ = append_issue_history(
+        base_dir,
+        issue_number=issue_number,
+        entry_type="runtime_transition",
+        created_at=updated_at,
+        role="release_worker",
+        stage="release_worker_execution",
+        status="",
+        summary=(
+            f"Recovered pending approval release fence for issue #{issue_number} after GitHub confirmed PR #{pr_status['pr_number']} was approved and merged."
+        ),
+        payload={
+            "transition_type": "release_approval_merge_recovery",
+            "issue_number": issue_number,
+            "pr_number": pr_status["pr_number"],
+            "review_decision": pr_status.get("reviewDecision"),
+            "merge_state_status": pr_status.get("mergeStateStatus"),
+            "pr_url": pr_status.get("url"),
+            "merged_at": pr_status.get("mergedAt"),
+        },
+        unique_key=f"release-approval-merge-recovery:{issue_number}:{updated_at}",
+    )
+    return True
+
+
+def _recover_approved_merged_release_pending_issues(*, base_dir: Path, updated_at: str) -> list[str]:
+    recovered: list[str] = []
+    for issue in list_issues(base_dir, states=["release_pending"]):
+        issue_number = str(issue.get("issue_number") or "")
+        if not issue_number:
+            continue
+        if _recover_approved_merged_release_pending_issue(
+            base_dir=base_dir,
+            issue_number=issue_number,
+            updated_at=updated_at,
+        ):
+            recovered.append(issue_number)
+    return recovered
 
 
 def show_latest_session(*, base_dir: Path, issue_number: str | None = None) -> SessionResult | None:
@@ -2695,13 +2845,23 @@ def reconcile_workspace_from_db(
     started_releases: list[JsonObject] = []
     release_backfill_errors: list[JsonObject] = []
     if release_backfill_mode == "auto":
+        _ = _recover_approved_merged_release_pending_issues(base_dir=base_dir, updated_at=timestamp)
         free_release_slots = available_release_slots(base_dir, release_capacity)
+        release_candidates: list[str] = []
         for issue in list_issues(base_dir, states=["verified"]):
+            issue_number = str(issue.get("issue_number") or "")
+            if issue_number:
+                release_candidates.append(issue_number)
+        for issue in list_issues(base_dir, states=["release_pending"]):
+            issue_number = str(issue.get("issue_number") or "")
+            if not issue_number or issue_number in release_candidates:
+                continue
+            if str(issue.get("current_session_id") or "") or str(issue.get("current_status") or ""):
+                continue
+            release_candidates.append(issue_number)
+        for issue_number in release_candidates:
             if free_release_slots <= 0:
                 break
-            issue_number = str(issue.get("issue_number") or "")
-            if not issue_number:
-                continue
             try:
                 session_result = start_release(
                     base_dir=base_dir,
@@ -2782,6 +2942,14 @@ def start_release(
     )
     timestamp = _now(updated_at)
     _ = _repair_stale_release_pending_fences(base_dir=base_dir, updated_at=timestamp)
+    if issue_number:
+        _ = _recover_approved_merged_release_pending_issue(
+            base_dir=base_dir,
+            issue_number=_normalize_requested_issue_number(issue_number),
+            updated_at=timestamp,
+        )
+    else:
+        _ = _recover_approved_merged_release_pending_issues(base_dir=base_dir, updated_at=timestamp)
     release_capacity = _release_capacity()
     if available_release_slots(base_dir, release_capacity) <= 0:
         raise RuntimeError(f"release capacity is full ({release_capacity}); wait for an active release_worker to finish")

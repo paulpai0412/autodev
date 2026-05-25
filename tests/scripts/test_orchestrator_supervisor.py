@@ -2635,6 +2635,169 @@ def test_start_release_repairs_stale_release_pending_fence_without_dispatch_evid
     assert "Cleared stale release_worker fence" in str(repair_event.get("summary") or "")
 
 
+def test_start_release_recovers_pending_approval_after_remote_approval_and_merge(tmp_path: Path) -> None:
+    _ingest_issue_packet_text(tmp_path, "42", SAMPLE_ISSUE_PACKET)
+    _ = (tmp_path / ".autodev.yaml").write_text(
+        'schema_version: "1.0"\nproject:\n  github_repo: example/repo\n',
+        encoding="utf-8",
+    )
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "main_orchestrator", "stage": "release_root_execution", "status": "pending_approval"}
+    _seed_db_issue_from_ledger(tmp_path, ledger, updated_at="2026-05-07T17:00:00+08:00")
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="release_pending",
+        command_id="cmd-release-pending",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_session_id="ses-pending-42",
+    )
+    orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_role="main_orchestrator",
+        current_stage="release_root_execution",
+        current_status="pending_approval",
+    )
+    orchestrator_supervisor.record_pr_opened(
+        base_dir=tmp_path,
+        issue_number="42",
+        pr_number="77",
+        created_at="2026-05-07T17:00:00+08:00",
+        verifier_session_id="ses-v",
+        command_id="cmd-pr",
+        payload={"issue_number": "42", "pr_number": "77"},
+    )
+    adapter = successful_host_adapter(session_id="ses-release-42", resume_command="opencode --session ses-release-42")
+
+    with patch(
+        "scripts.orchestrator_supervisor._read_release_pending_pr_merge_status",
+        return_value={
+            "pr_number": "77",
+            "merged": True,
+            "reviewDecision": "APPROVED",
+            "mergeStateStatus": "MERGED",
+            "url": "https://github.com/example/repo/pull/77",
+            "mergedAt": "2026-05-07T17:09:00+08:00",
+        },
+    ), patch("scripts.orchestrator_supervisor._default_host_adapter", return_value=adapter):
+        result = orchestrator_supervisor.start_release(
+            base_dir=tmp_path,
+            issue_number="42",
+            source_session_id="manual-release",
+            updated_at="2026-05-07T17:10:00+08:00",
+        )
+
+    issue = read_issue(tmp_path, "42")
+    repair_event = read_latest_issue_history(tmp_path, "42", entry_type="runtime_transition")
+
+    assert result.get("status") == "success"
+    assert issue is not None
+    assert issue["state"] == "release_pending"
+    assert issue["current_session_id"] == "ses-release-42"
+    assert issue["current_status"] == "running"
+    assert repair_event is not None
+    assert "approved and merged" in str(repair_event.get("summary") or "")
+
+
+def test_reconcile_workspace_auto_release_recovers_pending_approval_after_remote_merge(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AUTODEV_RELEASE_BACKFILL_MODE", "auto")
+    _ingest_issue_packet_text(tmp_path, "43", SAMPLE_ISSUE_PACKET.replace('"42"', '"43"').replace("issue-42", "issue-43"))
+    _ = (tmp_path / ".autodev.yaml").write_text(
+        'schema_version: "1.0"\nproject:\n  github_repo: example/repo\n',
+        encoding="utf-8",
+    )
+    issue_packet = parse_issue_packet_text(
+        SAMPLE_ISSUE_PACKET.replace('"42"', '"43"').replace("issue-42", "issue-43"),
+        "docs/agents/issue-packets/issue-43.yaml",
+    )
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "main_orchestrator", "stage": "release_root_execution", "status": "pending_approval"}
+    _seed_db_issue_from_ledger(tmp_path, ledger, updated_at="2026-05-07T17:00:00+08:00")
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="43",
+        state="release_pending",
+        command_id="cmd-release-pending-43",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_session_id="ses-pending-43",
+    )
+    orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="43",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_role="main_orchestrator",
+        current_stage="release_root_execution",
+        current_status="pending_approval",
+    )
+    orchestrator_supervisor.record_pr_opened(
+        base_dir=tmp_path,
+        issue_number="43",
+        pr_number="143",
+        created_at="2026-05-07T17:00:00+08:00",
+        verifier_session_id="ses-v-43",
+        command_id="cmd-pr-43",
+        payload={"issue_number": "43", "pr_number": "143"},
+    )
+    adapter = successful_host_adapter(session_id="ses-release-43", resume_command="opencode --session ses-release-43")
+
+    with patch(
+        "scripts.orchestrator_supervisor._read_release_pending_pr_merge_status",
+        return_value={
+            "pr_number": "143",
+            "merged": True,
+            "reviewDecision": "APPROVED",
+            "mergeStateStatus": "MERGED",
+            "url": "https://github.com/example/repo/pull/143",
+            "mergedAt": "2026-05-07T17:09:00+08:00",
+        },
+    ), patch("scripts.orchestrator_supervisor._default_host_adapter", return_value=adapter), patch(
+        "scripts.orchestrator_supervisor.run_issue_packet_intake", return_value=True
+    ):
+        payload = orchestrator_supervisor.reconcile_workspace_from_db(
+            base_dir=tmp_path,
+            updated_at="2026-05-07T17:10:00+08:00",
+            source_session_id="workspace-reconcile",
+        )
+
+    issue_43 = read_issue(tmp_path, "43")
+    started_releases = cast(list[dict[str, object]], payload["started_releases"])
+
+    assert [entry["issue_number"] for entry in started_releases] == ["43"]
+    assert issue_43 is not None
+    assert issue_43["state"] == "release_pending"
+    assert issue_43["current_session_id"] == "ses-release-43"
+    assert issue_43["current_status"] == "running"
+
+
+def test_reconcile_release_pending_approval_without_release_result_stays_waiting(tmp_path: Path) -> None:
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "main_orchestrator", "stage": "release_root_execution", "status": "pending_approval"}
+    _seed_db_issue_from_ledger(tmp_path, ledger, updated_at="2026-05-07T17:00:00+08:00")
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="release_pending",
+        command_id="cmd-release-pending",
+        updated_at="2026-05-07T17:01:00+08:00",
+        current_session_id="ses-release-root-42",
+    )
+
+    updated_ledger, decision, request = reconcile_ledger(
+        ledger,
+        artifact_base_dir=tmp_path,
+        updated_at="2026-05-07T17:02:00+08:00",
+    )
+
+    assert updated_ledger is not None
+    assert decision["action"] == "release_waiting"
+    assert decision["next_role"] == "operator"
+    assert request is None
+
+
 def test_validate_session_request_rejects_completed_issue(tmp_path: Path):
     issue_packet_path = tmp_path / "docs/agents/issue-packets/issue-42.yaml"
     issue_packet_path.parent.mkdir(parents=True, exist_ok=True)
