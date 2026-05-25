@@ -238,6 +238,9 @@ def _release_root_prompt_lines(
         "Evaluate merge gates explicitly and persist them in release_result.merge_gate: checks_state (pending|failed|passed), mergeability_state (conflicted|clean), approval_state (missing|satisfied), blocked_reason, next_action.",
         "Use remote GitHub PR merge as the single merge authority; do not merge main by local push.",
         "After merge succeeds, run workspace hygiene and persist release_result.workspace_hygiene with cleanup_status plus branch/dirty/worktree cleanup fields.",
+        "During workspace hygiene, do not run `git stash -a`, `git stash --all`, or any `git clean -xfd` style cleanup; these may remove control-plane/runtime state.",
+        "Treat `.opencode/runtime/control-plane.sqlite3` and `.opencode/runtime/` as protected runtime state: never stash, delete, or clean them.",
+        "If `.opencode/` appears in primary workspace status, resolve hygiene by adding `.opencode/` to `.git/info/exclude` (or equivalent ignore configuration) instead of stash/clean.",
         (
             f"Current release override: approval_override_mode={approval_override_mode or 'none'}, override_source={override_source}, human_approval_skipped={'true' if human_approval_skipped else 'false'}."
             if approval_override_mode or human_approval_skipped or override_source != 'none'

@@ -1005,6 +1005,49 @@ def test_reconcile_watch_stops_on_error_when_requested(tmp_path: Path):
     sleep.assert_not_called()
 
 
+def test_reconcile_watch_fails_fast_when_runtime_db_missing(tmp_path: Path, capsys: CaptureFixture[str]):
+    write(tmp_path / ".autodev.yaml", 'schema_version: "1.0"\nproject:\n  name: demo\n')
+    write(tmp_path / "AGENTS.md", "# AGENTS.md\n")
+    runtime_db = tmp_path / ".opencode/runtime/control-plane.sqlite3"
+    runtime_db.parent.mkdir(parents=True, exist_ok=True)
+    if runtime_db.exists():
+        runtime_db.unlink()
+
+    def fake_run(args: list[str], **_kwargs: object) -> CompletedProcess[str]:
+        if args[:3] == ["git", "rev-parse", "--is-inside-work-tree"]:
+            return completed(args, stdout="false\n")
+        if args[:4] == ["python3", "-m", "scripts.orchestrator_supervisor", "reconcile-workspace"]:
+            return completed(
+                args,
+                returncode=1,
+                stderr=(
+                    f"[autodev:reconcile] control-plane-db-missing-before-command={runtime_db}\n"
+                    "RuntimeError: control-plane DB missing; refusing to recreate\n"
+                ),
+            )
+        raise AssertionError(f"unexpected command: {args}")
+
+    with patch("scripts.autodev_project.subprocess.run", side_effect=fake_run), patch(
+        "scripts.autodev_project.time.sleep"
+    ) as sleep:
+        exit_code = autodev_project.main(
+            [
+                "reconcile-watch",
+                "--project-root",
+                str(tmp_path),
+                "--iterations",
+                "3",
+                "--stop-on-error",
+            ]
+        )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert f"[autodev:reconcile-watch] project-root={tmp_path}" in captured.out
+    assert f"[autodev:reconcile-watch] runtime-db={runtime_db}" in captured.out
+    sleep.assert_not_called()
+
+
 def test_reconcile_blocks_when_runtime_db_is_tracked(tmp_path: Path, capsys: CaptureFixture[str]):
     write(tmp_path / ".autodev.yaml", 'schema_version: "1.0"\nproject:\n  name: demo\n')
     write(tmp_path / "AGENTS.md", "# AGENTS.md\n")

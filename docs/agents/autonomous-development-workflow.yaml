@@ -470,6 +470,15 @@ release_worker_policy:
       if_not_main_and_dirty: create_wip_branch_and_stash_then_switch_to_main
       if_main_and_dirty: create_wip_branch_and_stash
       if_main_and_clean: no_branch_restore_needed
+      forbidden_cleanup_commands:
+        - git stash -a
+        - git stash --all
+        - git clean -xfd
+      protected_runtime_paths:
+        - .opencode/runtime/control-plane.sqlite3
+        - .opencode/runtime/
+      if_opencode_untracked:
+        - add_.opencode_to_git_info_exclude_instead_of_stash_or_clean
       wip_branch_name_template: "agent/wip/post-merge-issue-{issue_number}-{yyyyMMdd-HHmm}"
       stash_message_template: "post-merge hygiene preserve issue-{issue_number} from {source_branch}"
       final_git_status_must_be_clean: true

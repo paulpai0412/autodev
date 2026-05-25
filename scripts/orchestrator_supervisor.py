@@ -92,6 +92,31 @@ def _artifact_ref_value(artifacts: dict[str, object], artifact_kind: str) -> str
     return str(artifacts.get(key) or "")
 
 
+def _ensure_control_plane_db_with_diagnostic(
+    *,
+    base_dir: Path,
+    command_label: str,
+    allow_create: bool = True,
+) -> None:
+    db_path = control_plane_db_path(base_dir)
+    existed_before = db_path.exists()
+    if not existed_before:
+        print(
+            f"[autodev:{command_label}] control-plane-db-missing-before-command={db_path}",
+            file=sys.stderr,
+        )
+        if not allow_create:
+            raise RuntimeError(
+                f"control-plane DB missing at {db_path}; refusing to recreate during active {command_label} workflow"
+            )
+    ensure_control_plane_db(base_dir)
+    if not existed_before and db_path.exists():
+        print(
+            f"[autodev:{command_label}] control-plane-db-created={db_path}",
+            file=sys.stderr,
+        )
+
+
 class IssuePacketRecord(Protocol):
     issue_number: str
     title: str
@@ -2560,6 +2585,11 @@ def reconcile_workspace_from_db(
     source_session_id: str = "workspace_reconcile",
 ) -> JsonObject:
     base_dir = _canonical_supervisor_base_dir(base_dir)
+    _ensure_control_plane_db_with_diagnostic(
+        base_dir=base_dir,
+        command_label="reconcile",
+        allow_create=False,
+    )
     timestamp = _now(updated_at)
     active_states = ["claimed", "dispatching", "running", "verifying", "verified", "release_pending", "quarantined", "failed"]
     active_issues = list_issues(base_dir, states=active_states)
@@ -2696,7 +2726,11 @@ def start_release(
     start_reason: str | None = None,
 ) -> SessionResult:
     base_dir = _canonical_supervisor_base_dir(base_dir)
-    ensure_control_plane_db(base_dir)
+    _ensure_control_plane_db_with_diagnostic(
+        base_dir=base_dir,
+        command_label="release",
+        allow_create=False,
+    )
     timestamp = _now(updated_at)
     _ = _repair_stale_release_pending_fences(base_dir=base_dir, updated_at=timestamp)
     release_capacity = _release_capacity()
@@ -2835,6 +2869,11 @@ def _run_reconcile_issue_cli(*, base_dir: Path, issue_number: str, updated_at: s
 
 
 def _run_reconcile_db_cli(*, base_dir: Path, issue_number: str, updated_at: str | None, child_only: bool) -> int:
+    _ensure_control_plane_db_with_diagnostic(
+        base_dir=base_dir,
+        command_label="advance-child" if child_only else "reconcile",
+        allow_create=False,
+    )
     if child_only:
         issue = read_issue(base_dir, issue_number)
         current_role = str(issue.get("current_role") or "") if issue is not None else ""
@@ -4187,6 +4226,11 @@ def submit_artifact(
     timestamp = _now(updated_at)
     if artifact_kind not in {"worker_result", "evidence_packet", "release_result"}:
         raise ValueError(f"unsupported artifact kind {artifact_kind!r}")
+    db_path = control_plane_db_path(base_dir)
+    if not db_path.exists():
+        raise RuntimeError(
+            f"control-plane DB missing at {db_path}; refusing to recreate during active submit-artifact workflow"
+        )
     issue = read_issue(base_dir, issue_number)
     if issue is None:
         raise ValueError(f"unknown issue #{issue_number}")

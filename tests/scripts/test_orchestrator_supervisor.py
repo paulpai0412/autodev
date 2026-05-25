@@ -11,6 +11,7 @@ from contextlib import redirect_stdout
 from unittest.mock import patch
 
 import pytest
+from pytest import CaptureFixture
 import scripts.orchestrator_supervisor as orchestrator_supervisor
 from scripts.control_plane_db import read_github_sync_attempt, read_issue, read_latest_github_sync_attempt, read_latest_issue_history, read_latest_ref
 from scripts.host_adapter import SessionOutcome, SessionStartContext, SessionStartResult
@@ -2085,6 +2086,37 @@ def test_reconcile_workspace_reports_intake_exception_without_blocking_scheduler
     assert payload["intake_error"] == "gh unavailable"
 
 
+def test_reconcile_workspace_logs_db_creation_when_control_plane_db_missing(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
+    db_path = tmp_path / ".opencode/runtime/control-plane.sqlite3"
+    with pytest.raises(
+        RuntimeError,
+        match=r"control-plane DB missing .* refusing to recreate during active reconcile workflow",
+    ):
+        _ = orchestrator_supervisor.reconcile_workspace_from_db(
+            base_dir=tmp_path,
+            updated_at="2026-05-07T17:10:00+08:00",
+            source_session_id="workspace-reconcile",
+        )
+
+    captured = capsys.readouterr()
+    assert f"[autodev:reconcile] control-plane-db-missing-before-command={db_path}" in captured.err
+    assert "control-plane-db-created=" not in captured.err
+
+
+def test_reconcile_workspace_skips_db_creation_log_when_control_plane_db_exists(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
+    orchestrator_supervisor.ensure_control_plane_db(tmp_path)
+
+    _ = orchestrator_supervisor.reconcile_workspace_from_db(
+        base_dir=tmp_path,
+        updated_at="2026-05-07T17:10:00+08:00",
+        source_session_id="workspace-reconcile",
+    )
+
+    captured = capsys.readouterr()
+    assert "control-plane-db-created=" not in captured.err
+    assert "control-plane-db-missing-before-command=" not in captured.err
+
+
 def test_start_release_claims_verified_issue_and_launches_independent_release_root_session(tmp_path: Path) -> None:
     _ingest_issue_packet_text(tmp_path, "42", SAMPLE_ISSUE_PACKET)
     orchestrator_supervisor.upsert_issue_state(
@@ -2150,6 +2182,127 @@ def test_start_release_claims_verified_issue_and_launches_independent_release_ro
     assert "independent release root session" in child_context.prompt
     assert "foreground release_worker subagent" in child_context.prompt
     assert "Current release override: approval_override_mode=bypass_approval" in child_context.prompt
+
+
+def test_start_release_logs_db_creation_when_control_plane_db_missing(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
+    _ingest_issue_packet_text(tmp_path, "42", SAMPLE_ISSUE_PACKET)
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="verified",
+        command_id="cmd-verified",
+        updated_at="2026-05-07T17:00:00+08:00",
+    )
+    orchestrator_supervisor.record_pr_opened(
+        base_dir=tmp_path,
+        issue_number="42",
+        pr_number="77",
+        created_at="2026-05-07T17:00:00+08:00",
+        verifier_session_id="ses-v",
+        command_id="cmd-pr",
+        payload={"issue_number": "42", "pr_number": "77"},
+    )
+    db_path = tmp_path / ".opencode/runtime/control-plane.sqlite3"
+    db_path.unlink()
+    adapter = successful_host_adapter(session_id="ses-release-42", resume_command="opencode --session ses-release-42")
+
+    with patch("scripts.orchestrator_supervisor._default_host_adapter", return_value=adapter):
+        with pytest.raises(
+            RuntimeError,
+            match=r"control-plane DB missing .* refusing to recreate during active release workflow",
+        ):
+            _ = orchestrator_supervisor.start_release(
+                base_dir=tmp_path,
+                issue_number="42",
+                source_session_id="manual-release",
+                updated_at="2026-05-07T17:10:00+08:00",
+            )
+
+    captured = capsys.readouterr()
+    assert f"[autodev:release] control-plane-db-missing-before-command={db_path}" in captured.err
+    assert "control-plane-db-created=" not in captured.err
+
+
+def test_submit_artifact_fails_fast_when_control_plane_db_is_missing(tmp_path: Path) -> None:
+    db_path = tmp_path / ".opencode/runtime/control-plane.sqlite3"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    if db_path.exists():
+        db_path.unlink()
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"control-plane DB missing .* refusing to recreate during active submit-artifact workflow",
+    ):
+        _ = orchestrator_supervisor.submit_artifact(
+            base_dir=tmp_path,
+            issue_number="42",
+            artifact_kind="release_result",
+            payload={
+                "status": "blocked",
+                "blocked_reason": "required_checks_pending",
+                "next_recommended_step": "wait checks",
+            },
+            updated_at="2026-05-08T10:00:00+08:00",
+        )
+
+
+def test_advance_child_fails_fast_when_control_plane_db_is_missing(tmp_path: Path, capsys) -> None:
+    db_path = tmp_path / ".opencode/runtime/control-plane.sqlite3"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    if db_path.exists():
+        db_path.unlink()
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"control-plane DB missing .* refusing to recreate during active advance-child workflow",
+    ):
+        _ = orchestrator_supervisor.main(
+            [
+                "advance-child",
+                "--base-dir",
+                str(tmp_path),
+                "--issue-number",
+                "42",
+                "--updated-at",
+                "2026-05-07T17:10:00+08:00",
+            ]
+        )
+
+    captured = capsys.readouterr()
+    assert f"[autodev:advance-child] control-plane-db-missing-before-command={db_path}" in captured.err
+
+
+def test_start_release_skips_db_creation_log_when_control_plane_db_exists(tmp_path: Path, capsys: CaptureFixture[str]) -> None:
+    _ingest_issue_packet_text(tmp_path, "42", SAMPLE_ISSUE_PACKET)
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="verified",
+        command_id="cmd-verified",
+        updated_at="2026-05-07T17:00:00+08:00",
+    )
+    orchestrator_supervisor.record_pr_opened(
+        base_dir=tmp_path,
+        issue_number="42",
+        pr_number="77",
+        created_at="2026-05-07T17:00:00+08:00",
+        verifier_session_id="ses-v",
+        command_id="cmd-pr",
+        payload={"issue_number": "42", "pr_number": "77"},
+    )
+    adapter = successful_host_adapter(session_id="ses-release-42", resume_command="opencode --session ses-release-42")
+
+    with patch("scripts.orchestrator_supervisor._default_host_adapter", return_value=adapter):
+        _ = orchestrator_supervisor.start_release(
+            base_dir=tmp_path,
+            issue_number="42",
+            source_session_id="manual-release",
+            updated_at="2026-05-07T17:10:00+08:00",
+        )
+
+    captured = capsys.readouterr()
+    assert "control-plane-db-created=" not in captured.err
+    assert "control-plane-db-missing-before-command=" not in captured.err
 
 
 def test_dispatch_session_request_surfaces_child_session_tracking_for_release_root_execution() -> None:
