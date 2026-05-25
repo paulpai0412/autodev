@@ -603,58 +603,6 @@ PY
 )
 }
 
-autodev_release_pending_fallback() {
-  # Optional fallback path: if an issue is release_pending and has open PR, run release-finalize.
-  # This helps when release root session is degraded/stuck but merge state is already clean.
-  if [ ! -f "$DB_PATH" ]; then
-    return 0
-  fi
-
-  while IFS=$'\t' read -r issue branch worktree pr; do
-    [ -z "$issue" ] && continue
-    [ -z "$pr" ] && continue
-
-    local pr_state
-    pr_state=$(gh pr view "$pr" --repo "$REPO" --json state --jq '.state' 2>/dev/null || true)
-    if [ "$pr_state" = "MERGED" ] || [ "$pr_state" = "CLOSED" ]; then
-      continue
-    fi
-
-    run_cmd python3 "$SUPERVISOR_PY" release-finalize \
-      --base-dir "$PROJECT_ROOT" \
-      --issue-number "$issue" \
-      --pr-number "$pr" \
-      --repo "$REPO" \
-      --issue-branch "$branch" \
-      --worktree-path "$worktree" \
-      --merge-method squash
-  done < <(python3 - "$DB_PATH" <<'PY'
-import sqlite3, json, sys
-db = sys.argv[1]
-con = sqlite3.connect(db)
-con.row_factory = sqlite3.Row
-rows = con.execute("""
-  select issue_number, branch, worktree_path, artifact_status_json
-  from issues
-  where state='release_pending'
-""").fetchall()
-for r in rows:
-    pr = ""
-    try:
-        payload = json.loads(r[3] or "{}")
-        p = payload.get("evidence_packet")
-        if isinstance(p, dict):
-            pr = str(p.get("pr_number") or "")
-    except Exception:
-        pr = ""
-    if not pr:
-        continue
-    print(f"{r['issue_number']}\t{r['branch']}\t{r['worktree_path']}\t{pr}")
-con.close()
-PY
-)
-}
-
 sleep_with_heartbeat() {
   local total="$1"
   local open_count="$2"
@@ -710,7 +658,6 @@ main() {
     autodev_recovery
     autodev_reconcile
     autodev_release_verified
-    autodev_release_pending_fallback
 
     print_db_snapshot
     print_github_snapshot
