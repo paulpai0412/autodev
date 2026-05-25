@@ -58,6 +58,16 @@ def _release_child_session(issue: dict[str, Any] | None) -> JsonObject:
     return _json_object(payload)
 
 
+def _failure_context(issue: dict[str, Any] | None) -> JsonObject:
+    runtime_context = _load_issue_json(issue, "runtime_context_json")
+    return _json_object(runtime_context.get("failure_context"))
+
+
+def _recovery_cursor(issue: dict[str, Any] | None) -> JsonObject:
+    runtime_context = _load_issue_json(issue, "runtime_context_json")
+    return _json_object(runtime_context.get("recovery_cursor"))
+
+
 def _select_monitored_issue(*, base_dir: Path, issue_number: str | None) -> dict[str, Any] | None:
     if issue_number:
         return read_issue(base_dir, issue_number)
@@ -194,6 +204,8 @@ def collect_monitor_events(
     current_status = str(current.get("status") or "")
     runtime_state = str(runtime_issue.get("state") or "")
     release_child_session = _release_child_session(runtime_issue)
+    failure_context = _failure_context(runtime_issue)
+    recovery_cursor = _recovery_cursor(runtime_issue)
     effective_now = now or datetime.now().astimezone().isoformat(timespec="seconds")
     now_time = _parse_timestamp(effective_now)
     last_event_time = _parse_timestamp(str(runtime_issue.get("last_event_at") or ""))
@@ -248,6 +260,20 @@ def collect_monitor_events(
                 severity="critical",
                 summary=f"Issue #{monitored_issue_number} is quarantined and needs explicit operator attention.",
                 evidence={"issue_number": monitored_issue_number, "state": runtime_state},
+            )
+        )
+
+    if runtime_state == "failed" and bool(failure_context.get("retryable")) and recovery_cursor:
+        events.append(
+            _build_event(
+                rule_id="RETRYABLE_FAILED_RECOVERY_CURSOR",
+                severity="info",
+                summary=f"Issue #{monitored_issue_number} is failed but retryable with a persisted recovery cursor.",
+                evidence={
+                    "issue_number": monitored_issue_number,
+                    "failure_context": failure_context,
+                    "recovery_cursor": recovery_cursor,
+                },
             )
         )
 

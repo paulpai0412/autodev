@@ -1133,3 +1133,67 @@ def test_watch_mode_stops_early_on_critical_issue(tmp_path: Path, monkeypatch) -
     assert exit_code == 1
     assert len(log_lines) >= 1
     assert sleep_calls == []
+
+
+def test_collect_monitor_events_reports_retryable_failed_recovery_cursor(tmp_path: Path) -> None:
+    issue_packet_path = tmp_path / "docs/agents/issue-packets/issue-42.yaml"
+    issue_packet_path.parent.mkdir(parents=True, exist_ok=True)
+    issue_packet_path.write_text(_issue_packet_text("42"), encoding="utf-8")
+    issue_packet = parse_issue_packet_text(issue_packet_path.read_text(encoding="utf-8"), "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, primary_workspace_root=str(tmp_path), updated_at="2026-05-07T17:00:00+08:00")
+    ledger["lastFailure"] = {
+        "kind": "approval_blocked",
+        "summary": "Retry release after approval.",
+        "retryable": True,
+        "owner_role": "main_orchestrator",
+        "owner_stage": "release_root_execution",
+        "owner_state": "release_pending",
+        "artifact_kind": "release_result",
+        "failure_class": "release",
+        "recovery_cursor": {
+            "resume_role": "main_orchestrator",
+            "resume_stage": "release_root_execution",
+            "resume_state": "release_pending",
+            "resume_strategy": "retry_same_phase",
+        },
+    }
+    _ = ingest_issue_packet(
+        tmp_path,
+        issue_number="42",
+        issue_packet={
+            "issue_number": "42",
+            "title": "Issue 42",
+            "branch": "agent/issue-42-demo",
+            "raw_text": issue_packet_path.read_text(encoding="utf-8"),
+        },
+        updated_at="2026-05-07T17:00:00+08:00",
+    )
+    _ = upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="failed",
+        command_id="cmd-failed",
+        updated_at="2026-05-07T17:01:00+08:00",
+    )
+    _ = sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:02:00+08:00",
+        current_role="main_orchestrator",
+        current_stage="issue_selection_or_recovery",
+        current_status="queued",
+        last_failure=cast(dict[str, object], ledger["lastFailure"]),
+        runtime_context={
+            "failure_context": cast(dict[str, object], ledger["lastFailure"]),
+            "recovery_cursor": cast(dict[str, object], cast(dict[str, object], ledger["lastFailure"]).get("recovery_cursor", {})),
+        },
+        automation_flags=cast(dict[str, object], ledger["automation"]),
+    )
+
+    events = collect_monitor_events(base_dir=tmp_path, issue_number="42", now="2026-05-07T17:03:00+08:00")
+
+    recovery_event = next(event for event in events if str(event["rule_id"]) == "RETRYABLE_FAILED_RECOVERY_CURSOR")
+    evidence = cast(dict[str, object], recovery_event["evidence"])
+    recovery_cursor = cast(dict[str, object], evidence["recovery_cursor"])
+    assert recovery_event["severity"] == "info"
+    assert recovery_cursor["resume_stage"] == "release_root_execution"
