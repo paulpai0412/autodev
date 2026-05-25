@@ -240,7 +240,7 @@ def _release_root_prompt_lines(
         "After merge succeeds, run workspace hygiene and persist release_result.workspace_hygiene with cleanup_status plus branch/dirty/worktree cleanup fields.",
         "During workspace hygiene, do not run `git stash -a`, `git stash --all`, or any `git clean -xfd` style cleanup; these may remove control-plane/runtime state.",
         "Treat `.opencode/runtime/control-plane.sqlite3` and `.opencode/runtime/` as protected runtime state: never stash, delete, or clean them.",
-        "If `.opencode/` appears in primary workspace status, resolve hygiene by adding `.opencode/` to `.git/info/exclude` (or equivalent ignore configuration) instead of stash/clean.",
+        "If runtime artifact paths such as `.opencode/`, `.playwright-mcp/`, or `artifacts/` appear in workspace status, resolve hygiene by adding them to `.git/info/exclude` (or equivalent ignore configuration) instead of stash/clean.",
         (
             f"Current release override: approval_override_mode={approval_override_mode or 'none'}, override_source={override_source}, human_approval_skipped={'true' if human_approval_skipped else 'false'}."
             if approval_override_mode or human_approval_skipped or override_source != 'none'

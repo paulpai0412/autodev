@@ -160,7 +160,9 @@ def test_build_prompt_for_release_worker_mentions_release_approval_override() ->
     assert "`git stash --all`" in prompt
     assert "git clean -xfd" in prompt
     assert "Treat `.opencode/runtime/control-plane.sqlite3` and `.opencode/runtime/` as protected runtime state" in prompt
-    assert "adding `.opencode/` to `.git/info/exclude`" in prompt
+    assert "`.playwright-mcp/`" in prompt
+    assert "`artifacts/`" in prompt
+    assert "`.git/info/exclude`" in prompt
     assert "single merge authority" in prompt
     assert "return control to the supervisor/release command result" in prompt
     assert "Do not perform the merge/close workflow directly from the release root shell" in prompt
