@@ -154,6 +154,11 @@ def test_build_prompt_for_release_worker_mentions_release_approval_override() ->
     assert "override_scope" in prompt
     assert "git fetch origin --prune" in prompt
     assert "git pull --ff-only origin main" in prompt
+    assert "If the PR is conflicted or not mergeable because the head branch is behind or diverged" in prompt
+    assert "resolve conflicts yourself" in prompt
+    assert "re-evaluate mergeability before deciding the final release state" in prompt
+    assert "Only submit a failed release state for merge conflicts after you attempted conflict resolution in good faith" in prompt
+    assert "do not mark the release failed on the first conflicted check" in prompt
     assert "release_result.merge_gate" in prompt
     assert "release_result.workspace_hygiene" in prompt
     assert "do not run `git stash -a`" in prompt

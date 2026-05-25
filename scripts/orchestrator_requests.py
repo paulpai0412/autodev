@@ -235,6 +235,8 @@ def _release_root_prompt_lines(
         'If `approval_override_mode` is `"bypass_approval"`, skip only the human approval requirement while still enforcing verifier pass, required checks, PR mergeability, review gate, diagnostics/build gate, surface QA gate, and workspace hygiene.',
         'When bypassing approval, record `merge_approval_mode`, `human_approval_skipped`, `override_source`, and `override_scope` in the release result summary or metadata fields.',
         "Before merge, enforce local convergence in this order: `git fetch origin --prune` -> `git switch main` -> `git pull --ff-only origin main`; if any step fails, report blocked and do not merge.",
+        "If the PR is conflicted or not mergeable because the head branch is behind or diverged, first attempt to update the head branch from the base branch, resolve conflicts yourself, rerun any checks affected by the resolution, and then re-evaluate mergeability before deciding the final release state.",
+        "Only submit a failed release state for merge conflicts after you attempted conflict resolution in good faith and the branch still cannot be merged safely; do not mark the release failed on the first conflicted check.",
         "Evaluate merge gates explicitly and persist them in release_result.merge_gate: checks_state (pending|failed|passed), mergeability_state (conflicted|clean), approval_state (missing|satisfied), blocked_reason, next_action.",
         "Use remote GitHub PR merge as the single merge authority; do not merge main by local push.",
         "After merge succeeds, run workspace hygiene and persist release_result.workspace_hygiene with cleanup_status plus branch/dirty/worktree cleanup fields.",
