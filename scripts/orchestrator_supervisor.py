@@ -20,6 +20,8 @@ from uuid import uuid4
 from typing import Callable, NotRequired, Protocol, TypedDict, cast
 from urllib.parse import unquote, urlparse
 
+import yaml
+
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -1825,6 +1827,26 @@ def _refresh_running_issue_heartbeat_from_worker_result(
     return True
 
 
+def _projection_updated_at_from_worker_result(
+    *,
+    base_dir: Path,
+    issue_number: str,
+    fallback_updated_at: str,
+) -> str:
+    worker_result = _read_db_artifact_fact(base_dir=base_dir, issue_number=issue_number, artifact_kind="worker_result")
+    completed_at = str(worker_result.get("completed_at") or "").strip()
+    completed_time = _parse_iso8601(completed_at)
+    if completed_time is None:
+        return fallback_updated_at
+
+    fallback_time = _parse_iso8601(fallback_updated_at)
+    if fallback_time is None:
+        return completed_at
+    if completed_time <= fallback_time:
+        return completed_at
+    return fallback_updated_at
+
+
 def _record_current_verifier_session(
     *,
     base_dir: Path,
@@ -2082,11 +2104,13 @@ def _sync_project_fields_projection(
 ) -> str:
     sync_fields = cast(Callable[..., str], _lifecycle_helpers.sync_project_fields_projection)
     timestamp = _now(updated_at)
-    configured = _load_json_dict((read_runtime_context(base_dir, issue_number) or {}).get("github_project_field_ids"))
+    runtime_context = read_runtime_context(base_dir, issue_number) or {}
+    configured = _load_json_dict(runtime_context.get("github_project_field_ids"))
+    configured_fallback = _configured_project_field_ids(base_dir)
     fields: dict[str, str] = {}
-    state_field_id = str(configured.get("state") or "").strip()
-    stage_field_id = str(configured.get("stage") or "").strip()
-    pr_workflow_field_id = str(configured.get("pr_workflow") or "").strip()
+    state_field_id = str(configured.get("state") or configured_fallback.get("state") or "").strip()
+    stage_field_id = str(configured.get("stage") or configured_fallback.get("stage") or "").strip()
+    pr_workflow_field_id = str(configured.get("pr_workflow") or configured_fallback.get("pr_workflow") or "").strip()
 
     issue = read_issue(base_dir, issue_number) or {}
     issue_state, team_workflow_state, pr_workflow_status = _projected_issue_state_and_workflows(
@@ -2408,6 +2432,56 @@ def _load_json_dict(raw: object) -> dict[str, object]:
         except json.JSONDecodeError:
             return {}
     return _json_dict(raw)
+
+
+def _string_map(raw: object) -> dict[str, str]:
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, str] = {}
+    for key, value in raw.items():
+        normalized_key = str(key or "").strip()
+        normalized_value = str(value or "").strip()
+        if normalized_key and normalized_value:
+            result[normalized_key] = normalized_value
+    return result
+
+
+def _read_autodev_config(base_dir: Path) -> dict[str, object]:
+    config_path = _canonical_supervisor_base_dir(base_dir) / ".autodev.yaml"
+    if not config_path.exists():
+        return {}
+    try:
+        parsed = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return {}
+    return cast(dict[str, object], parsed) if isinstance(parsed, dict) else {}
+
+
+def _configured_project_field_ids(base_dir: Path) -> dict[str, str]:
+    return _string_map(_read_autodev_config(base_dir).get("github_project_field_ids"))
+
+
+def _configured_project_id(base_dir: Path) -> str:
+    return str(_read_autodev_config(base_dir).get("github_project_id") or "").strip()
+
+
+def _project_fields_sync_enabled(*, base_dir: Path, issue_number: str) -> bool:
+    runtime_context = read_runtime_context(base_dir, issue_number) or {}
+    runtime_field_ids = _string_map(runtime_context.get("github_project_field_ids"))
+    configured_field_ids = _configured_project_field_ids(base_dir)
+    has_field_ids = any(
+        str(runtime_field_ids.get(key) or configured_field_ids.get(key) or "").strip()
+        for key in ("state", "stage", "pr_workflow")
+    )
+    if not has_field_ids:
+        return False
+
+    project_id = str(runtime_context.get("github_project_id") or "").strip()
+    if not project_id:
+        project_id = str(os.environ.get("AUTODEV_GITHUB_PROJECT_ID", "")).strip()
+    if not project_id:
+        project_id = _configured_project_id(base_dir)
+    return bool(project_id)
 
 
 def _db_issue_to_ledger(issue: dict[str, object], *, runtime_context: dict[str, object]) -> JsonObject:
@@ -4000,29 +4074,42 @@ def retry_github_sync_attempt(
     if latest_attempt is not None and str(latest_attempt.get("command_id") or "") != command_id:
         raise ValueError(f"github sync attempt {command_id!r} is stale for issue #{issue_number}")
 
-    delta = json.loads(str(attempt.get("intended_label_delta") or "{}"))
-    add_labels = delta.get("add", [])
-    remove_labels = delta.get("remove", [])
-    if not isinstance(add_labels, list) or not isinstance(remove_labels, list):
-        raise ValueError(f"github sync attempt {command_id!r} has invalid intended_label_delta")
+    projection_target = str(attempt.get("projection_target") or "labels").strip() or "labels"
+    if projection_target == "labels":
+        delta = json.loads(str(attempt.get("intended_label_delta") or "{}"))
+        add_labels = delta.get("add", [])
+        remove_labels = delta.get("remove", [])
+        if not isinstance(add_labels, list) or not isinstance(remove_labels, list):
+            raise ValueError(f"github sync attempt {command_id!r} has invalid intended_label_delta")
 
-    sync_error = _sync_issue_progress_label(
-        base_dir=base_dir,
-        issue_number=issue_number,
-        add_labels=[str(label) for label in add_labels],
-        remove_labels=[str(label) for label in remove_labels],
-        command_id=command_id,
-        updated_at=updated_at,
-    )
+        sync_error = _sync_issue_progress_label(
+            base_dir=base_dir,
+            issue_number=issue_number,
+            add_labels=[str(label) for label in add_labels],
+            remove_labels=[str(label) for label in remove_labels],
+            command_id=command_id,
+            updated_at=updated_at,
+        )
+    elif projection_target == "project_fields":
+        sync_error = _sync_project_fields_projection(
+            base_dir=base_dir,
+            issue_number=issue_number,
+            command_id=command_id,
+            updated_at=updated_at,
+        )
+    else:
+        raise ValueError(
+            f"github sync attempt {command_id!r} projection_target {projection_target!r} is not retryable"
+        )
     record_admin_decision(
         base_dir,
         command_id=f"{command_id}:retry",
         issue_number=issue_number,
         decision_type="admin_github_sync_retry",
         reason=(
-            f"Retry GitHub sync-safe command {command_id} for issue #{issue_number}."
+            f"Retry GitHub sync-safe command {command_id} ({projection_target}) for issue #{issue_number}."
             if not sync_error
-            else f"Retry GitHub sync-safe command {command_id} for issue #{issue_number} failed again: {sync_error}"
+            else f"Retry GitHub sync-safe command {command_id} ({projection_target}) for issue #{issue_number} failed again: {sync_error}"
         ),
         updated_at=_now(updated_at),
     )
@@ -4482,11 +4569,16 @@ def reconcile_ledger(
             )
             _sync_runtime_phase_metadata(base_dir=base_dir, issue_number=_ledger_issue_number(next_ledger, issue["number"]), current=cast(dict[str, str], next_ledger["current"]), attempts=cast(dict[str, int], next_ledger.get("attempts", {})), limits=cast(dict[str, int], next_ledger.get("limits", {})), last_failure=cast(dict[str, object], next_ledger.get("lastFailure", {})), workflow=cast(dict[str, object], next_ledger.get("workflow", {})), automation=cast(dict[str, object], next_ledger.get("automation", {})), artifacts=cast(dict[str, object], next_ledger.get("artifacts", {})), queued_next_issue=cast(dict[str, object], next_ledger.get("queuedNextIssue", {})), updated_at=timestamp)
             if str(cast(dict[str, object], decision).get("next_role") or "") == "pr_verifier":
+                projection_updated_at = _projection_updated_at_from_worker_result(
+                    base_dir=base_dir,
+                    issue_number=issue["number"],
+                    fallback_updated_at=timestamp,
+                )
                 sync_error = _sync_projected_issue_labels(
                     base_dir=base_dir,
                     issue_number=issue["number"],
                     command_id=f"reconcile:{issue['number']}:issue-worker-pr-opened:labels",
-                    updated_at=timestamp,
+                    updated_at=projection_updated_at,
                 )
                 if sync_error:
                     record_admin_decision(
@@ -4498,8 +4590,27 @@ def reconcile_ledger(
                             f"GitHub projected label sync failed after worker_result success for issue #{issue['number']}: "
                             f"{sync_error}"
                         ),
-                        updated_at=timestamp,
+                        updated_at=projection_updated_at,
                     )
+                if _project_fields_sync_enabled(base_dir=base_dir, issue_number=issue["number"]):
+                    project_error = _sync_project_fields_projection(
+                        base_dir=base_dir,
+                        issue_number=issue["number"],
+                        command_id=f"reconcile:{issue['number']}:issue-worker-pr-opened:project-fields",
+                        updated_at=projection_updated_at,
+                    )
+                    if project_error:
+                        record_admin_decision(
+                            base_dir,
+                            command_id=f"reconcile:{issue['number']}:issue-worker-pr-opened:project-fields:admin-failed",
+                            issue_number=issue["number"],
+                            decision_type="admin_github_projection_failure",
+                            reason=(
+                                f"GitHub project field sync failed after worker_result success for issue #{issue['number']}: "
+                                f"{project_error}"
+                            ),
+                            updated_at=projection_updated_at,
+                        )
             return next_ledger, decision, request
 
         def _route_pr_verifier() -> tuple[JsonObject, JsonObject, JsonObject | None]:
@@ -4564,6 +4675,25 @@ def reconcile_ledger(
                         ),
                         updated_at=timestamp,
                     )
+                if _project_fields_sync_enabled(base_dir=base_dir, issue_number=issue["number"]):
+                    project_error = _sync_project_fields_projection(
+                        base_dir=base_dir,
+                        issue_number=issue["number"],
+                        command_id=f"reconcile:{issue['number']}:pr-verifier-release-waiting:project-fields",
+                        updated_at=timestamp,
+                    )
+                    if project_error:
+                        record_admin_decision(
+                            base_dir,
+                            command_id=f"reconcile:{issue['number']}:pr-verifier-release-waiting:project-fields:admin-failed",
+                            issue_number=issue["number"],
+                            decision_type="admin_github_projection_failure",
+                            reason=(
+                                f"GitHub project field sync failed after verifier pass for issue #{issue['number']}: "
+                                f"{project_error}"
+                            ),
+                            updated_at=timestamp,
+                        )
             return next_ledger, decision, request
 
         def _route_release_root_execution() -> tuple[JsonObject, JsonObject, JsonObject | None]:
@@ -4802,7 +4932,7 @@ def build_parser() -> argparse.ArgumentParser:
     _ = inspect_parser.add_argument("--base-dir", default=".", help="Consumer project root")
     _ = inspect_parser.add_argument("--issue-number", help="Explicit issue number override")
 
-    retry_sync_parser = subparsers.add_parser("retry-github-sync", help="Retry a failed GitHub label sync attempt by command id")
+    retry_sync_parser = subparsers.add_parser("retry-github-sync", help="Retry a failed GitHub projection sync attempt by command id")
     _ = retry_sync_parser.add_argument("--base-dir", default=".", help="Consumer project root")
     _ = retry_sync_parser.add_argument("--command-id", required=True, help="Failed GitHub sync command id to replay")
     _ = retry_sync_parser.add_argument("--updated-at")

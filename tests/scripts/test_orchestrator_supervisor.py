@@ -5307,6 +5307,102 @@ next_recommended_step: \"Release it\"
     assert latest_root_event["session_seq"] == 2
 
 
+def test_reconcile_worker_success_syncs_project_fields_when_project_binding_exists(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, primary_workspace_root=str(tmp_path),
+    updated_at="2026-05-07T17:00:00+08:00",)
+    ledger["current"] = {"role": "issue_worker", "stage": "issue_worker_execution", "status": "queued"}
+    cast(dict[str, int], ledger["attempts"])["issue_worker"] = 1
+
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="worker_result",
+        payload={
+            "status": "success",
+            "pr_number": "77",
+            "next_recommended_step": "Spawn verifier",
+            "failure_kind": "none",
+            "retryable": True,
+            "completed_at": "2026-05-07T17:10:00+08:00",
+            "worker_session_id": "ses",
+        },
+        updated_at="2026-05-07T17:10:00+08:00",
+    )
+    _ = orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:10:30+08:00",
+        runtime_context={
+            "github_project_id": "PVT_project_1",
+            "github_project_field_ids": {
+                "state": "PVTF_state",
+            },
+        },
+    )
+
+    with patch("scripts.orchestrator_supervisor._sync_project_fields_projection", return_value="") as sync_project_fields:
+        updated_ledger, decision, request = reconcile_ledger(ledger, artifact_base_dir=tmp_path,
+        updated_at="2026-05-07T17:11:00+08:00",)
+
+    assert cast(dict[str, object], updated_ledger["current"])["role"] == "pr_verifier"
+    assert decision["action"] == "delegate_subagent"
+    assert request is None
+    sync_project_fields.assert_called_once()
+    kwargs = sync_project_fields.call_args.kwargs
+    assert kwargs["issue_number"] == "42"
+    assert kwargs["command_id"] == "reconcile:42:issue-worker-pr-opened:project-fields"
+
+
+def test_reconcile_verifier_release_waiting_syncs_project_fields_when_project_binding_exists(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "pr_verifier", "stage": "pr_verifier_execution", "status": "queued"}
+    cast(dict[str, str], ledger["artifacts"])["evidence_packet_ref"] = "docs/agents/evidence/issue-42-pr-77.yaml"
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="evidence_packet",
+        payload={
+            "status": "pass",
+            "pr_number": "77",
+            "verifier_session_id": "ses-v",
+            "next_recommended_step": "Release it",
+            "failure_kind": "none",
+            "retryable": True,
+            "gates": {"surface_qa_gate": {"status": "pass", "evidence_ref": "db:evidence:42"}},
+        },
+        updated_at="2026-05-07T17:11:00+08:00",
+    )
+    orchestrator_supervisor.upsert_issue_state(tmp_path,
+    issue_number="42",
+    state="running",
+    command_id="cmd-running",
+    updated_at="2026-05-07T17:09:00+08:00", current_session_id="ses-root-42", )
+    _ = orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:10:30+08:00",
+        runtime_context={
+            "github_project_id": "PVT_project_1",
+            "github_project_field_ids": {
+                "state": "PVTF_state",
+            },
+        },
+    )
+
+    with patch("scripts.orchestrator_supervisor._sync_project_fields_projection", return_value="") as sync_project_fields:
+        updated_ledger, decision, _ = reconcile_ledger(ledger, artifact_base_dir=tmp_path,
+        updated_at="2026-05-07T17:11:00+08:00",)
+
+    assert cast(dict[str, object], updated_ledger["current"])["role"] == "main_orchestrator"
+    assert decision["action"] == "release_waiting"
+    sync_project_fields.assert_called_once()
+    kwargs = sync_project_fields.call_args.kwargs
+    assert kwargs["issue_number"] == "42"
+    assert kwargs["command_id"] == "reconcile:42:pr-verifier-release-waiting:project-fields"
+
+
 def test_reconcile_verifier_requires_persisted_evidence_fact(tmp_path: Path):
     issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
@@ -8971,6 +9067,100 @@ def test_retry_github_sync_command_replays_failed_attempt(tmp_path: Path):
     assert attempt["attempt_count"] == 2
     assert latest_decision is not None
     assert latest_decision["decision_type"] == "admin_github_sync_retry"
+
+
+def test_retry_github_sync_command_replays_failed_project_fields_attempt(tmp_path: Path):
+    orchestrator_supervisor.record_github_sync_attempt(
+        tmp_path,
+        command_id="cmd-project-fields",
+        issue_number="42",
+        add_labels=[],
+        remove_labels=[],
+        status="failed",
+        updated_at="2026-05-07T17:02:00+08:00",
+        last_error="project sync failed",
+        projection_target="project_fields",
+        projection_payload={"project_id": "PVT_project_1", "issue_number": "42"},
+    )
+
+    def fake_sync_project_fields_projection(
+        *,
+        base_dir: Path,
+        issue_number: str,
+        command_id: str | None = None,
+        updated_at: str | None = None,
+    ) -> str:
+        assert command_id is not None
+        orchestrator_supervisor.record_github_sync_attempt(
+            base_dir,
+            command_id=command_id,
+            issue_number=issue_number,
+            add_labels=[],
+            remove_labels=[],
+            status="success",
+            updated_at=str(updated_at or "2026-05-07T17:03:00+08:00"),
+            projection_target="project_fields",
+            projection_payload={"issue_number": issue_number},
+        )
+        return ""
+
+    output = io.StringIO()
+    with patch(
+        "scripts.orchestrator_supervisor._sync_project_fields_projection",
+        side_effect=fake_sync_project_fields_projection,
+    ) as sync_project_fields, redirect_stdout(output):
+        exit_code = orchestrator_supervisor.main([
+            "retry-github-sync",
+            "--base-dir",
+            str(tmp_path),
+            "--command-id",
+            "cmd-project-fields",
+            "--updated-at",
+            "2026-05-07T17:03:00+08:00",
+        ])
+
+    payload = cast(dict[str, object], json.loads(output.getvalue()))
+    attempt = read_github_sync_attempt(tmp_path, "cmd-project-fields")
+    latest_decision = orchestrator_supervisor.read_latest_decision(tmp_path, "42")
+
+    assert exit_code == 0
+    sync_project_fields.assert_called_once()
+    kwargs = sync_project_fields.call_args.kwargs
+    assert kwargs["issue_number"] == "42"
+    assert kwargs["command_id"] == "cmd-project-fields"
+    assert payload["status"] == "success"
+    assert attempt is not None
+    assert attempt["status"] == "success"
+    assert attempt["attempt_count"] == 2
+    assert latest_decision is not None
+    assert latest_decision["decision_type"] == "admin_github_sync_retry"
+
+
+def test_retry_github_sync_command_rejects_non_retryable_projection_target(tmp_path: Path):
+    orchestrator_supervisor.record_github_sync_attempt(
+        tmp_path,
+        command_id="cmd-issue-body",
+        issue_number="42",
+        add_labels=[],
+        remove_labels=[],
+        status="failed",
+        updated_at="2026-05-07T17:02:00+08:00",
+        last_error="body sync failed",
+        projection_target="issue_body",
+    )
+
+    try:
+        orchestrator_supervisor.main([
+            "retry-github-sync",
+            "--base-dir",
+            str(tmp_path),
+            "--command-id",
+            "cmd-issue-body",
+        ])
+    except ValueError as error:
+        assert "is not retryable" in str(error)
+    else:
+        raise AssertionError("expected retry-github-sync to reject unsupported projection_target")
 
 
 def test_retry_github_sync_command_rejects_non_failed_attempt(tmp_path: Path):

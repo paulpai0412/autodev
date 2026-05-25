@@ -46,6 +46,11 @@ def _extract_pr_number_from_fact(fact: dict[str, object]) -> str:
     return ""
 
 
+def _artifact_recorded_at(payload: dict[str, object], *, fallback: str) -> str:
+    recorded_at = str(payload.get("completed_at") or payload.get("recorded_at") or "").strip()
+    return recorded_at or fallback
+
+
 def _issue_packet_requires_browser_e2e(issue_packet: dict[str, object] | None) -> bool:
     if not isinstance(issue_packet, dict):
         return False
@@ -515,7 +520,7 @@ def reconcile_issue_worker(
                 base_dir=base_dir,
                 issue_number=issue["number"],
                 pr_number=pr_number,
-                created_at=updated_at,
+                created_at=_artifact_recorded_at(persisted_worker, fallback=updated_at),
                 verifier_session_id=worker_session_id,
                 command_id=str(persisted_worker.get("command_id") or ""),
                 summary=(
@@ -873,7 +878,7 @@ def reconcile_pr_verifier(
             base_dir=base_dir,
             issue_number=issue["number"],
             pr_number=pr_number,
-            created_at=updated_at,
+            created_at=_artifact_recorded_at(persisted_evidence, fallback=updated_at),
             verifier_session_id=verifier_session_id,
             command_id=str(persisted_evidence.get("command_id") or ""),
             payload={
