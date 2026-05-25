@@ -84,6 +84,12 @@ ARTIFACT_REF_KEYS: dict[str, str] = {
     "release_result": "release_result_ref",
 }
 
+WORKTREE_LOCAL_EXCLUDE_PATTERNS: tuple[str, ...] = (
+    ".opencode/",
+    ".playwright-mcp/",
+    "artifacts/",
+)
+
 
 def _artifact_ref_value(artifacts: dict[str, object], artifact_kind: str) -> str:
     key = ARTIFACT_REF_KEYS.get(artifact_kind)
@@ -193,6 +199,38 @@ def _branch_exists_locally(base_dir: Path, branch: str) -> bool:
     return completed.returncode == 0
 
 
+def _git_path(base_dir: Path, pathspec: str) -> Path | None:
+    completed = _run_git_command(base_dir, ["git", "rev-parse", "--git-path", pathspec])
+    if completed.returncode != 0:
+        return None
+    raw_path = (completed.stdout or "").strip()
+    if not raw_path:
+        return None
+    path = Path(raw_path)
+    if not path.is_absolute():
+        path = (base_dir / path).resolve()
+    return path
+
+
+def _ensure_git_info_exclude(base_dir: Path, patterns: tuple[str, ...]) -> None:
+    exclude_path = _git_path(base_dir, "info/exclude")
+    if exclude_path is None:
+        raise RuntimeError(f"failed to resolve git info/exclude path for {base_dir}")
+    exclude_path.parent.mkdir(parents=True, exist_ok=True)
+    existing = exclude_path.read_text(encoding="utf-8") if exclude_path.exists() else ""
+    existing_lines = existing.splitlines()
+    missing = [pattern for pattern in patterns if pattern not in existing_lines]
+    if not missing:
+        return
+    separator = "" if not existing or existing.endswith("\n") else "\n"
+    block = "".join(f"{pattern}\n" for pattern in missing)
+    exclude_path.write_text(f"{existing}{separator}{block}", encoding="utf-8")
+
+
+def _ensure_worktree_local_exclude(worktree_path: Path) -> None:
+    _ensure_git_info_exclude(worktree_path, WORKTREE_LOCAL_EXCLUDE_PATTERNS)
+
+
 def _ensure_issue_worktree(
     *,
     base_dir: Path,
@@ -218,6 +256,7 @@ def _ensure_issue_worktree(
     branch_worktrees = _list_branch_worktrees(base_dir)
     existing = branch_worktrees.get(normalized_branch)
     if existing is not None:
+        _ensure_worktree_local_exclude(existing)
         return existing
 
     worktree_path = _issue_worktree_path(base_dir, issue_number)
@@ -235,6 +274,7 @@ def _ensure_issue_worktree(
     if completed.returncode != 0:
         error = (completed.stderr or completed.stdout).strip() or "git worktree add failed"
         raise RuntimeError(f"failed to prepare worktree for issue #{issue_number}: {error}")
+    _ensure_worktree_local_exclude(worktree_path)
     return worktree_path
 
 

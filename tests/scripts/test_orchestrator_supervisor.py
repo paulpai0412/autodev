@@ -1378,6 +1378,7 @@ def test_start_issue_creates_issue_specific_worktree_in_real_git_repo(tmp_path: 
     worktree_path = tmp_path / ".opencode/runtime/issue-worktrees/issue-42"
     issue = read_issue(tmp_path, "42")
     runtime_context = orchestrator_supervisor.read_runtime_context(tmp_path, "42")
+    exclude_path = orchestrator_supervisor._git_path(worktree_path, "info/exclude")
 
     assert result.get("status") == "success"
     assert worktree_path.exists()
@@ -1385,6 +1386,45 @@ def test_start_issue_creates_issue_specific_worktree_in_real_git_repo(tmp_path: 
     assert issue is not None
     assert issue.get("worktree_path") == str(worktree_path)
     assert runtime_context.get("issue_worktree_path") == str(worktree_path)
+    assert exclude_path is not None
+    exclude_text = exclude_path.read_text(encoding="utf-8")
+    for pattern in orchestrator_supervisor.WORKTREE_LOCAL_EXCLUDE_PATTERNS:
+        assert pattern in exclude_text
+
+
+def test_ensure_issue_worktree_backfills_local_exclude_for_existing_worktree(tmp_path: Path):
+    _ = subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    _ = subprocess.run(["git", "config", "user.email", "autodev@example.com"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    _ = subprocess.run(["git", "config", "user.name", "autodev"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    readme = tmp_path / "README.md"
+    readme.write_text("demo\n", encoding="utf-8")
+    _ = subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True, capture_output=True, text=True)
+    _ = subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True, text=True)
+
+    worktree_path = tmp_path / ".opencode/runtime/issue-worktrees/issue-42"
+    _ = subprocess.run(
+        ["git", "worktree", "add", "-b", "agent/issue-42-demo", str(worktree_path), "main"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    exclude_path = orchestrator_supervisor._git_path(worktree_path, "info/exclude")
+    assert exclude_path is not None
+    exclude_path.write_text("", encoding="utf-8")
+
+    resolved = orchestrator_supervisor._ensure_issue_worktree(
+        base_dir=tmp_path,
+        issue_number="42",
+        branch="agent/issue-42-demo",
+        base_branch="main",
+        updated_at="2026-05-07T17:10:00+08:00",
+    )
+
+    assert resolved == worktree_path
+    exclude_text = exclude_path.read_text(encoding="utf-8")
+    for pattern in orchestrator_supervisor.WORKTREE_LOCAL_EXCLUDE_PATTERNS:
+        assert pattern in exclude_text
 
 
 def test_start_issue_from_issue_worktree_uses_root_control_plane_db(tmp_path: Path):
@@ -2074,6 +2114,7 @@ def test_auto_release_backfill_bypass_approval_can_complete_end_to_end(tmp_path:
 
 
 def test_reconcile_workspace_reports_intake_exception_without_blocking_scheduler(tmp_path: Path) -> None:
+    orchestrator_supervisor.ensure_control_plane_db(tmp_path)
     with patch("scripts.orchestrator_supervisor.run_issue_packet_intake", side_effect=RuntimeError("gh unavailable")):
         payload = orchestrator_supervisor.reconcile_workspace_from_db(
             base_dir=tmp_path,
