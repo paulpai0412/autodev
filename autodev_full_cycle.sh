@@ -425,6 +425,34 @@ open_issue_count() {
 }
 
 first_ready_issue_number() {
+  if [ -f "$DB_PATH" ]; then
+    local from_db
+    from_db=$(python3 - "$DB_PATH" <<'PY'
+import sqlite3, sys
+
+db = sys.argv[1]
+con = sqlite3.connect(db)
+row = con.execute(
+    """
+    select issue_number
+    from issues
+    where state='ready'
+      and current_session_id=''
+      and rank_score >= 0
+    order by rank_score desc, cast(issue_number as integer)
+    limit 1
+    """
+).fetchone()
+con.close()
+print((row[0] if row else ""))
+PY
+)
+    if [ -n "$from_db" ]; then
+      printf '%s' "$from_db"
+      return 0
+    fi
+  fi
+
   gh issue list \
     --repo "$REPO" \
     --state open \
