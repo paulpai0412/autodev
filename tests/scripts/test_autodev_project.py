@@ -150,6 +150,8 @@ def test_init_creates_project_contract_dirs_and_agents_managed_block(tmp_path: P
     gitignore = read(tmp_path / ".gitignore")
     assert ".opencode/runtime/*" in gitignore
     assert "!.opencode/runtime/.gitkeep" in gitignore
+    assert ".playwright-mcp/" in gitignore
+    assert "artifacts/" in gitignore
     agents = read(tmp_path / "AGENTS.md")
     assert "Keep this project-specific guidance." in agents
     assert "<!-- AUTODEV:BEGIN -->" in agents
@@ -558,8 +560,26 @@ def test_doctor_reports_tracked_runtime_files(tmp_path: Path, capsys: CaptureFix
     captured = capsys.readouterr()
 
     assert exit_code == 1
-    assert "missing .gitignore entries for .opencode/runtime/*" in captured.out
+    assert "missing .gitignore entries for autodev runtime/tool artifacts" in captured.out
     assert "tracked autodev runtime files must be removed from git index: .opencode/runtime/control-plane.sqlite3" in captured.out
+
+
+def test_ensure_runtime_gitignore_backfills_local_artifact_lines_without_duplication(tmp_path: Path) -> None:
+    write(
+        tmp_path / ".gitignore",
+        "# existing\n.opencode/runtime/*\n.opencode/runtime/control-plane.sqlite3\n!.opencode/runtime/.gitkeep\n",
+    )
+
+    report = autodev_project.ActionReport(actions=[], findings=[])
+
+    autodev_project._ensure_runtime_gitignore(tmp_path, dry_run=False, check=False, report=report)
+
+    gitignore = read(tmp_path / ".gitignore")
+
+    assert gitignore.count(".opencode/runtime/*") == 1
+    assert gitignore.count(".opencode/runtime/control-plane.sqlite3") == 1
+    assert ".playwright-mcp/" in gitignore
+    assert "artifacts/" in gitignore
 
 
 def test_runtime_gitignore_requires_explicit_control_plane_db_line(tmp_path: Path) -> None:

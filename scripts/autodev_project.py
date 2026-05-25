@@ -75,6 +75,17 @@ RUNTIME_GITIGNORE_LINES = [
     "!.opencode/runtime/.gitkeep",
 ]
 
+LOCAL_ARTIFACT_GITIGNORE_LINES = [
+    "# local tool and test artifacts",
+    ".playwright-mcp/",
+    "artifacts/",
+]
+
+REQUIRED_GITIGNORE_LINES = [
+    *RUNTIME_GITIGNORE_LINES[1:],
+    *LOCAL_ARTIFACT_GITIGNORE_LINES[1:],
+]
+
 TRACKED_RUNTIME_BLOCK_PREFIX = "tracked autodev runtime files must be removed from git index:"
 
 DEFAULT_ENV_VARS: dict[str, str] = {
@@ -246,19 +257,36 @@ def _runtime_gitignore_is_configured(root: Path) -> bool:
     if not gitignore.exists():
         return False
     text = _read_text(gitignore)
-    return all(line in text.splitlines() for line in RUNTIME_GITIGNORE_LINES[1:])
+    return all(line in text.splitlines() for line in REQUIRED_GITIGNORE_LINES)
 
 
 def _ensure_runtime_gitignore(root: Path, *, dry_run: bool, check: bool, report: ActionReport) -> None:
     if _runtime_gitignore_is_configured(root):
         return
-    report.actions.append("update .gitignore for autodev runtime state")
+    report.actions.append("update .gitignore for autodev runtime state and local artifacts")
     if dry_run or check:
         return
     gitignore = root / ".gitignore"
     original = _read_text(gitignore) if gitignore.exists() else ""
+    existing_lines = original.splitlines()
+    existing_line_set = set(existing_lines)
+    additions: list[str] = []
+
+    for block in (RUNTIME_GITIGNORE_LINES, LOCAL_ARTIFACT_GITIGNORE_LINES):
+        missing = [line for line in block[1:] if line not in existing_line_set]
+        if not missing:
+            continue
+        if block[0] not in existing_line_set:
+            additions.append(block[0])
+            existing_line_set.add(block[0])
+        additions.extend(missing)
+        existing_line_set.update(missing)
+
+    if not additions:
+        return
+
     separator = "" if not original or original.endswith("\n") else "\n"
-    block = "\n".join(RUNTIME_GITIGNORE_LINES) + "\n"
+    block = "\n".join(additions) + "\n"
     _write_text(gitignore, f"{original}{separator}{block}")
 
 
@@ -1321,7 +1349,7 @@ def doctor_project(root: Path) -> ActionReport:
     if not (root / ".opencode/runtime/control-plane.sqlite3").exists():
         report.findings.append("missing .opencode/runtime/control-plane.sqlite3")
     if _is_git_repo(root) and not _runtime_gitignore_is_configured(root):
-        report.findings.append("missing .gitignore entries for .opencode/runtime/*")
+        report.findings.append("missing .gitignore entries for autodev runtime/tool artifacts")
     tracked_runtime = _tracked_runtime_paths(root)
     if tracked_runtime:
         report.findings.append(
