@@ -11,6 +11,63 @@ from uuid import uuid4
 JsonObject = dict[str, object]
 ReconcileResult = tuple[JsonObject, JsonObject, JsonObject | None]
 
+
+def _normalized_current_role_stage(ledger: JsonObject) -> tuple[str, str]:
+    current = cast(dict[str, str], ledger.get("current", {}))
+    return str(current.get("role") or "").strip(), str(current.get("stage") or "").strip()
+
+
+def _default_owner_state(*, role: str, stage: str) -> str:
+    if role == "issue_worker":
+        return "running"
+    if role == "pr_verifier":
+        return "verifying"
+    if role == "main_orchestrator" and stage == "release_root_execution":
+        return "release_pending"
+    if role == "main_orchestrator" and stage == "orchestrator_bootstrap":
+        return "running"
+    return ""
+
+
+def _default_failure_class(*, role: str, stage: str) -> str:
+    if role == "issue_worker":
+        return "worker"
+    if role == "pr_verifier":
+        return "verifier"
+    if role == "main_orchestrator" and stage == "release_root_execution":
+        return "release"
+    return "orchestrator"
+
+
+def _default_recovery_cursor(*, role: str, stage: str) -> dict[str, object]:
+    if role == "issue_worker":
+        return {
+            "resume_role": "issue_worker",
+            "resume_stage": stage or "issue_worker_execution",
+            "resume_state": "running",
+            "resume_strategy": "retry_same_role",
+        }
+    if role == "pr_verifier":
+        return {
+            "resume_role": "pr_verifier",
+            "resume_stage": stage or "pr_verifier_execution",
+            "resume_state": "verifying",
+            "resume_strategy": "retry_same_role",
+        }
+    if role == "main_orchestrator" and stage == "release_root_execution":
+        return {
+            "resume_role": "main_orchestrator",
+            "resume_stage": "release_root_execution",
+            "resume_state": "release_pending",
+            "resume_strategy": "retry_same_phase",
+        }
+    return {
+        "resume_role": "main_orchestrator",
+        "resume_stage": "issue_selection_or_recovery",
+        "resume_state": "failed",
+        "resume_strategy": "retry_via_orchestrator_recovery",
+    }
+
 def _set_artifact_ref(artifacts: dict[str, str], semantic_key: str, value: str) -> None:
     artifacts[semantic_key] = value
 
@@ -240,11 +297,70 @@ def queue_transition(
     }
 
 
-def set_failure(ledger: JsonObject, *, kind: str, summary: str, retryable: bool) -> None:
+def set_failure(
+    ledger: JsonObject,
+    *,
+    kind: str,
+    summary: str,
+    retryable: bool,
+    failure_class: str = "",
+    artifact_kind: str = "",
+    owner_role: str = "",
+    owner_stage: str = "",
+    owner_state: str = "",
+    resume_role: str = "",
+    resume_stage: str = "",
+    resume_state: str = "",
+    resume_strategy: str = "",
+) -> None:
+    if kind == "none":
+        ledger["lastFailure"] = {
+            "kind": "none",
+            "summary": "",
+            "retryable": retryable,
+            "failure_class": "",
+            "artifact_kind": "",
+            "owner_role": "",
+            "owner_stage": "",
+            "owner_state": "",
+            "recovery_cursor": {},
+        }
+        return
+
+    current_role, current_stage = _normalized_current_role_stage(ledger)
+    normalized_owner_role = owner_role or current_role
+    normalized_owner_stage = owner_stage or current_stage
+    normalized_owner_state = owner_state or _default_owner_state(
+        role=normalized_owner_role,
+        stage=normalized_owner_stage,
+    )
+    normalized_failure_class = failure_class or _default_failure_class(
+        role=normalized_owner_role,
+        stage=normalized_owner_stage,
+    )
+    recovery_cursor = _default_recovery_cursor(
+        role=normalized_owner_role,
+        stage=normalized_owner_stage,
+    )
+    if resume_role:
+        recovery_cursor["resume_role"] = resume_role
+    if resume_stage:
+        recovery_cursor["resume_stage"] = resume_stage
+    if resume_state:
+        recovery_cursor["resume_state"] = resume_state
+    if resume_strategy:
+        recovery_cursor["resume_strategy"] = resume_strategy
+
     ledger["lastFailure"] = {
         "kind": kind,
         "summary": summary,
         "retryable": retryable,
+        "failure_class": normalized_failure_class,
+        "artifact_kind": artifact_kind,
+        "owner_role": normalized_owner_role,
+        "owner_stage": normalized_owner_stage,
+        "owner_state": normalized_owner_state,
+        "recovery_cursor": recovery_cursor,
     }
 
 
@@ -488,7 +604,13 @@ def reconcile_issue_worker(
             f"Issue worker for issue #{issue['number']} ended without recording a worker_result in SQLite. "
             "Retry the worker session as a contract repair."
         )
-        set_failure_func(ledger, kind="contract_invalid", summary=summary, retryable=True)
+        set_failure_func(
+            ledger,
+            kind="contract_invalid",
+            summary=summary,
+            retryable=True,
+            artifact_kind="worker_result",
+        )
         if attempts["issue_worker"] < limits["issue_worker"]:
             decision, request = requeue_issue_worker_func(
                 ledger,
@@ -566,6 +688,7 @@ def reconcile_issue_worker(
         kind=failure_kind,
         summary=summary,
         retryable=True if retryable is None else retryable,
+        artifact_kind="worker_result",
     )
     if attempts["issue_worker"] < limits["issue_worker"] and (retryable is None or retryable):
         retry_summary = (
@@ -656,7 +779,13 @@ def reconcile_pr_verifier(
             f"pr_verifier for issue #{issue['number']} ended without recording evidence_packet in SQLite. "
             "Retry the verifier once before recovery."
         )
-        set_failure_func(ledger, kind="contract_invalid", summary=summary, retryable=True)
+        set_failure_func(
+            ledger,
+            kind="contract_invalid",
+            summary=summary,
+            retryable=True,
+            artifact_kind="evidence_packet",
+        )
         if attempts["pr_verifier"] < limits["pr_verifier"]:
             attempts["pr_verifier"] += 1
             transition_issue_state_if_possible(
@@ -707,7 +836,13 @@ def reconcile_pr_verifier(
                 "{status: 'pass', evidence_ref: '<non-empty>', evidence_kind: 'browser'} "
                 "or provide legacy-compatible browser_e2e evidence fields before acceptance."
             )
-            set_failure_func(ledger, kind="contract_invalid", summary=summary, retryable=True)
+            set_failure_func(
+                ledger,
+                kind="contract_invalid",
+                summary=summary,
+                retryable=True,
+                artifact_kind="evidence_packet",
+            )
             if attempts["pr_verifier"] < limits["pr_verifier"]:
                 attempts["pr_verifier"] += 1
                 transition_issue_state_if_possible(
@@ -745,7 +880,13 @@ def reconcile_pr_verifier(
                     f"Verifier for issue #{issue['number']} reported pass but browser artifact validation failed "
                     f"({artifact_deficiency}). Retry pr_verifier with a resolvable evidence_ref that points to an existing browser artifact."
                 )
-                set_failure_func(ledger, kind="contract_invalid", summary=summary, retryable=True)
+                set_failure_func(
+                    ledger,
+                    kind="contract_invalid",
+                    summary=summary,
+                    retryable=True,
+                    artifact_kind="evidence_packet",
+                )
                 if attempts["pr_verifier"] < limits["pr_verifier"]:
                     attempts["pr_verifier"] += 1
                     transition_issue_state_if_possible(
@@ -802,7 +943,13 @@ def reconcile_pr_verifier(
                 f"Verifier for issue #{issue['number']} passed without a PR number in evidence_packet. "
                 "Retry pr_verifier so verifier-owned evidence can confirm the PR binding before release."
             )
-            set_failure_func(ledger, kind="contract_invalid", summary=summary, retryable=True)
+            set_failure_func(
+                ledger,
+                kind="contract_invalid",
+                summary=summary,
+                retryable=True,
+                artifact_kind="evidence_packet",
+            )
             if attempts["pr_verifier"] < limits["pr_verifier"]:
                 attempts["pr_verifier"] += 1
                 transition_issue_state_if_possible(
@@ -840,7 +987,13 @@ def reconcile_pr_verifier(
                 f"but worker_result recorded PR #{worker_pr_number}. "
                 "Retry pr_verifier so verifier-owned evidence can reconcile the PR binding before release."
             )
-            set_failure_func(ledger, kind="contract_invalid", summary=summary, retryable=True)
+            set_failure_func(
+                ledger,
+                kind="contract_invalid",
+                summary=summary,
+                retryable=True,
+                artifact_kind="evidence_packet",
+            )
             if attempts["pr_verifier"] < limits["pr_verifier"]:
                 attempts["pr_verifier"] += 1
                 transition_issue_state_if_possible(
@@ -934,6 +1087,11 @@ def reconcile_pr_verifier(
         kind=failure_kind,
         summary=summary,
         retryable=True if retryable is None else retryable,
+        artifact_kind="evidence_packet",
+        resume_role="issue_worker" if status == "fail" else "",
+        resume_stage="issue_worker_repair" if status == "fail" else "",
+        resume_state="running" if status == "fail" else "",
+        resume_strategy="rollback_one_phase" if status == "fail" else "",
     )
     if status == "fail" and attempts["issue_worker"] < limits["issue_worker"]:
         retry_summary = (
@@ -1045,7 +1203,13 @@ def reconcile_release_worker(
             f"release_worker for issue #{issue['number']} ended without recording release_result in SQLite. "
             "Re-dispatch release_worker so the subagent can submit release_result before completion."
         )
-        set_failure_func(ledger, kind="contract_invalid", summary=summary, retryable=True)
+        set_failure_func(
+            ledger,
+            kind="contract_invalid",
+            summary=summary,
+            retryable=True,
+            artifact_kind="release_result",
+        )
         if attempts["release_worker"] < limits["release_worker"]:
             attempts["release_worker"] += 1
             transition_issue_state_if_possible(
@@ -1119,6 +1283,7 @@ def reconcile_release_worker(
         kind=failure_kind,
         summary=summary,
         retryable=True if retryable is None else retryable,
+        artifact_kind="release_result",
     )
     if blocked_reason in transient_release_blockers and attempts["release_worker"] < limits["release_worker"] and (retryable is None or retryable):
         attempts["release_worker"] += 1
@@ -1269,6 +1434,11 @@ def reconcile_issue_selection_or_recovery(
     is_successful_release_status: Callable[[str], bool],
     set_failure_func: Callable[..., None],
     queue_orchestrator_recovery_func: Callable[..., tuple[JsonObject, JsonObject, JsonObject]],
+    upsert_issue_state: Callable[..., dict[str, object]],
+    request_for_transition_func: Callable[..., JsonObject],
+    queue_transition_func: Callable[..., None],
+    subagent_decision_func: Callable[..., JsonObject],
+    attempts: dict[str, int],
 ) -> ReconcileResult | None:
     issue_state = read_issue(base_dir, issue["number"])
     persisted_release = _stored_fact(artifacts, "release_result", read_artifact_fact)
@@ -1304,10 +1474,92 @@ def reconcile_issue_selection_or_recovery(
                 final_state="verified",
             )
     last_failure = cast(dict[str, object], ledger.get("lastFailure", {}))
+    recovery_cursor = cast(dict[str, object], last_failure.get("recovery_cursor", {})) if isinstance(last_failure.get("recovery_cursor"), dict) else {}
     if issue_state and str(issue_state.get("state") or "") == "failed" and bool(last_failure.get("retryable")):
+        resume_role = str(recovery_cursor.get("resume_role") or "").strip()
+        resume_stage = str(recovery_cursor.get("resume_stage") or "").strip()
+        resume_state = str(recovery_cursor.get("resume_state") or "").strip()
+        resume_strategy = str(recovery_cursor.get("resume_strategy") or "").strip()
         summary = cast(str, last_failure.get("summary") or "") or (
             f"Issue #{issue['number']} is in retryable failed recovery. Launch a main_orchestrator recovery session and continue the workflow without waiting for a human reply."
         )
+        if resume_role or resume_stage or resume_state or resume_strategy:
+            summary = (
+                f"{summary} Recovery cursor: role={resume_role or 'unknown'}, "
+                f"stage={resume_stage or 'unknown'}, state={resume_state or 'unknown'}, "
+                f"strategy={resume_strategy or 'unspecified'}."
+            )
+        if resume_role and resume_stage and resume_state:
+            _ = upsert_issue_state(
+                base_dir=base_dir,
+                issue_number=issue["number"],
+                state=resume_state,
+                command_id=f"failed-recovery:{issue['number']}:{resume_role}:{resume_stage}",
+                updated_at=updated_at,
+                current_session_id="",
+            )
+            set_failure_func(ledger, kind="none", summary="", retryable=True)
+            if resume_role == "issue_worker":
+                queue_transition_func(
+                    ledger,
+                    next_role="issue_worker",
+                    next_stage=resume_stage,
+                    summary=summary,
+                    updated_at=updated_at,
+                )
+                return (
+                    ledger,
+                    subagent_decision_func(
+                        ledger,
+                        next_role="issue_worker",
+                        next_stage=resume_stage,
+                        summary=summary,
+                    ),
+                    None,
+                )
+            if resume_role == "pr_verifier":
+                queue_transition_func(
+                    ledger,
+                    next_role="pr_verifier",
+                    next_stage=resume_stage,
+                    summary=summary,
+                    updated_at=updated_at,
+                )
+                return (
+                    ledger,
+                    subagent_decision_func(
+                        ledger,
+                        next_role="pr_verifier",
+                        next_stage=resume_stage,
+                        summary=summary,
+                    ),
+                    None,
+                )
+            if resume_role == "main_orchestrator":
+                queue_transition_func(
+                    ledger,
+                    next_role="main_orchestrator",
+                    next_stage=resume_stage,
+                    summary=summary,
+                    updated_at=updated_at,
+                )
+                request = request_for_transition_func(
+                    ledger,
+                    next_role="main_orchestrator",
+                    next_stage=resume_stage,
+                    summary=summary,
+                )
+                return (
+                    ledger,
+                    {
+                        "action": "queue_next_session",
+                        "next_role": "main_orchestrator",
+                        "next_stage": resume_stage,
+                        "summary": summary,
+                        "request_title": request["title"],
+                    },
+                    request,
+                )
         return queue_orchestrator_recovery_func(
             ledger,
             base_dir=base_dir,

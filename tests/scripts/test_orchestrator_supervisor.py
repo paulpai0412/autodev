@@ -646,6 +646,8 @@ metadata:
     assert decision["next_role"] == "issue_worker"
     assert request is None
     assert cast(dict[str, object], updated_ledger["lastFailure"])["kind"] == "contract_invalid"
+    assert cast(dict[str, object], updated_ledger["lastFailure"])["owner_role"] == "issue_worker"
+    assert cast(dict[str, object], updated_ledger["lastFailure"])["artifact_kind"] == "worker_result"
     assert "ended without recording a worker_result in SQLite" in cast(str, decision["summary"])
 
 
@@ -1316,6 +1318,59 @@ def test_inspect_project_pr_workflow_reflects_merged_release(tmp_path: Path):
 
     assert pr_workflow["status"] == "merged"
     assert pr_workflow["prNumber"] == "88"
+
+
+def test_inspect_control_plane_projects_failure_context_and_recovery_cursor(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "pr_verifier", "stage": "pr_verifier_execution", "status": "queued"}
+    ledger["lastFailure"] = {
+        "kind": "browser_e2e_unavailable",
+        "summary": "Retry verifier from failed recovery.",
+        "retryable": True,
+        "owner_role": "pr_verifier",
+        "owner_stage": "pr_verifier_execution",
+        "owner_state": "verifying",
+        "artifact_kind": "evidence_packet",
+        "failure_class": "verifier",
+        "recovery_cursor": {
+            "resume_role": "pr_verifier",
+            "resume_stage": "pr_verifier_execution",
+            "resume_state": "verifying",
+            "resume_strategy": "retry_same_role",
+        },
+    }
+    _seed_db_issue_from_ledger(tmp_path, ledger, updated_at="2026-05-07T17:05:00+08:00")
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="failed",
+        command_id="cmd-failed",
+        updated_at="2026-05-07T17:06:00+08:00",
+        current_session_id="",
+    )
+    orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:07:00+08:00",
+        current_role="main_orchestrator",
+        current_stage="issue_selection_or_recovery",
+        current_status="queued",
+        last_failure=cast(dict[str, object], ledger["lastFailure"]),
+        runtime_context={
+            "failure_context": cast(dict[str, object], ledger["lastFailure"]),
+            "recovery_cursor": cast(dict[str, object], cast(dict[str, object], ledger["lastFailure"]).get("recovery_cursor", {})),
+        },
+    )
+
+    payload = orchestrator_supervisor.inspect_control_plane(base_dir=tmp_path, issue_number="42")
+
+    failure_context = cast(dict[str, object], payload["failureContext"])
+    recovery_cursor = cast(dict[str, object], payload["recoveryCursor"])
+    assert failure_context["owner_role"] == "pr_verifier"
+    assert failure_context["artifact_kind"] == "evidence_packet"
+    assert recovery_cursor["resume_role"] == "pr_verifier"
+    assert recovery_cursor["resume_stage"] == "pr_verifier_execution"
 
 
 def test_start_issue_succeeds_without_legacy_runtime_files(tmp_path: Path):
@@ -5634,6 +5689,8 @@ next_recommended_step: \"Release it\"
     assert request is None
     assert decision["next_role"] == "pr_verifier"
     assert cast(dict[str, object], updated_ledger["lastFailure"])["kind"] == "contract_invalid"
+    assert cast(dict[str, object], updated_ledger["lastFailure"])["owner_role"] == "pr_verifier"
+    assert cast(dict[str, object], updated_ledger["lastFailure"])["artifact_kind"] == "evidence_packet"
     assert "ended without recording evidence_packet in SQLite" in cast(str, decision["summary"])
 
 
@@ -8521,6 +8578,13 @@ def test_reconcile_release_blocked_exhaustion_marks_issue_failed(tmp_path: Path)
     assert issue is not None
     assert issue["state"] == "failed"
     assert issue["current_session_id"] == ""
+    runtime_context = orchestrator_supervisor.read_runtime_context(tmp_path, "42")
+    failure_context = cast(dict[str, object], runtime_context.get("failure_context", {}))
+    recovery_cursor = cast(dict[str, object], runtime_context.get("recovery_cursor", {}))
+    assert failure_context["owner_role"] == "main_orchestrator"
+    assert failure_context["owner_stage"] == "release_root_execution"
+    assert failure_context["artifact_kind"] == "release_result"
+    assert recovery_cursor["resume_stage"] == "release_root_execution"
 
 
 def test_reconcile_release_human_approval_block_stays_release_pending(tmp_path: Path):
@@ -9001,6 +9065,17 @@ def test_reconcile_issue_selection_or_recovery_queues_retryable_failed_issue_rec
         "kind": "approval_blocked",
         "summary": "Obtain required human approval, then rerun release_worker.",
         "retryable": True,
+        "owner_role": "main_orchestrator",
+        "owner_stage": "release_root_execution",
+        "owner_state": "release_pending",
+        "artifact_kind": "release_result",
+        "failure_class": "release",
+        "recovery_cursor": {
+            "resume_role": "main_orchestrator",
+            "resume_stage": "release_root_execution",
+            "resume_state": "release_pending",
+            "resume_strategy": "retry_same_phase",
+        },
     }
     cast(dict[str, str], ledger["artifacts"])["release_result_ref"] = "docs/agents/release-results/issue-42-pr-88.yaml"
     orchestrator_supervisor.upsert_issue_state(tmp_path,
@@ -9017,7 +9092,107 @@ def test_reconcile_issue_selection_or_recovery_queues_retryable_failed_issue_rec
     assert decision["action"] == "queue_next_session"
     assert request is not None
     assert request["role"] == "main_orchestrator"
-    assert request["stage"] == "issue_selection_or_recovery"
+    assert request["stage"] == "release_root_execution"
+    assert "role=main_orchestrator" in cast(str, decision["summary"])
+    assert "stage=release_root_execution" in cast(str, decision["summary"])
+    assert "state=release_pending" in cast(str, decision["summary"])
+    assert "strategy=retry_same_phase" in cast(str, decision["summary"])
+
+
+def test_reconcile_issue_selection_or_recovery_directly_requeues_failed_worker(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "main_orchestrator", "stage": "issue_selection_or_recovery", "status": "queued"}
+    attempts = cast(dict[str, int], ledger["attempts"])
+    starting_attempts = attempts["issue_worker"]
+    ledger["lastFailure"] = {
+        "kind": "contract_invalid",
+        "summary": "Retry worker from failed recovery.",
+        "retryable": True,
+        "owner_role": "issue_worker",
+        "owner_stage": "issue_worker_repair",
+        "owner_state": "running",
+        "artifact_kind": "worker_result",
+        "failure_class": "worker",
+        "recovery_cursor": {
+            "resume_role": "issue_worker",
+            "resume_stage": "issue_worker_repair",
+            "resume_state": "running",
+            "resume_strategy": "retry_same_role",
+        },
+    }
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="failed",
+        command_id="cmd-failed-worker",
+        updated_at="2026-05-07T17:21:00+08:00",
+        current_session_id="",
+    )
+
+    with patch("scripts.orchestrator_supervisor.run_issue_packet_intake", return_value=False):
+        updated_ledger, decision, request = reconcile_ledger(ledger, artifact_base_dir=tmp_path,
+        updated_at="2026-05-07T17:23:00+08:00",)
+
+    issue = read_issue(tmp_path, "42")
+
+    assert updated_ledger is not None
+    assert decision["action"] == "delegate_subagent"
+    assert decision["next_role"] == "issue_worker"
+    assert decision["next_stage"] == "issue_worker_repair"
+    assert request is None
+    assert issue is not None
+    assert issue["state"] == "running"
+    assert attempts["issue_worker"] == starting_attempts
+
+
+def test_reconcile_issue_selection_or_recovery_directly_requeues_failed_verifier(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "main_orchestrator", "stage": "issue_selection_or_recovery", "status": "queued"}
+    attempts = cast(dict[str, int], ledger["attempts"])
+    starting_attempts = attempts["pr_verifier"]
+    ledger["lastFailure"] = {
+        "kind": "browser_e2e_unavailable",
+        "summary": "Retry verifier from failed recovery.",
+        "retryable": True,
+        "owner_role": "pr_verifier",
+        "owner_stage": "pr_verifier_execution",
+        "owner_state": "verifying",
+        "artifact_kind": "evidence_packet",
+        "failure_class": "verifier",
+        "recovery_cursor": {
+            "resume_role": "pr_verifier",
+            "resume_stage": "pr_verifier_execution",
+            "resume_state": "verifying",
+            "resume_strategy": "retry_same_role",
+        },
+    }
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="failed",
+        command_id="cmd-failed-verifier",
+        updated_at="2026-05-07T17:21:00+08:00",
+        current_session_id="",
+    )
+
+    with patch("scripts.orchestrator_supervisor.run_issue_packet_intake", return_value=False):
+        updated_ledger, decision, request = reconcile_ledger(ledger, artifact_base_dir=tmp_path,
+        updated_at="2026-05-07T17:23:00+08:00",)
+
+    issue = read_issue(tmp_path, "42")
+
+    assert updated_ledger is not None
+    assert decision["action"] == "delegate_subagent"
+    assert decision["next_role"] == "pr_verifier"
+    assert decision["next_stage"] == "pr_verifier_execution"
+    assert request is None
+    assert issue is not None
+    assert issue["state"] == "verifying"
+    assert attempts["pr_verifier"] == starting_attempts
+    assert "Recovery cursor: role=unknown" not in cast(str, decision["summary"])
+    assert "strategy=unspecified" not in cast(str, decision["summary"])
 
 
 def test_reconcile_issue_selection_or_recovery_recovers_ready_issue_to_verified_from_late_evidence(tmp_path: Path):
@@ -9203,6 +9378,8 @@ def test_inspect_command_prints_control_plane_snapshot(tmp_path: Path, monkeypat
         "releaseChildSession",
         "latestReleaseChildSession",
         "releaseBackfill",
+        "failureContext",
+        "recoveryCursor",
     }
     assert schema["dbPath"] == str(tmp_path / ".opencode/runtime/control-plane.sqlite3")
     assert "artifact_refs_json" in issue_column_names
@@ -9215,6 +9392,8 @@ def test_inspect_command_prints_control_plane_snapshot(tmp_path: Path, monkeypat
     assert cast(dict[str, object], payload["projectPrWorkflow"])["status"] == "not_opened"
     assert cast(dict[str, object], payload["releaseChildSession"])["childSessionID"] == "ses-release-worker-42"
     assert cast(dict[str, object], payload["latestReleaseChildSession"])["command_id"] == "cmd-release-child"
+    assert payload["failureContext"] == {}
+    assert payload["recoveryCursor"] == {}
     release_backfill = cast(dict[str, object], payload["releaseBackfill"])
     assert release_backfill["mode"] == "manual"
     assert release_backfill["releaseCapacity"] == 3

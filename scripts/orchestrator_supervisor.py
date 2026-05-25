@@ -2437,6 +2437,14 @@ def _sync_runtime_phase_metadata(
         queued_next_issue=queued_next_issue,
     )
 
+    merged_runtime_context = dict(runtime_context or {})
+    recovery_cursor = cast(dict[str, object], last_failure.get("recovery_cursor", {})) if isinstance(last_failure.get("recovery_cursor"), dict) else {}
+    merged_runtime_context["failure_context"] = dict(last_failure)
+    if recovery_cursor:
+        merged_runtime_context["recovery_cursor"] = dict(recovery_cursor)
+    else:
+        merged_runtime_context["recovery_cursor"] = None
+
     _ = sync_issue_runtime_context(
         base_dir,
         issue_number=issue_number,
@@ -2448,7 +2456,7 @@ def _sync_runtime_phase_metadata(
         limits=limits,
         last_failure=last_failure,
         resume_snapshot=workflow,
-        runtime_context=runtime_context,
+        runtime_context=merged_runtime_context,
         automation_flags=automation,
         artifact_refs=artifacts,
     )
@@ -3323,6 +3331,12 @@ def create_initial_ledger(
             "kind": "none",
             "summary": "",
             "retryable": True,
+            "failure_class": "",
+            "artifact_kind": "",
+            "owner_role": "",
+            "owner_stage": "",
+            "owner_state": "",
+            "recovery_cursor": {},
         },
         "lastSessionResult": {},
         "history": [
@@ -3982,11 +3996,14 @@ def inspect_control_plane(
     release_backfill_mode = _release_backfill_mode()
     available_slots = available_release_slots(base_dir, release_capacity)
     verified_waiting_count = len(list_issues(base_dir, states=["verified"]))
+    runtime_context = read_runtime_context(base_dir, issue_number)
     return {
         "schema": describe_control_plane_schema(base_dir),
         "issue": read_issue(base_dir, issue_number) or {},
         "latestDecision": read_latest_decision(base_dir, issue_number) or {},
         "latestGitHubSyncAttempt": read_latest_github_sync_attempt(base_dir, issue_number) or {},
+        "failureContext": cast(dict[str, object], runtime_context.get("failure_context", {})) if isinstance(runtime_context.get("failure_context"), dict) else {},
+        "recoveryCursor": cast(dict[str, object], runtime_context.get("recovery_cursor", {})) if isinstance(runtime_context.get("recovery_cursor"), dict) else {},
         "projectPrWorkflow": _project_pr_workflow_projection(base_dir, issue_number),
         "releaseGate": _release_gate_view(base_dir, issue_number),
         "releaseChildSession": read_release_child_session(base_dir, issue_number),
@@ -4349,9 +4366,38 @@ def _queue_transition(
     )
 
 
-def _set_failure(ledger: JsonObject, *, kind: str, summary: str, retryable: bool) -> None:
+def _set_failure(
+    ledger: JsonObject,
+    *,
+    kind: str,
+    summary: str,
+    retryable: bool,
+    failure_class: str = "",
+    artifact_kind: str = "",
+    owner_role: str = "",
+    owner_stage: str = "",
+    owner_state: str = "",
+    resume_role: str = "",
+    resume_stage: str = "",
+    resume_state: str = "",
+    resume_strategy: str = "",
+) -> None:
     set_failure = cast(Callable[..., None], _reconcile_helpers.set_failure)
-    set_failure(ledger, kind=kind, summary=summary, retryable=retryable)
+    set_failure(
+        ledger,
+        kind=kind,
+        summary=summary,
+        retryable=retryable,
+        failure_class=failure_class,
+        artifact_kind=artifact_kind,
+        owner_role=owner_role,
+        owner_stage=owner_stage,
+        owner_state=owner_state,
+        resume_role=resume_role,
+        resume_stage=resume_stage,
+        resume_state=resume_state,
+        resume_strategy=resume_strategy,
+    )
 
 
 def _request_for_transition(
@@ -4840,6 +4886,11 @@ def reconcile_ledger(
                 is_successful_release_status=_is_successful_release_status,
                 set_failure_func=_set_failure,
                 queue_orchestrator_recovery_func=_queue_orchestrator_recovery,
+                upsert_issue_state=upsert_issue_state,
+                request_for_transition_func=_request_for_transition,
+                queue_transition_func=_queue_transition,
+                subagent_decision_func=_subagent_decision,
+                attempts=attempts,
             )
             if recovery_result is not None:
                 next_ledger, decision, request = recovery_result
