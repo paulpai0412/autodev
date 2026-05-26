@@ -779,6 +779,20 @@ AGENT_IN_PROGRESS_LABEL = "agent-in-progress"
 AGENT_IN_REVIEW_LABEL = "agent-in-review"
 AGENT_COMPLETED_LABEL = "agent-completed"
 MAX_ROLE_ATTEMPTS = 3
+ROLE_COUNTER_DEFAULTS: dict[str, int] = {
+    "main_orchestrator": 0,
+    "issue_worker": 0,
+    "pr_verifier": 0,
+    "release_worker": 0,
+    "source_session_stop": 0,
+}
+ROLE_LIMIT_DEFAULTS: dict[str, int] = {
+    "main_orchestrator": MAX_ROLE_ATTEMPTS,
+    "issue_worker": MAX_ROLE_ATTEMPTS,
+    "pr_verifier": MAX_ROLE_ATTEMPTS,
+    "release_worker": MAX_ROLE_ATTEMPTS,
+    "source_session_stop": MAX_ROLE_ATTEMPTS,
+}
 DEFAULT_DEVELOPMENT_CAPACITY = 1
 DEFAULT_RELEASE_CAPACITY = 1
 DEFAULT_RELEASE_BACKFILL_MODE = "auto"
@@ -2799,6 +2813,47 @@ def _load_json_dict(raw: object) -> dict[str, object]:
     return _json_dict(raw)
 
 
+def _to_int(raw: object, default: int) -> int:
+    if isinstance(raw, bool):
+        return int(raw)
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, float):
+        return int(raw)
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return default
+        try:
+            return int(text)
+        except ValueError:
+            return default
+    return default
+
+
+def _normalize_role_attempt_counters(raw: dict[str, object]) -> dict[str, int]:
+    normalized: dict[str, int] = {
+        str(key): _to_int(value, 0)
+        for key, value in raw.items()
+        if str(key or "").strip()
+    }
+    for role, fallback in ROLE_COUNTER_DEFAULTS.items():
+        normalized.setdefault(role, fallback)
+    return normalized
+
+
+def _normalize_role_attempt_limits(raw: dict[str, object]) -> dict[str, int]:
+    normalized: dict[str, int] = {
+        str(key): _to_int(value, MAX_ROLE_ATTEMPTS)
+        for key, value in raw.items()
+        if str(key or "").strip()
+    }
+    for role, fallback in ROLE_LIMIT_DEFAULTS.items():
+        candidate = normalized.get(role, fallback)
+        normalized[role] = candidate if candidate > 0 else fallback
+    return normalized
+
+
 def _string_map(raw: object) -> dict[str, str]:
     if not isinstance(raw, dict):
         return {}
@@ -2852,8 +2907,8 @@ def _project_fields_sync_enabled(*, base_dir: Path, issue_number: str) -> bool:
 def _db_issue_to_ledger(issue: dict[str, object], *, runtime_context: dict[str, object]) -> JsonObject:
     issue_number = str(issue.get("issue_number") or "")
     issue_packet = _load_json_dict(issue.get("issue_packet_json"))
-    attempts = _load_json_dict(issue.get("attempts_json"))
-    limits = _load_json_dict(issue.get("limits_json"))
+    attempts = _normalize_role_attempt_counters(_load_json_dict(issue.get("attempts_json")))
+    limits = _normalize_role_attempt_limits(_load_json_dict(issue.get("limits_json")))
     last_failure = _load_json_dict(issue.get("last_failure_json"))
     resume_snapshot = _load_json_dict(issue.get("resume_snapshot_json"))
     automation_flags = _load_json_dict(issue.get("automation_flags_json"))

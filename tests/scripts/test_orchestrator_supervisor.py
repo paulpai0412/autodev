@@ -7575,6 +7575,42 @@ def test_db_issue_to_ledger_backfills_missing_workflow_paths(tmp_path: Path) -> 
     assert workflow["releaseResultTemplatePath"] == orchestrator_supervisor.DEFAULT_RELEASE_RESULT_TEMPLATE_PATH
 
 
+def test_db_issue_to_ledger_normalizes_missing_pr_verifier_attempts_and_limits(tmp_path: Path) -> None:
+    issue_packet_path = tmp_path / "docs/agents/issue-packets/issue-42.yaml"
+    issue_packet_path.parent.mkdir(parents=True, exist_ok=True)
+    issue_packet_path.write_text(SAMPLE_ISSUE_PACKET, encoding="utf-8")
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    _ingest_issue_packet_text(tmp_path, "42", SAMPLE_ISSUE_PACKET)
+    _seed_db_issue_from_ledger(tmp_path, ledger, updated_at="2026-05-07T17:00:00+08:00")
+
+    connection = sqlite3.connect(tmp_path / ".opencode/runtime/control-plane.sqlite3")
+    try:
+        _ = connection.execute(
+            "UPDATE issues SET attempts_json = ?, limits_json = ? WHERE issue_number = ?",
+            (json.dumps({"issue_worker": 2}, ensure_ascii=False), json.dumps({"issue_worker": 1}, ensure_ascii=False), "42"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    issue = read_issue(tmp_path, "42")
+    assert issue is not None
+    runtime_context = orchestrator_supervisor.read_runtime_context(tmp_path, "42")
+    reconstructed = orchestrator_supervisor._db_issue_to_ledger(
+        cast(dict[str, object], issue),
+        runtime_context=cast(dict[str, object], runtime_context),
+    )
+
+    attempts = cast(dict[str, int], reconstructed["attempts"])
+    limits = cast(dict[str, int], reconstructed["limits"])
+
+    assert attempts["issue_worker"] == 2
+    assert limits["issue_worker"] == 1
+    assert attempts["pr_verifier"] == 0
+    assert limits["pr_verifier"] == orchestrator_supervisor.MAX_ROLE_ATTEMPTS
+
+
 def test_redispatch_quarantined_command_does_not_write_legacy_runtime_files(tmp_path: Path) -> None:
     issue_packet_path = tmp_path / "docs/agents/issue-packets/issue-42.yaml"
     issue_packet_path.parent.mkdir(parents=True, exist_ok=True)
