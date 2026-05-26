@@ -13,6 +13,10 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+AUTODEV_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+if str(AUTODEV_PACKAGE_ROOT) not in sys.path:
+    sys.path.insert(0, str(AUTODEV_PACKAGE_ROOT))
+
 from scripts.runtime_exec import resolved_python_executable
 
 
@@ -21,6 +25,7 @@ class FullCycleRunner:
         self.script_dir = Path(__file__).resolve().parents[1]
         self.autodev_home = Path(os.environ.get("AUTODEV_HOME", str(self.script_dir))).resolve()
         self.project_root = self._resolve_consumer_project_root(os.environ.get("PROJECT_ROOT", ""))
+        self._load_consumer_autodev_yaml_settings(self.project_root)
         self._load_consumer_env(self.project_root)
         self.repo = self._resolve_repo(self.project_root)
         self.interval_seconds = int(os.environ.get("INTERVAL_SECONDS", "180") or "180")
@@ -37,6 +42,7 @@ class FullCycleRunner:
         self.autodev_project_py = self.autodev_home / "scripts" / "autodev_project.py"
         self.intake_py = self.autodev_home / "scripts" / "issue_packet_intake.py"
         self.supervisor_py = self.autodev_home / "scripts" / "orchestrator_supervisor.py"
+        self.autodev_config_path = self.project_root / ".autodev.yaml"
         self.db_path = self.project_root / ".opencode/runtime/control-plane.sqlite3"
         self.state_dir = self.project_root / ".opencode/runtime/full-cycle-state"
         self.log_path = self.project_root / ".opencode/runtime/full-cycle.log"
@@ -65,6 +71,85 @@ class FullCycleRunner:
             normalized = value.strip().strip("\"").strip("'")
             values[key.strip()] = normalized
         return values
+
+    @staticmethod
+    def _parse_runtime_mapping(root: Path, section: str) -> dict[str, str]:
+        config = root / ".autodev.yaml"
+        if not config.exists():
+            return {}
+
+        values: dict[str, str] = {}
+        in_runtime = False
+        in_section = False
+
+        for raw_line in config.read_text(encoding="utf-8").splitlines():
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+
+            indent = len(raw_line) - len(raw_line.lstrip(" "))
+            if indent == 0:
+                in_runtime = stripped == "runtime:"
+                in_section = False
+                continue
+
+            if not in_runtime:
+                continue
+
+            if indent == 2 and stripped.endswith(":"):
+                in_section = stripped == f"{section}:"
+                continue
+
+            if indent <= 2:
+                in_section = False
+                continue
+
+            if in_section and indent >= 4 and ":" in stripped:
+                key, raw_value = stripped.split(":", 1)
+                values[key.strip()] = raw_value.strip()
+
+        return values
+
+    @staticmethod
+    def _normalize_config_value(raw_value: str, *, coerce_bool: bool) -> str:
+        normalized = raw_value.strip().strip("\"").strip("'")
+        if not normalized:
+            return ""
+
+        if coerce_bool:
+            lowered = normalized.lower()
+            if lowered in {"true", "yes", "on"}:
+                return "1"
+            if lowered in {"false", "no", "off"}:
+                return "0"
+
+        return normalized
+
+    def _load_consumer_autodev_yaml_settings(self, root: Path) -> None:
+        for key, raw_value in self._parse_runtime_mapping(root, "env").items():
+            normalized = self._normalize_config_value(raw_value, coerce_bool=False)
+            if normalized:
+                os.environ.setdefault(key, normalized)
+
+        full_cycle_to_env = {
+            "interval_seconds": "INTERVAL_SECONDS",
+            "max_cycles": "MAX_CYCLES",
+            "auto_approve_release": "AUTO_APPROVE_RELEASE",
+            "auto_label_ready": "AUTO_LABEL_READY",
+            "heartbeat_seconds": "HEARTBEAT_SECONDS",
+            "resume_max_attempts": "RESUME_MAX_ATTEMPTS",
+            "redispatch_max_attempts": "REDISPATCH_MAX_ATTEMPTS",
+            "auto_fail_quarantined": "AUTO_FAIL_QUARANTINED",
+            "bootstrap_done": "BOOTSTRAP_DONE",
+        }
+
+        full_cycle_values = self._parse_runtime_mapping(root, "full_cycle")
+        for config_key, env_key in full_cycle_to_env.items():
+            if config_key not in full_cycle_values:
+                continue
+            normalized = self._normalize_config_value(full_cycle_values[config_key], coerce_bool=True)
+            if normalized:
+                os.environ.setdefault(env_key, normalized)
 
     def _load_consumer_env(self, root: Path) -> None:
         env = self._parse_env_file(root / ".env")
@@ -147,6 +232,32 @@ class FullCycleRunner:
             self.log(f"WARN: command failed (exit={completed.returncode}): {' '.join(args)}")
         return completed.returncode
 
+    def _gh_no_pager_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        env["GH_PAGER"] = "cat"
+        env["PAGER"] = "cat"
+        env["LESS"] = "FRX"
+        return env
+
+    def _print_gh_list(self, heading: str, args: list[str], empty_message: str) -> None:
+        self.log(heading)
+        completed = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=self._gh_no_pager_env(),
+        )
+        output = (completed.stdout or "").strip()
+        if output:
+            print(output)
+        else:
+            print(empty_message)
+        if completed.returncode != 0:
+            stderr = (completed.stderr or "").strip()
+            if stderr:
+                self.log(f"WARN: {' '.join(args)} failed (exit={completed.returncode}): {stderr}")
+
     def _query_issue_numbers(self, state: str, *, require_empty_session: bool = False) -> list[str]:
         if not self.db_path.exists():
             return []
@@ -190,6 +301,7 @@ class FullCycleRunner:
             capture_output=True,
             text=True,
             check=False,
+            env=self._gh_no_pager_env(),
         )
         return [line.strip() for line in (completed.stdout or "").splitlines() if line.strip()]
 
@@ -199,6 +311,7 @@ class FullCycleRunner:
             capture_output=True,
             text=True,
             check=False,
+            env=self._gh_no_pager_env(),
         )
         try:
             return int((completed.stdout or "0").strip() or "0")
@@ -230,6 +343,7 @@ class FullCycleRunner:
             capture_output=True,
             text=True,
             check=False,
+            env=self._gh_no_pager_env(),
         )
         return (completed.stdout or "").strip()
 
@@ -279,7 +393,18 @@ class FullCycleRunner:
         if self.bootstrap_done:
             self.log("Bootstrap already completed; skip autodev init/doctor")
             return
-        self.run_cmd([self.python_exec, str(self.autodev_project_py), "init", "--project-root", str(self.project_root), "--json"])
+        self.run_cmd(
+            [
+                self.python_exec,
+                str(self.autodev_project_py),
+                "init",
+                "--project-root",
+                str(self.project_root),
+                "--github-repo",
+                self.repo,
+                "--json",
+            ]
+        )
         self.run_cmd([self.python_exec, str(self.autodev_project_py), "doctor", "--project-root", str(self.project_root), "--json"])
         self.bootstrap_done = True
 
@@ -446,10 +571,36 @@ class FullCycleRunner:
         print(json.dumps([dict(row) for row in rows], ensure_ascii=False, indent=2))
 
     def print_github_snapshot(self) -> None:
-        self.log("GitHub snapshot (open issues):")
-        subprocess.run(["gh", "issue", "list", "--repo", self.repo, "--state", "open", "--limit", "200"], check=False)
-        self.log("GitHub snapshot (open PRs):")
-        subprocess.run(["gh", "pr", "list", "--repo", self.repo, "--state", "open"], check=False)
+        self._print_gh_list(
+            "GitHub snapshot (open issues, screen output only):",
+            ["gh", "issue", "list", "--repo", self.repo, "--state", "open", "--limit", "200"],
+            "(no open issues)",
+        )
+        self._print_gh_list(
+            "GitHub snapshot (open PRs, screen output only):",
+            ["gh", "pr", "list", "--repo", self.repo, "--state", "open"],
+            "(no open pull requests)",
+        )
+
+    def print_autodev_yaml_settings(self) -> None:
+        self.log(f"Loaded consumer config from {self.autodev_config_path}")
+        if not self.autodev_config_path.exists():
+            print("(missing .autodev.yaml)")
+            return
+        content = self.autodev_config_path.read_text(encoding="utf-8").strip()
+        print("----- BEGIN .autodev.yaml -----")
+        if content:
+            print(content)
+        else:
+            print("(empty .autodev.yaml)")
+        print("----- END .autodev.yaml -----")
+
+    def print_startup_github_issue_list(self) -> None:
+        self._print_gh_list(
+            "Startup GitHub issue list (screen output only):",
+            ["gh", "issue", "list", "--repo", self.repo, "--state", "open", "--limit", "200"],
+            "(no open issues)",
+        )
 
     def sleep_with_heartbeat(self, total_seconds: int, open_count: int) -> None:
         if total_seconds <= 0:
@@ -472,6 +623,8 @@ class FullCycleRunner:
         self.log(f"PROJECT_ROOT={self.project_root}")
         self.log(f"AUTODEV_HOME={self.autodev_home}")
         self.log(f"REPO={self.repo}")
+        self.print_autodev_yaml_settings()
+        self.print_startup_github_issue_list()
 
         self.autodev_bootstrap_once()
 
