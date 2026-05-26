@@ -152,6 +152,9 @@ def test_init_creates_project_contract_dirs_and_agents_managed_block(tmp_path: P
     assert (tmp_path / ".opencode/runtime/.gitkeep").exists()
     assert (tmp_path / ".opencode/runtime/control-plane.sqlite3").exists()
     gitignore = read(tmp_path / ".gitignore")
+    assert ".env" in gitignore
+    assert "AGENTS.md" in gitignore
+    assert ".autodev.yaml" in gitignore
     assert ".opencode/runtime/*" in gitignore
     assert "!.opencode/runtime/.gitkeep" in gitignore
     assert ".playwright-mcp/" in gitignore
@@ -582,6 +585,9 @@ def test_ensure_runtime_gitignore_backfills_local_artifact_lines_without_duplica
 
     gitignore = read(tmp_path / ".gitignore")
 
+    assert ".env" in gitignore
+    assert "AGENTS.md" in gitignore
+    assert ".autodev.yaml" in gitignore
     assert gitignore.count(".opencode/runtime/*") == 1
     assert gitignore.count(".opencode/runtime/control-plane.sqlite3") == 1
     assert ".playwright-mcp/" in gitignore
@@ -590,6 +596,17 @@ def test_ensure_runtime_gitignore_backfills_local_artifact_lines_without_duplica
 
 def test_runtime_gitignore_requires_explicit_control_plane_db_line(tmp_path: Path) -> None:
     write(tmp_path / ".gitignore", ".opencode/runtime/*\n!.opencode/runtime/.gitkeep\n")
+
+    assert autodev_project._runtime_gitignore_is_configured(tmp_path) is False
+
+
+def test_runtime_gitignore_requires_autodev_yaml_line(tmp_path: Path) -> None:
+    write(
+        tmp_path / ".gitignore",
+        "# local env and agent files\n.env\nAGENTS.md\n"
+        "# autodev runtime state\n.opencode/runtime/*\n.opencode/runtime/control-plane.sqlite3\n!.opencode/runtime/.gitkeep\n"
+        "# local tool and test artifacts\n.playwright-mcp/\nartifacts/\n",
+    )
 
     assert autodev_project._runtime_gitignore_is_configured(tmp_path) is False
 

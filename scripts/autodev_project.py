@@ -69,8 +69,16 @@ ARTIFACT_DIRS = [
     ".opencode/runtime",
 ]
 
+LOCAL_ENV_GITIGNORE_LINES = [
+    "# local env and agent files",
+    ".env",
+    "AGENTS.md",
+]
+
+
 RUNTIME_GITIGNORE_LINES = [
     "# autodev runtime state",
+    ".autodev.yaml",
     ".opencode/runtime/*",
     ".opencode/runtime/control-plane.sqlite3",
     "!.opencode/runtime/.gitkeep",
@@ -83,6 +91,7 @@ LOCAL_ARTIFACT_GITIGNORE_LINES = [
 ]
 
 REQUIRED_GITIGNORE_LINES = [
+    *LOCAL_ENV_GITIGNORE_LINES[1:],
     *RUNTIME_GITIGNORE_LINES[1:],
     *LOCAL_ARTIFACT_GITIGNORE_LINES[1:],
 ]
@@ -288,7 +297,7 @@ def _ensure_runtime_gitignore(root: Path, *, dry_run: bool, check: bool, report:
     existing_line_set = set(existing_lines)
     additions: list[str] = []
 
-    for block in (RUNTIME_GITIGNORE_LINES, LOCAL_ARTIFACT_GITIGNORE_LINES):
+    for block in (LOCAL_ENV_GITIGNORE_LINES, RUNTIME_GITIGNORE_LINES, LOCAL_ARTIFACT_GITIGNORE_LINES):
         missing = [line for line in block[1:] if line not in existing_line_set]
         if not missing:
             continue
