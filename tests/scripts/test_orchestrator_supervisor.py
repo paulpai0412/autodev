@@ -1897,6 +1897,101 @@ def test_reconcile_workspace_reconciles_active_issues_and_starts_ready_issue_wit
     assert issue_43["current_session_id"] == "ses-shared"
 
 
+def test_reconcile_workspace_syncs_project_fields_for_ready_issues_after_intake(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AUTODEV_DEVELOPMENT_CAPACITY", "1")
+    monkeypatch.setenv("AUTODEV_RELEASE_BACKFILL_MODE", "manual")
+
+    _ingest_issue_packet_text(tmp_path, "42", SAMPLE_ISSUE_PACKET)
+    _ = orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:00:00+08:00",
+        runtime_context={
+            "github_project_id": "PVT_project_1",
+            "github_project_field_ids": {
+                "state": "PVTF_state",
+                "stage": "PVTF_stage",
+                "pr_workflow": "PVTF_pr_workflow",
+            },
+        },
+    )
+
+    with patch("scripts.orchestrator_supervisor.run_issue_packet_intake", return_value=True), patch(
+        "scripts.orchestrator_supervisor._sync_project_fields_projection",
+        return_value="",
+    ) as sync_project_fields, patch(
+        "scripts.orchestrator_supervisor._default_host_adapter",
+        return_value=successful_host_adapter(session_id="ses-ready-42", resume_command="opencode --session ses-ready-42"),
+    ), patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+        _ = orchestrator_supervisor.reconcile_workspace_from_db(
+            base_dir=tmp_path,
+            updated_at="2026-05-07T17:10:00+08:00",
+            source_session_id="workspace-reconcile",
+        )
+
+    intake_call = next(
+        (
+            call
+            for call in sync_project_fields.call_args_list
+            if str(call.kwargs.get("command_id") or "") == "intake:42:ready:project-fields"
+        ),
+        None,
+    )
+    assert intake_call is not None
+    assert intake_call.kwargs["issue_number"] == "42"
+
+
+def test_reconcile_workspace_records_admin_decision_when_ready_project_sync_fails(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AUTODEV_DEVELOPMENT_CAPACITY", "1")
+    monkeypatch.setenv("AUTODEV_RELEASE_BACKFILL_MODE", "manual")
+
+    _ingest_issue_packet_text(tmp_path, "42", SAMPLE_ISSUE_PACKET)
+    _ingest_issue_packet_text(
+        tmp_path,
+        "41",
+        SAMPLE_ISSUE_PACKET.replace('"42"', '"41"').replace("issue-42", "issue-41").replace("agent/issue-42-demo", "agent/issue-41-demo"),
+    )
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="41",
+        state="running",
+        command_id="cmd-running-41",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_session_id="ses-running-41",
+    )
+    _ = orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:00:00+08:00",
+        runtime_context={
+            "github_project_id": "PVT_project_1",
+            "github_project_field_ids": {
+                "state": "PVTF_state",
+                "stage": "PVTF_stage",
+                "pr_workflow": "PVTF_pr_workflow",
+            },
+        },
+    )
+
+    with patch("scripts.orchestrator_supervisor.run_issue_packet_intake", return_value=True), patch(
+        "scripts.orchestrator_supervisor._sync_project_fields_projection",
+        return_value="project sync failed",
+    ), patch(
+        "scripts.orchestrator_supervisor._default_host_adapter",
+        return_value=successful_host_adapter(session_id="ses-ready-42", resume_command="opencode --session ses-ready-42"),
+    ), patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+        _ = orchestrator_supervisor.reconcile_workspace_from_db(
+            base_dir=tmp_path,
+            updated_at="2026-05-07T17:10:00+08:00",
+            source_session_id="workspace-reconcile",
+        )
+
+    latest_decision = orchestrator_supervisor.read_latest_decision(tmp_path, "42")
+    assert latest_decision is not None
+    assert latest_decision["decision_type"] == "admin_github_projection_failure"
+    assert "after intake for issue #42" in str(latest_decision["reason"])
+
+
 def test_reconcile_workspace_respects_full_development_capacity(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("AUTODEV_DEVELOPMENT_CAPACITY", "1")
     monkeypatch.setenv("AUTODEV_RELEASE_CAPACITY", "1")
@@ -7388,6 +7483,95 @@ def test_redispatch_quarantined_command_creates_fresh_root_session(tmp_path: Pat
     assert dispatch_sync_kwargs["add_labels"] == ["agent-dispatching", "pr-not-opened"]
     assert "ready-for-agent" in dispatch_sync_kwargs["remove_labels"]
     assert "agent-in-progress" in dispatch_sync_kwargs["remove_labels"]
+
+
+def test_redispatch_quarantined_command_backfills_missing_workflow_paths(tmp_path: Path, capsys) -> None:
+    issue_packet_path = tmp_path / "docs/agents/issue-packets/issue-42.yaml"
+    issue_packet_path.parent.mkdir(parents=True, exist_ok=True)
+    issue_packet_path.write_text(SAMPLE_ISSUE_PACKET, encoding="utf-8")
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    _ingest_issue_packet_text(tmp_path, "42", SAMPLE_ISSUE_PACKET)
+    _seed_db_issue_from_ledger(tmp_path, ledger, updated_at="2026-05-07T17:00:00+08:00")
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="quarantined",
+        command_id="cmd-quarantined",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_session_id="ses-old-root",
+    )
+
+    connection = sqlite3.connect(tmp_path / ".opencode/runtime/control-plane.sqlite3")
+    try:
+        _ = connection.execute(
+            "UPDATE issues SET resume_snapshot_json = '{}' WHERE issue_number = ?",
+            ("42",),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with patch(
+        "scripts.orchestrator_supervisor._default_host_adapter",
+        return_value=successful_host_adapter(session_id="ses_root_retry", resume_command="opencode --session ses_root_retry"),
+    ), patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+        exit_code = orchestrator_supervisor.main(
+            [
+                "redispatch-quarantined",
+                "--base-dir",
+                str(tmp_path),
+                "--issue-number",
+                "42",
+                "--reason",
+                "operator approved fresh root-session redispatch",
+                "--source-session-id",
+                "ses_source_test",
+                "--updated-at",
+                "2026-05-07T17:10:00+08:00",
+            ]
+        )
+
+    session_result = cast(dict[str, object], json.loads(capsys.readouterr().out))
+    issue = read_issue(tmp_path, "42")
+
+    assert exit_code == 0
+    assert session_result["status"] == "success"
+    assert session_result["rootSessionID"] == "ses_root_retry"
+    assert issue is not None
+    assert issue["state"] == "running"
+
+
+def test_db_issue_to_ledger_backfills_missing_workflow_paths(tmp_path: Path) -> None:
+    issue_packet_path = tmp_path / "docs/agents/issue-packets/issue-42.yaml"
+    issue_packet_path.parent.mkdir(parents=True, exist_ok=True)
+    issue_packet_path.write_text(SAMPLE_ISSUE_PACKET, encoding="utf-8")
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    _ingest_issue_packet_text(tmp_path, "42", SAMPLE_ISSUE_PACKET)
+    _seed_db_issue_from_ledger(tmp_path, ledger, updated_at="2026-05-07T17:00:00+08:00")
+
+    connection = sqlite3.connect(tmp_path / ".opencode/runtime/control-plane.sqlite3")
+    try:
+        _ = connection.execute(
+            "UPDATE issues SET resume_snapshot_json = '{}' WHERE issue_number = ?",
+            ("42",),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    issue = read_issue(tmp_path, "42")
+    assert issue is not None
+    runtime_context = orchestrator_supervisor.read_runtime_context(tmp_path, "42")
+    reconstructed = orchestrator_supervisor._db_issue_to_ledger(
+        cast(dict[str, object], issue),
+        runtime_context=cast(dict[str, object], runtime_context),
+    )
+    workflow = cast(dict[str, object], reconstructed["workflow"])
+
+    assert workflow["workflowPolicyPath"] == orchestrator_supervisor.DEFAULT_WORKFLOW_POLICY_PATH
+    assert workflow["releaseResultTemplatePath"] == orchestrator_supervisor.DEFAULT_RELEASE_RESULT_TEMPLATE_PATH
 
 
 def test_redispatch_quarantined_command_does_not_write_legacy_runtime_files(tmp_path: Path) -> None:

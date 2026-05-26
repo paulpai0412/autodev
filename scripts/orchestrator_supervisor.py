@@ -2762,6 +2762,16 @@ def _db_issue_to_ledger(issue: dict[str, object], *, runtime_context: dict[str, 
     queued_next_issue = _json_dict(runtime_context.get("queuedNextIssue"))
     if queued_next_issue:
         ledger["queuedNextIssue"] = queued_next_issue
+
+    workflow = cast(dict[str, object], ledger.get("workflow", {}))
+    workflow_policy_path = str(workflow.get("workflowPolicyPath") or "").strip()
+    if not workflow_policy_path:
+        workflow["workflowPolicyPath"] = DEFAULT_WORKFLOW_POLICY_PATH
+    release_template_path = str(workflow.get("releaseResultTemplatePath") or "").strip()
+    if not release_template_path:
+        workflow["releaseResultTemplatePath"] = DEFAULT_RELEASE_RESULT_TEMPLATE_PATH
+    ledger["workflow"] = workflow
+
     return ledger
 
 
@@ -2814,6 +2824,32 @@ def reconcile_workspace_from_db(
     except Exception as error:  # pragma: no cover - defensive best-effort guard
         intake_ok = False
         intake_error = str(error)
+
+    if intake_ok:
+        for ready_issue in list_issues(base_dir, states=["ready"]):
+            ready_issue_number = str(ready_issue.get("issue_number") or "")
+            if not ready_issue_number:
+                continue
+            if not _project_fields_sync_enabled(base_dir=base_dir, issue_number=ready_issue_number):
+                continue
+            project_error = _sync_project_fields_projection(
+                base_dir=base_dir,
+                issue_number=ready_issue_number,
+                command_id=f"intake:{ready_issue_number}:ready:project-fields",
+                updated_at=timestamp,
+            )
+            if project_error:
+                record_admin_decision(
+                    base_dir,
+                    command_id=f"intake:{ready_issue_number}:ready:project-fields:admin-failed",
+                    issue_number=ready_issue_number,
+                    decision_type="admin_github_projection_failure",
+                    reason=(
+                        "GitHub project field sync failed after intake for issue "
+                        f"#{ready_issue_number}: {project_error}"
+                    ),
+                    updated_at=timestamp,
+                )
 
     started_issues: list[JsonObject] = []
     capacity = _development_capacity()
