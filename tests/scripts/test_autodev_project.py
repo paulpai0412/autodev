@@ -506,6 +506,27 @@ def test_default_commands_dir_uses_windows_appdata(tmp_path: Path):
     assert commands_dir == tmp_path / "opencode" / "commands"
 
 
+def test_default_commands_dir_uses_codex_commands_dir_when_adapter_is_codex(tmp_path: Path):
+    class FakeCodexAdapter:
+        def operator_entrypoints(self) -> dict[str, str]:
+            return {
+                "start": "autodev-start.md",
+                "reconcile": "autodev-reconcile.md",
+                "release": "autodev-release.md",
+                "inspect": "autodev-show-session.md",
+                "doctor": "autodev-doctor.md",
+                "full_cycle": "autodev-full-cycle.md",
+            }
+
+        def capabilities(self) -> dict[str, object]:
+            return {"host": "codex", "commands_dir": str(tmp_path / "codex" / "commands")}
+
+    with patch("scripts.autodev_project._host_adapter", return_value=FakeCodexAdapter()):
+        commands_dir = autodev_project._default_commands_dir()
+
+    assert commands_dir == tmp_path / "codex" / "commands"
+
+
 def test_repo_local_commands_use_autodev_project_wrappers():
     start_command = read(autodev_project.ROOT / ".opencode/commands/autodev-start.md")
     reconcile_command = read(autodev_project.ROOT / ".opencode/commands/autodev-reconcile.md")
@@ -696,6 +717,36 @@ def test_doctor_windows_preflight_passes_when_tools_exist(tmp_path: Path, capsys
     captured = capsys.readouterr()
     assert exit_code == 0
     assert captured.out == "autodev project: no changes needed\n"
+
+
+def test_doctor_windows_preflight_reports_missing_codex_cli_when_host_is_codex(tmp_path: Path, capsys: CaptureFixture[str]):
+    write(tmp_path / ".autodev.yaml", 'schema_version: "1.0"\nproject:\n  name: demo\n')
+    write(tmp_path / "AGENTS.md", "# AGENTS.md\n")
+    write(tmp_path / ".opencode/runtime/control-plane.sqlite3", "")
+
+    def fake_which(command: str) -> str | None:
+        mapping = {
+            "git": "C:/Program Files/Git/cmd/git.exe",
+            "gh": "C:/Program Files/GitHub CLI/gh.exe",
+            "python": "C:/Python311/python.exe",
+            "python3": "C:/Python311/python.exe",
+            "codex": None,
+            "codex.exe": None,
+        }
+        return mapping.get(command, f"/mock/{command}")
+
+    with patch("scripts.autodev_project.platform.system", return_value="Windows"), patch(
+        "scripts.autodev_project.shutil.which", side_effect=fake_which
+    ), patch("scripts.autodev_project.resolved_python_executable", return_value="python"), patch(
+        "scripts.autodev_project.configured_host_adapter_name", return_value="codex"
+    ), patch(
+        "scripts.autodev_project.resolve_codex_cli", return_value=None
+    ):
+        exit_code = autodev_project.main(["doctor", "--project-root", str(tmp_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "windows preflight: Codex CLI not found" in captured.out
 
 
 def test_direct_script_doctor_works_without_pythonpath(tmp_path: Path):

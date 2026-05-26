@@ -16,14 +16,21 @@ _HOST_ADAPTER_FACTORIES: dict[str, HostAdapterFactory] = {}
 
 def _register_builtin_adapters() -> None:
     if "opencode" in _HOST_ADAPTER_FACTORIES:
-        return
+        if "codex" in _HOST_ADAPTER_FACTORIES:
+            return
 
     def _build_opencode_adapter() -> HostAdapter:
         from scripts.opencode_host_adapter import OpenCodeHostAdapter
 
         return OpenCodeHostAdapter()
 
+    def _build_codex_adapter() -> HostAdapter:
+        from scripts.codex_host_adapter import CodexHostAdapter
+
+        return CodexHostAdapter()
+
     _HOST_ADAPTER_FACTORIES["opencode"] = _build_opencode_adapter
+    _HOST_ADAPTER_FACTORIES["codex"] = _build_codex_adapter
 
 
 def register_host_adapter_factory(name: str, factory: HostAdapterFactory) -> None:

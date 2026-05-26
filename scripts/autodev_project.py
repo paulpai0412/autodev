@@ -23,8 +23,9 @@ from scripts import autodev_host_packaging
 from scripts.control_plane_db import canonical_control_plane_base_dir, ensure_control_plane_db
 from scripts.orchestrator_supervisor import show_latest_session
 from scripts.control_plane_db import list_issues
-from scripts.orchestrator_sessions import resolve_host_adapter
+from scripts.orchestrator_sessions import configured_host_adapter_name, resolve_host_adapter
 from scripts.opencode_host_adapter import resolve_opencode_cli
+from scripts.codex_host_adapter import resolve_codex_cli
 from scripts.issue_state_machine import ISSUE_STATES
 from scripts.state_projection import (
     PR_WORKFLOW_LABELS,
@@ -387,11 +388,16 @@ def _windows_preflight_findings() -> list[str]:
             "Install GitHub CLI for Windows and run `gh auth login`."
         )
 
-    host_adapter = os.environ.get("AUTODEV_HOST_ADAPTER", "opencode").strip().lower() or "opencode"
+    host_adapter = configured_host_adapter_name()
     if host_adapter == "opencode" and not resolve_opencode_cli():
         findings.append(
             "windows preflight: OpenCode CLI not found (tried PATH and common Windows AppData locations). "
             "Install OpenCode Desktop/CLI and ensure `opencode` or `opencode.exe` is discoverable."
+        )
+    if host_adapter == "codex" and not resolve_codex_cli():
+        findings.append(
+            "windows preflight: Codex CLI not found (tried PATH and common Windows AppData locations). "
+            "Install Codex CLI and ensure `codex` or `codex.exe` is discoverable."
         )
 
     return findings

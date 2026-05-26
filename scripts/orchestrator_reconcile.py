@@ -748,7 +748,7 @@ def reconcile_pr_verifier(
         current_status = str(current.get("status") or "")
         outcome_status = ""
         session_terminal_without_artifact = False
-        if verifier_session_id and current_status in {"running", "queued"}:
+        if verifier_session_id and current_status == "running":
             outcome = read_session_outcome(verifier_session_id)
             if isinstance(outcome, dict):
                 outcome_status = str(outcome.get("status") or "")
@@ -756,9 +756,7 @@ def reconcile_pr_verifier(
                 outcome_status = str(getattr(outcome, "status", "") or "")
             if outcome_status and outcome_status not in {"running", "queued", "unknown"}:
                 session_terminal_without_artifact = True
-        session_inflight = current_status == "running" or (
-            current_status == "queued" and outcome_status in {"running", "queued", "unknown"}
-        )
+        session_inflight = current_status in {"running", "queued"}
         if session_inflight and not session_terminal_without_artifact:
             summary = (
                 f"pr_verifier for issue #{issue['number']} is {current_status} and SQLite has not recorded "

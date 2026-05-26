@@ -74,3 +74,9 @@ def test_configured_host_adapter_name_reads_env(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setenv("AUTODEV_HOST_ADAPTER", "  Fake  ")
 
     assert orchestrator_sessions.configured_host_adapter_name() == "fake"
+
+
+def test_resolve_builtin_codex_host_adapter() -> None:
+    adapter = orchestrator_sessions.resolve_host_adapter("codex")
+
+    assert adapter.__class__.__name__ == "CodexHostAdapter"

@@ -28,6 +28,25 @@ def default_opencode_commands_dir() -> Path:
     return Path.home() / ".config" / "opencode" / "commands"
 
 
+def default_codex_home() -> Path:
+    configured = os.environ.get("CODEX_HOME", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".codex"
+
+
+def default_codex_commands_dir() -> Path:
+    if platform.system().lower().startswith("win"):
+        appdata = os.environ.get("APPDATA", "").strip()
+        if appdata:
+            return Path(appdata) / "codex" / "commands"
+    return default_codex_home() / "commands"
+
+
+def default_codex_sessions_dir() -> Path:
+    return default_codex_home() / "sessions"
+
+
 def default_opencode_data_home() -> Path:
     if platform.system().lower().startswith("win"):
         local = os.environ.get("LOCALAPPDATA", "").strip()
@@ -59,6 +78,27 @@ def opencode_cli_fallback_candidates() -> list[Path]:
                         root / "Programs" / "opencode" / "opencode.exe",
                         root / "opencode" / "opencode.exe",
                         root / "Microsoft" / "WindowsApps" / "opencode.exe",
+                    ]
+                )
+    return candidates
+
+
+def codex_cli_fallback_candidates() -> list[Path]:
+    candidates = [
+        Path.home() / ".local" / "bin" / "codex",
+        Path.home() / "bin" / "codex",
+    ]
+    if platform.system().lower().startswith("win"):
+        local = os.environ.get("LOCALAPPDATA", "").strip()
+        appdata = os.environ.get("APPDATA", "").strip()
+        for base in [local, appdata]:
+            if base:
+                root = Path(base)
+                candidates.extend(
+                    [
+                        root / "Programs" / "codex" / "codex.exe",
+                        root / "codex" / "codex.exe",
+                        root / "Microsoft" / "WindowsApps" / "codex.exe",
                     ]
                 )
     return candidates
