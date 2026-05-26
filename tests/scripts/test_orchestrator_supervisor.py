@@ -971,12 +971,77 @@ def test_reconcile_active_runtime_issue_without_current_role_stage_does_not_requ
 
     current = cast(dict[str, object], updated_ledger["current"])
 
-    assert current == {"role": "", "stage": "", "status": ""}
+    assert current == {"role": "issue_worker", "stage": "issue_worker_execution", "status": "queued"}
     assert decision["action"] == "no_change"
+    assert decision["next_role"] == "issue_worker"
+    assert decision["next_stage"] == "issue_worker_execution"
     assert decision["request_title"] == ""
+    assert "Recovered current cursor from" in str(decision["summary"])
     assert f"state={runtime_state}" in str(decision["summary"])
     assert "start-issue" not in str(decision["summary"])
     assert request is None
+
+
+def test_reconcile_dispatching_issue_with_missing_role_stage_recovers_from_runtime_transition(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "", "stage": "", "status": ""}
+
+    orchestrator_supervisor.ensure_issue_row(tmp_path, issue_number="42", updated_at="2026-05-07T17:00:00+08:00")
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="dispatching",
+        command_id="cmd-dispatching",
+        updated_at="2026-05-07T17:04:00+08:00",
+        current_session_id="ses-root-42",
+    )
+
+    _ = orchestrator_supervisor.append_issue_history(
+        tmp_path,
+        issue_number="42",
+        entry_type="runtime_transition",
+        created_at="2026-05-07T17:04:30+08:00",
+        role="issue_worker",
+        stage="issue_worker_execution",
+        status="queued",
+        summary="Recover dispatching cursor",
+        payload={
+            "transition_type": "runtime_role_stage",
+            "to_role": "issue_worker",
+            "to_stage": "issue_worker_execution",
+        },
+    )
+
+    connection = sqlite3.connect(tmp_path / ".opencode/runtime/control-plane.sqlite3")
+    try:
+        _ = connection.execute(
+            "UPDATE issues SET current_role = '', current_stage = '', current_status = '' WHERE issue_number = ?",
+            ("42",),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    updated_ledger, decision, request = reconcile_ledger(
+        ledger,
+        artifact_base_dir=tmp_path,
+        updated_at="2026-05-07T17:05:00+08:00",
+    )
+
+    current = cast(dict[str, object], updated_ledger["current"])
+    issue = read_issue(tmp_path, "42")
+
+    assert current == {"role": "issue_worker", "stage": "issue_worker_execution", "status": "queued"}
+    assert decision["action"] == "no_change"
+    assert decision["next_role"] == "issue_worker"
+    assert decision["next_stage"] == "issue_worker_execution"
+    assert "Recovered current cursor from runtime_transition" in str(decision["summary"])
+    assert request is None
+    assert issue is not None
+    assert issue["current_role"] == "issue_worker"
+    assert issue["current_stage"] == "issue_worker_execution"
+    assert issue["current_status"] == "queued"
 
 
 def test_build_orchestrator_request_includes_nonce_generation_and_ledger_revision():
@@ -6024,7 +6089,7 @@ def test_reconcile_verifier_release_waiting_syncs_project_fields_when_project_bi
 def test_reconcile_verifier_requires_persisted_evidence_fact(tmp_path: Path):
     issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
-    ledger["current"] = {"role": "pr_verifier", "stage": "pr_verifier_execution", "status": "queued"}
+    ledger["current"] = {"role": "pr_verifier", "stage": "pr_verifier_execution", "status": "running"}
     cast(dict[str, str], ledger["artifacts"])["evidence_packet_ref"] = "docs/agents/evidence/issue-42-pr-77.yaml"
     evidence_path = tmp_path / "docs/agents/evidence/issue-42-pr-77.yaml"
     evidence_path.parent.mkdir(parents=True, exist_ok=True)
@@ -6049,7 +6114,15 @@ next_recommended_step: \"Release it\"
     command_id="cmd-running",
     updated_at="2026-05-07T17:09:00+08:00", current_session_id="ses-root-42", )
 
-    with patch("scripts.orchestrator_supervisor._read_db_artifact_fact", return_value={}):
+    class CompletedOutcomeHostAdapter(FakeHostAdapter):
+        def read_session_outcome(self, runtime_session_id: str):
+            del runtime_session_id
+            return SessionOutcome(status="completed", session_id="ses-root-42")
+
+    with patch(
+        "scripts.orchestrator_supervisor._default_host_adapter",
+        return_value=CompletedOutcomeHostAdapter(successful_host_adapter(session_id="ses-ignored").start_result),
+    ), patch("scripts.orchestrator_supervisor._read_db_artifact_fact", return_value={}):
         updated_ledger, decision, request = reconcile_ledger(ledger, artifact_base_dir=tmp_path,
         updated_at="2026-05-07T17:11:00+08:00",)
 
@@ -6620,6 +6693,50 @@ def test_reconcile_verifier_queued_without_evidence_packet_running_outcome_stays
     with patch("scripts.orchestrator_supervisor._default_host_adapter", return_value=RunningOutcomeHostAdapter(successful_host_adapter(session_id="ses-ignored").start_result)), patch(
         "scripts.orchestrator_supervisor._read_db_artifact_fact", return_value={}
     ):
+        updated_ledger, decision, request = reconcile_ledger(
+            ledger,
+            artifact_base_dir=tmp_path,
+            updated_at="2026-05-07T17:11:00+08:00",
+        )
+
+    issue = read_issue(tmp_path, "42")
+
+    assert updated_ledger is not None
+    assert decision["action"] == "no_change"
+    assert decision["next_role"] == "pr_verifier"
+    assert decision["next_stage"] == "pr_verifier_execution"
+    assert "Keep the queued/running dispatch state unchanged" in cast(str, decision["summary"])
+    assert request is None
+    assert attempts["pr_verifier"] == starting_attempts
+    assert issue is not None
+    assert issue["state"] == "verifying"
+
+
+def test_reconcile_verifier_queued_without_evidence_packet_completed_outcome_stays_no_change(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "pr_verifier", "stage": "pr_verifier_execution", "status": "queued"}
+    cast(dict[str, str], ledger["artifacts"])["evidence_packet_ref"] = "docs/agents/evidence/issue-42-pr-77.yaml"
+    attempts = cast(dict[str, int], ledger["attempts"])
+    starting_attempts = attempts["pr_verifier"]
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="verifying",
+        command_id="cmd-verifier-queued-completed",
+        updated_at="2026-05-07T17:10:00+08:00",
+        current_session_id="ses-verifier-42",
+    )
+
+    class CompletedOutcomeHostAdapter(FakeHostAdapter):
+        def read_session_outcome(self, runtime_session_id: str):
+            del runtime_session_id
+            return SessionOutcome(status="completed", session_id="ses-verifier-42")
+
+    with patch(
+        "scripts.orchestrator_supervisor._default_host_adapter",
+        return_value=CompletedOutcomeHostAdapter(successful_host_adapter(session_id="ses-ignored").start_result),
+    ), patch("scripts.orchestrator_supervisor._read_db_artifact_fact", return_value={}):
         updated_ledger, decision, request = reconcile_ledger(
             ledger,
             artifact_base_dir=tmp_path,
@@ -8052,6 +8169,61 @@ def test_reconcile_bootstrap_rebuilds_running_state_from_db_dispatch_result_root
     assert issue["current_session_id"] == "ses-root-42"
 
 
+def test_reconcile_ignores_stale_last_session_result_hydrate_older_than_runtime_issue(tmp_path: Path) -> None:
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="running",
+        command_id="cmd-running",
+        updated_at="2026-05-07T17:20:00+08:00",
+        current_session_id="ses-root-new",
+    )
+    orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:20:00+08:00",
+        current_role="issue_worker",
+        current_stage="issue_worker_execution",
+        current_status="queued",
+    )
+
+    orchestrator_supervisor._record_dispatch_result_history(
+        base_dir=tmp_path,
+        session_result={
+            "status": "success",
+            "rootSessionID": "ses-root-old",
+            "recordedAt": "2026-05-07T17:10:00+08:00",
+            "issueNumber": "42",
+            "branch": "agent/issue-42-demo",
+            "sourceSessionID": "ses-source-old",
+            "role": "main_orchestrator",
+            "stage": "orchestrator_bootstrap",
+            "reason": "stale bootstrap dispatch result",
+            "title": "Continue issue #42 on agent/issue-42-demo",
+        },
+    )
+
+    updated_ledger, decision, request = reconcile_ledger(
+        ledger,
+        artifact_base_dir=tmp_path,
+        updated_at="2026-05-07T17:21:00+08:00",
+    )
+
+    issue = read_issue(tmp_path, "42")
+    root_event = read_latest_issue_history(tmp_path, "42", entry_type="root_event")
+
+    assert updated_ledger is ledger
+    assert decision["action"] == "delegate_subagent"
+    assert request is None
+    assert issue is not None
+    assert issue["state"] == "running"
+    assert issue["current_session_id"] == "ses-root-new"
+    assert root_event is None
+
+
 def test_record_dispatch_result_history_does_not_collide_on_shared_source_session_id(tmp_path: Path):
     issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
     orchestrator_supervisor._sync_issue_packet_to_db(tmp_path, issue_packet, updated_at="2026-05-07T17:00:00+08:00")
@@ -8557,6 +8729,56 @@ def test_reconcile_quarantines_stale_queued_pr_verifier_with_stale_root_heartbea
     with patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
         updated_ledger, decision, request = reconcile_ledger(ledger, artifact_base_dir=tmp_path,
         updated_at="2026-05-07T17:16:00+08:00",)
+
+    issue = read_issue(tmp_path, "42")
+
+    assert updated_ledger is ledger
+    assert decision["action"] == "hold_quarantined_issue"
+    assert request is None
+    assert issue is not None
+    assert issue["state"] == "quarantined"
+
+
+def test_reconcile_stale_queued_pr_verifier_prefers_root_event_timestamp_over_last_event_at(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "pr_verifier", "stage": "pr_verifier_execution", "status": "queued"}
+    cast(dict[str, str], ledger["artifacts"])["evidence_packet_ref"] = "docs/agents/evidence/issue-42-pr-77.yaml"
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="verifying",
+        command_id="cmd-verifying",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_session_id="ses-root-42",
+    )
+    connection = sqlite3.connect(tmp_path / ".opencode/runtime/control-plane.sqlite3")
+    try:
+        _ = connection.execute(
+            "UPDATE issues SET last_event_at = ? WHERE issue_number = ?",
+            ("2026-05-07T17:16:10+08:00", "42"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    _ = orchestrator_supervisor.append_issue_history(
+        tmp_path,
+        issue_number="42",
+        entry_type="root_event",
+        created_at="2026-05-07T17:00:00+08:00",
+        session_id="ses-root-42",
+        status="root_session_started",
+        summary="root_session_started",
+        payload={"event_type": "root_session_started", "rootSessionID": "ses-root-42"},
+    )
+
+    with patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+        updated_ledger, decision, request = reconcile_ledger(
+            ledger,
+            artifact_base_dir=tmp_path,
+            updated_at="2026-05-07T17:16:30+08:00",
+        )
 
     issue = read_issue(tmp_path, "42")
 

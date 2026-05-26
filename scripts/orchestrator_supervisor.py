@@ -811,7 +811,7 @@ NON_TERMINAL_RELEASE_FAILURE_KINDS = {
     "approval_blocked",
     "policy_blocked",
 }
-RUNTIME_PHASE_PROJECTION_CLEAR_STATES = {"completed"}
+RUNTIME_PHASE_PROJECTION_CLEAR_STATES = {"completed", "failed"}
 RUNTIME_PHASE_PROJECTION_WHITELISTS: dict[str, set[tuple[str, str, str]]] = {
     "ready": {
         ("main_orchestrator", "orchestrator_bootstrap", "queued"),
@@ -1118,6 +1118,72 @@ def _show_session_for_issue(*, base_dir: Path, issue: dict[str, object], issue_n
             },
         ),
     )
+
+
+def _is_allowed_runtime_projection(*, runtime_state: str, role: str, stage: str, status: str) -> bool:
+    allowed_projections = RUNTIME_PHASE_PROJECTION_WHITELISTS.get(runtime_state)
+    if allowed_projections is None:
+        return bool(role and stage)
+    return (role, stage, status) in allowed_projections
+
+
+def _default_current_for_runtime_state(runtime_state: str) -> dict[str, str]:
+    if runtime_state == "dispatching":
+        return {"role": "issue_worker", "stage": "issue_worker_execution", "status": "queued"}
+    if runtime_state == "running":
+        return {"role": "issue_worker", "stage": "issue_worker_execution", "status": "queued"}
+    if runtime_state == "verifying":
+        return {"role": "pr_verifier", "stage": "pr_verifier_execution", "status": "queued"}
+    if runtime_state == "release_pending":
+        return {"role": "main_orchestrator", "stage": "release_root_execution", "status": "queued"}
+    return {}
+
+
+def _recover_missing_current_from_persisted_facts(
+    *,
+    base_dir: Path,
+    issue_number: str,
+    runtime_state: str,
+) -> tuple[dict[str, str], str]:
+    runtime_transition = read_latest_history_entry(
+        base_dir,
+        issue_number=issue_number,
+        entry_type="runtime_transition",
+    )
+    if runtime_transition is not None:
+        payload = _load_json_dict(runtime_transition.get("payload_json"))
+        candidate = {
+            "role": str(payload.get("to_role") or runtime_transition.get("role") or "").strip(),
+            "stage": str(payload.get("to_stage") or runtime_transition.get("stage") or "").strip(),
+            "status": str(runtime_transition.get("status") or "").strip() or "queued",
+        }
+        if _is_allowed_runtime_projection(
+            runtime_state=runtime_state,
+            role=candidate["role"],
+            stage=candidate["stage"],
+            status=candidate["status"],
+        ):
+            return candidate, "runtime_transition"
+
+    latest_session_payload = _read_latest_session_payload(base_dir, issue_number=issue_number)
+    if latest_session_payload is not None:
+        candidate = {
+            "role": str(latest_session_payload.get("role") or "").strip(),
+            "stage": str(latest_session_payload.get("stage") or "").strip(),
+            "status": "queued",
+        }
+        if _is_allowed_runtime_projection(
+            runtime_state=runtime_state,
+            role=candidate["role"],
+            stage=candidate["stage"],
+            status=candidate["status"],
+        ):
+            return candidate, "dispatch_result"
+
+    fallback = _default_current_for_runtime_state(runtime_state)
+    if fallback:
+        return fallback, "runtime_state_default"
+    return {}, ""
 
 
 def _repair_stale_release_pending_fences(*, base_dir: Path, updated_at: str) -> list[str]:
@@ -1818,6 +1884,15 @@ def _sync_root_issue_event_from_session_result(ledger: JsonObject, *, base_dir: 
     if not issue_number:
         return
     runtime_issue = read_issue(base_dir, issue_number) or {}
+    runtime_last_event_at = str(runtime_issue.get("last_event_at") or runtime_issue.get("updated_at") or "")
+    if runtime_last_event_at:
+        recorded_time = _parse_iso8601(recorded_at)
+        runtime_last_event_time = _parse_iso8601(runtime_last_event_at)
+        if recorded_time is not None and runtime_last_event_time is not None:
+            if recorded_time < runtime_last_event_time:
+                return
+        elif recorded_at < runtime_last_event_at:
+            return
     current_state = str(runtime_issue.get("state") or "")
     current_session_id = str(runtime_issue.get("current_session_id") or "")
     if current_state and not current_session_id:
@@ -2138,23 +2213,39 @@ def _quarantine_stale_queued_subagent_with_stale_root(
         return False
     if str(runtime_issue.get("state") or "") not in {"running", "verifying", "release_pending"}:
         return False
+    issue = cast(dict[str, str], ledger["issue"])
+    issue_number = issue["number"]
     root_session_id = str(runtime_issue.get("current_session_id") or "")
-    last_event_at = str(runtime_issue.get("last_event_at") or "")
-    if not root_session_id or not last_event_at:
+    if not root_session_id:
+        return False
+
+    heartbeat_at = str(runtime_issue.get("last_event_at") or "")
+    root_event = read_latest_history_entry(base_dir, issue_number=issue_number, entry_type="root_event")
+    if root_event is not None and str(root_event.get("session_id") or "") == root_session_id:
+        candidate_created_at = str(root_event.get("created_at") or "")
+        if candidate_created_at:
+            heartbeat_at = candidate_created_at
+    else:
+        dispatch_result = read_latest_history_entry(base_dir, issue_number=issue_number, entry_type="dispatch_result")
+        if dispatch_result is not None and str(dispatch_result.get("session_id") or "") == root_session_id:
+            candidate_created_at = str(dispatch_result.get("created_at") or "")
+            if candidate_created_at:
+                heartbeat_at = candidate_created_at
+
+    if not heartbeat_at:
         return False
     current_time = _parse_iso8601(updated_at)
-    last_event_time = _parse_iso8601(last_event_at)
+    last_event_time = _parse_iso8601(heartbeat_at)
     if current_time is None or last_event_time is None:
         return False
     if current_time - last_event_time <= timedelta(seconds=root_heartbeat_timeout_seconds()):
         return False
 
-    issue = cast(dict[str, str], ledger["issue"])
     quarantine_issue_execution(
         base_dir=base_dir,
-        issue_number=issue["number"],
+        issue_number=issue_number,
         reason=(
-            f"Queued {current['role']} for issue #{issue['number']} outlived root session heartbeat {root_session_id} after last event at {last_event_at}; "
+            f"Queued {current['role']} for issue #{issue_number} outlived root session heartbeat {root_session_id} after last root event at {heartbeat_at}; "
             "treat it as an orphaned queued subagent and quarantine before redispatch."
         ),
         updated_at=updated_at,
@@ -5344,6 +5435,51 @@ def reconcile_ledger(
             return _route_no_change()
 
         def _route_no_change() -> tuple[JsonObject, JsonObject, JsonObject | None]:
+            runtime_issue_state = str(runtime_issue.get("state") or "") if runtime_issue is not None else ""
+            if (
+                not str(current.get("role") or "")
+                and not str(current.get("stage") or "")
+                and runtime_issue is not None
+                and runtime_issue_state in {"dispatching", "running", "verifying", "release_pending"}
+            ):
+                recovered_current, recovered_from = _recover_missing_current_from_persisted_facts(
+                    base_dir=base_dir,
+                    issue_number=issue["number"],
+                    runtime_state=runtime_issue_state,
+                )
+                if recovered_current:
+                    current.update(recovered_current)
+                    cast(dict[str, str], ledger["current"]).update(recovered_current)
+                    summary = (
+                        f"Issue #{issue['number']} is active (state={runtime_issue_state}) with missing role/stage. "
+                        f"Recovered current cursor from {recovered_from}: "
+                        f"{recovered_current['role']}/{recovered_current['stage']} ({recovered_current['status']})."
+                    )
+                    _sync_runtime_phase_metadata(
+                        base_dir=base_dir,
+                        issue_number=_ledger_issue_number(ledger, issue["number"]),
+                        current=cast(dict[str, str], ledger["current"]),
+                        attempts=cast(dict[str, int], ledger.get("attempts", {})),
+                        limits=cast(dict[str, int], ledger.get("limits", {})),
+                        last_failure=cast(dict[str, object], ledger.get("lastFailure", {})),
+                        workflow=cast(dict[str, object], ledger.get("workflow", {})),
+                        automation=cast(dict[str, object], ledger.get("automation", {})),
+                        artifacts=cast(dict[str, object], ledger.get("artifacts", {})),
+                        queued_next_issue=cast(dict[str, object], ledger.get("queuedNextIssue", {})),
+                        updated_at=timestamp,
+                    )
+                    return (
+                        ledger,
+                        {
+                            "action": "no_change",
+                            "next_role": recovered_current["role"],
+                            "next_stage": recovered_current["stage"],
+                            "summary": summary,
+                            "request_title": "",
+                        },
+                        None,
+                    )
+
             persisted_release = _read_db_artifact_fact(
                 base_dir=artifact_lookup_base_dir,
                 issue_number=issue["number"],
@@ -5398,7 +5534,7 @@ def reconcile_ledger(
             next_ledger, decision, request = no_change_decision(
                 ledger,
                 current=current,
-                runtime_issue_state=str(runtime_issue.get("state") or "") if runtime_issue is not None else "",
+                runtime_issue_state=runtime_issue_state,
                 updated_at=timestamp,
                 bump_ledger_revision=_bump_ledger_revision,
             )
