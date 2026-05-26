@@ -797,7 +797,7 @@ NON_TERMINAL_RELEASE_FAILURE_KINDS = {
     "approval_blocked",
     "policy_blocked",
 }
-RUNTIME_PHASE_PROJECTION_CLEAR_STATES = {"completed", "failed"}
+RUNTIME_PHASE_PROJECTION_CLEAR_STATES = {"completed"}
 RUNTIME_PHASE_PROJECTION_WHITELISTS: dict[str, set[tuple[str, str, str]]] = {
     "ready": {
         ("main_orchestrator", "orchestrator_bootstrap", "queued"),
@@ -807,6 +807,7 @@ RUNTIME_PHASE_PROJECTION_WHITELISTS: dict[str, set[tuple[str, str, str]]] = {
         ("pr_verifier", "pr_verifier_execution", "queued"),
     },
     "verified": {("main_orchestrator", "issue_selection_or_recovery", "queued")},
+    "failed": {("main_orchestrator", "issue_selection_or_recovery", "queued")},
     "release_pending": {
         ("main_orchestrator", "release_root_execution", "queued"),
         ("main_orchestrator", "release_root_execution", "running"),
@@ -5067,6 +5068,56 @@ def reconcile_ledger(
             return _route_no_change()
 
         def _route_no_change() -> tuple[JsonObject, JsonObject, JsonObject | None]:
+            persisted_release = _read_db_artifact_fact(
+                base_dir=artifact_lookup_base_dir,
+                issue_number=issue["number"],
+                artifact_kind="release_result",
+            )
+            persisted_release_status = str(persisted_release.get("status") or "").strip().lower()
+            if (
+                not str(current.get("role") or "")
+                and not str(current.get("stage") or "")
+                and runtime_issue is not None
+                and str(runtime_issue.get("state") or "") in {"failed", "ready"}
+                and bool(artifacts.get("release_result_ref"))
+                and persisted_release_status in {"success", "completed"}
+            ):
+                summary = (
+                    f"Issue #{issue['number']} has no queued role/stage, but SQLite already has a successful release_result. "
+                    "Queue issue_selection_or_recovery so late release recovery can reconcile the control plane to completed."
+                )
+                queue_transition = {"role": "main_orchestrator", "stage": "issue_selection_or_recovery", "status": "queued"}
+                cast(dict[str, str], ledger["current"]).update(queue_transition)
+                _sync_runtime_phase_metadata(
+                    base_dir=base_dir,
+                    issue_number=_ledger_issue_number(ledger, issue["number"]),
+                    current=cast(dict[str, str], ledger["current"]),
+                    attempts=cast(dict[str, int], ledger.get("attempts", {})),
+                    limits=cast(dict[str, int], ledger.get("limits", {})),
+                    last_failure=cast(dict[str, object], ledger.get("lastFailure", {})),
+                    workflow=cast(dict[str, object], ledger.get("workflow", {})),
+                    automation=cast(dict[str, object], ledger.get("automation", {})),
+                    artifacts=cast(dict[str, object], ledger.get("artifacts", {})),
+                    queued_next_issue=cast(dict[str, object], ledger.get("queuedNextIssue", {})),
+                    updated_at=timestamp,
+                )
+                request = {
+                    "role": "main_orchestrator",
+                    "stage": "issue_selection_or_recovery",
+                    "title": f"Recover issue #{issue['number']} from persisted release result",
+                    "issueNumber": issue["number"],
+                }
+                return (
+                    ledger,
+                    {
+                        "action": "queue_next_session",
+                        "next_role": "main_orchestrator",
+                        "next_stage": "issue_selection_or_recovery",
+                        "summary": summary,
+                        "request_title": cast(str, request["title"]),
+                    },
+                    cast(JsonObject, request),
+                )
             no_change_decision = cast(Callable[..., tuple[JsonObject, JsonObject, JsonObject | None]], _reconcile_helpers.no_change_decision)
             next_ledger, decision, request = no_change_decision(
                 ledger,

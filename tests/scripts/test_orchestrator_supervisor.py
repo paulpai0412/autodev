@@ -9277,6 +9277,105 @@ def test_reconcile_late_successful_release_result_recovers_ready_issue_to_comple
     assert issue["current_session_id"] == ""
 
 
+def test_reconcile_without_queued_role_recovers_failed_issue_from_completed_release_result(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "", "stage": "", "status": ""}
+    cast(dict[str, str], ledger["artifacts"])["release_result_ref"] = "docs/agents/release-results/issue-42-pr-88.yaml"
+    orchestrator_supervisor.upsert_issue_state(tmp_path,
+    issue_number="42",
+    state="failed",
+    command_id="cmd-failed",
+    updated_at="2026-05-07T17:21:00+08:00", current_session_id="", )
+    release_path = tmp_path / "docs/agents/release-results/issue-42-pr-88.yaml"
+    release_path.parent.mkdir(parents=True, exist_ok=True)
+    release_path.write_text(
+        'schema_version: "1.0"\nkind: release_result\nline_cap: 60\nsubject:\n  issue_number: "42"\n  pr_number: "88"\n  branch: "agent/issue-42-demo"\nstatus: "completed"\nblocked_reason: "none"\nsummary:\n  outcome: "merged"\n  next_recommended_step: "continue"\nfailure_classification: {kind: "none", retryable: false, routed_to: "none", root_cause_signature: "none"}\nmerge:\n  attempted: false\n  merged: true\n  merged_sha: "abc"\nrole_boundary:\n  actor_role: "release_worker"\n  may_run_final_acceptance_qa: false\n  may_merge_only_after_verifier_pass: true\nmetadata:\n  worker: "r"\n  worker_session_id: "ses-r"\n  completed_at: "2026-05-07T17:22:00+08:00"\n',
+        encoding="utf-8",
+    )
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="release_result",
+        payload={
+            "status": "completed",
+            "blocked_reason": "none",
+            "next_recommended_step": "continue",
+            "failure_kind": "none",
+            "retryable": False,
+        },
+        updated_at="2026-05-07T17:22:00+08:00",
+        body_text=release_path.read_text(encoding="utf-8"),
+    )
+
+    with patch("scripts.orchestrator_supervisor.run_issue_packet_intake", return_value=False):
+        first_ledger, first_decision, first_request = reconcile_ledger(ledger, artifact_base_dir=tmp_path,
+        updated_at="2026-05-07T17:23:00+08:00",)
+        second_ledger, second_decision, second_request = reconcile_ledger(first_ledger, artifact_base_dir=tmp_path,
+        updated_at="2026-05-07T17:24:00+08:00",)
+
+    issue = read_issue(tmp_path, "42")
+
+    assert first_decision["action"] == "queue_next_session"
+    assert first_decision["next_stage"] == "issue_selection_or_recovery"
+    assert first_request is not None
+    assert cast(dict[str, object], first_ledger["current"])["stage"] == "issue_selection_or_recovery"
+    assert second_decision["action"] == "queue_next_session"
+    assert second_request is not None
+    assert issue is not None
+    assert issue["state"] == "completed"
+    assert issue["current_stage"] == ""
+
+
+def test_reconcile_issue_selection_or_recovery_recovers_completed_release_without_main_orchestrator_attempt_counter(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "main_orchestrator", "stage": "issue_selection_or_recovery", "status": "queued"}
+    ledger["attempts"] = {"issue_worker": 1, "pr_verifier": 1, "release_worker": 1}
+    cast(dict[str, str], ledger["artifacts"])["release_result_ref"] = "docs/agents/release-results/issue-42-pr-88.yaml"
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="failed",
+        command_id="cmd-failed",
+        updated_at="2026-05-07T17:21:00+08:00",
+        current_session_id="",
+    )
+    release_path = tmp_path / "docs/agents/release-results/issue-42-pr-88.yaml"
+    release_path.parent.mkdir(parents=True, exist_ok=True)
+    release_path.write_text(
+        'schema_version: "1.0"\nkind: release_result\nline_cap: 60\nsubject:\n  issue_number: "42"\n  pr_number: "88"\n  branch: "agent/issue-42-demo"\nstatus: "completed"\nblocked_reason: "none"\nsummary:\n  outcome: "merged"\n  next_recommended_step: "continue"\nfailure_classification: {kind: "none", retryable: false, routed_to: "none", root_cause_signature: "none"}\nmerge:\n  attempted: false\n  merged: true\n  merged_sha: "abc"\nrole_boundary:\n  actor_role: "release_worker"\n  may_run_final_acceptance_qa: false\n  may_merge_only_after_verifier_pass: true\nmetadata:\n  worker: "r"\n  worker_session_id: "ses-r"\n  completed_at: "2026-05-07T17:22:00+08:00"\n',
+        encoding="utf-8",
+    )
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="release_result",
+        payload={
+            "status": "completed",
+            "blocked_reason": "none",
+            "next_recommended_step": "continue",
+            "failure_kind": "none",
+            "retryable": False,
+        },
+        updated_at="2026-05-07T17:22:00+08:00",
+        body_text=release_path.read_text(encoding="utf-8"),
+    )
+
+    with patch("scripts.orchestrator_supervisor.run_issue_packet_intake", return_value=False):
+        updated_ledger, decision, request = reconcile_ledger(ledger, artifact_base_dir=tmp_path,
+        updated_at="2026-05-07T17:23:00+08:00",)
+
+    issue = read_issue(tmp_path, "42")
+
+    assert updated_ledger is not None
+    assert decision["action"] == "queue_next_session"
+    assert request is not None
+    assert issue is not None
+    assert issue["state"] == "completed"
+    assert cast(dict[str, int], updated_ledger["attempts"])["main_orchestrator"] == 1
+
+
 def test_reconcile_issue_selection_or_recovery_queues_retryable_failed_issue_recovery(tmp_path: Path):
     issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
