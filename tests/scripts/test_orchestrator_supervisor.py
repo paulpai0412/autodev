@@ -1199,7 +1199,7 @@ def test_sync_project_fields_projection_includes_pr_workflow_status(tmp_path: Pa
         )
 
     assert error == ""
-    assert captured_fields["PVTF_state"] == "in progress"
+    assert captured_fields["PVTF_state"] == "running"
     assert captured_fields["PVTF_stage"] == ""
     assert captured_fields["PVTF_pr_workflow"] == "verifier_passed"
 
@@ -1246,7 +1246,7 @@ def test_sync_project_fields_projection_sets_release_pending_pr_workflow_to_veri
         )
 
     assert error == ""
-    assert captured_fields["PVTF_state"] == "in review"
+    assert captured_fields["PVTF_state"] == "release_pending"
     assert captured_fields["PVTF_pr_workflow"] == "verifier_passed"
 
 

@@ -2329,12 +2329,12 @@ def _sync_project_fields_projection(
     pr_workflow_field_id = str(configured.get("pr_workflow") or configured_fallback.get("pr_workflow") or "").strip()
 
     issue = read_issue(base_dir, issue_number) or {}
-    issue_state, team_workflow_state, pr_workflow_status = _projected_issue_state_and_workflows(
+    issue_state, _team_workflow_state, pr_workflow_status = _projected_issue_state_and_workflows(
         base_dir=base_dir,
         issue_number=issue_number,
     )
     if state_field_id:
-        fields[state_field_id] = team_workflow_state
+        fields[state_field_id] = issue_state
     if stage_field_id:
         fields[stage_field_id] = str(issue.get("current_stage") or "")
     if pr_workflow_field_id:
