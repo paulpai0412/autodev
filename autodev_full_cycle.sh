@@ -15,6 +15,7 @@ MAX_CYCLES="${MAX_CYCLES:-}" # 0 = infinite
 AUTO_APPROVE_RELEASE="${AUTO_APPROVE_RELEASE:-}"
 AUTO_LABEL_READY="${AUTO_LABEL_READY:-}" # 1 => add ready-for-agent to all open issues
 HEARTBEAT_SECONDS="${HEARTBEAT_SECONDS:-}"
+BOOTSTRAP_DONE="${BOOTSTRAP_DONE:-0}"
 
 # Force non-interactive output in shell dashboards (avoid pager freeze on gh lists).
 export GH_PAGER="${GH_PAGER:-cat}"
@@ -501,9 +502,16 @@ con.close()
 PY
 }
 
-autodev_init() {
+autodev_bootstrap_once() {
+  if [ "$BOOTSTRAP_DONE" = "1" ]; then
+    log "Bootstrap already completed; skip autodev init/doctor"
+    return 0
+  fi
+
   run_cmd python3 "$AUTODEV_PROJECT_PY" init --project-root "$PROJECT_ROOT" --json
   run_cmd python3 "$AUTODEV_PROJECT_PY" doctor --project-root "$PROJECT_ROOT" --json
+
+  BOOTSTRAP_DONE="1"
 }
 
 autodev_intake() {
@@ -734,7 +742,7 @@ main() {
   log "REDISPATCH_MAX_ATTEMPTS=$REDISPATCH_MAX_ATTEMPTS"
   log "AUTO_FAIL_QUARANTINED=$AUTO_FAIL_QUARANTINED"
 
-  autodev_init
+  autodev_bootstrap_once
 
   local cycle=0
   while true; do
