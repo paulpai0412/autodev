@@ -72,12 +72,14 @@ def fake_init_with_project_bootstrap_run(args: list[str], **_kwargs: object) -> 
     if args[:4] == ["gh", "project", "field-list", "7"]:
         return completed(args, stdout="[]")
     if args[:4] == ["gh", "project", "field-create", "7"]:
-        if "Workflow State" in args:
+        if "Status" in args:
             return completed(args, stdout=json.dumps({"id": "PVTF_state"}))
         if "Current Stage" in args:
             return completed(args, stdout=json.dumps({"id": "PVTF_stage"}))
         if "PR Workflow" in args:
             return completed(args, stdout=json.dumps({"id": "PVTF_pr_workflow"}))
+    if args[:3] == ["gh", "api", "graphql"]:
+        return completed(args, stdout=json.dumps({"data": {"updateProjectV2Field": {"projectV2Field": {"id": "PVTF_state"}}}}))
     raise AssertionError(f"unexpected command: {args}")
 
 
@@ -105,7 +107,7 @@ def fake_init_with_existing_project_link_run(args: list[str], **_kwargs: object)
                 [
                     {
                         "id": "PVTF_state",
-                        "name": "Workflow State",
+                        "name": "Status",
                         "options": [{"id": "opt_ready", "name": "ready"}],
                     },
                     {"id": "PVTF_stage", "name": "Current Stage", "options": []},
@@ -119,6 +121,8 @@ def fake_init_with_existing_project_link_run(args: list[str], **_kwargs: object)
         )
     if args[:4] == ["gh", "project", "link", "7"]:
         return completed(args)
+    if args[:3] == ["gh", "api", "graphql"]:
+        return completed(args, stdout=json.dumps({"data": {"updateProjectV2Field": {"projectV2Field": {"id": "PVTF_state"}}}}))
     raise AssertionError(f"unexpected command: {args}")
 
 
@@ -315,7 +319,7 @@ def test_init_resolves_existing_github_project_by_title_and_backfills_monitoring
                     [
                         {
                             "id": "PVTF_state",
-                            "name": "Workflow State",
+                            "name": "Status",
                             "options": [{"id": "opt_ready", "name": "ready"}],
                         },
                         {"id": "PVTF_stage", "name": "Current Stage", "options": []},
@@ -329,6 +333,8 @@ def test_init_resolves_existing_github_project_by_title_and_backfills_monitoring
             )
         if args[:4] == ["gh", "project", "link", "7"]:
             return completed(args)
+        if args[:3] == ["gh", "api", "graphql"]:
+            return completed(args, stdout=json.dumps({"data": {"updateProjectV2Field": {"projectV2Field": {"id": "PVTF_state"}}}}))
         raise AssertionError(f"unexpected command: {args}")
 
     with patch("scripts.autodev_project.subprocess.run", side_effect=fake_run):

@@ -22,6 +22,7 @@ from scripts.control_plane_db import canonical_control_plane_base_dir, ensure_co
 from scripts.orchestrator_supervisor import show_latest_session
 from scripts.control_plane_db import list_issues
 from scripts.orchestrator_sessions import resolve_host_adapter
+from scripts.issue_state_machine import ISSUE_STATES
 from scripts.state_projection import (
     PR_WORKFLOW_LABELS,
     TEAM_WORKFLOW_STATES,
@@ -149,6 +150,21 @@ class ConfiguredGitHubMonitoring:
 
 
 AUTODEV_ISSUE_STATES = TEAM_WORKFLOW_STATES
+
+AUTODEV_PROJECT_STATUS_STATES = [state for state in ISSUE_STATES if state != "closed"]
+
+AUTODEV_PROJECT_STATUS_COLORS: dict[str, str] = {
+    "ready": "GRAY",
+    "claimed": "BLUE",
+    "dispatching": "BLUE",
+    "running": "BLUE",
+    "verifying": "YELLOW",
+    "verified": "GREEN",
+    "release_pending": "ORANGE",
+    "completed": "GREEN",
+    "failed": "RED",
+    "quarantined": "PURPLE",
+}
 
 AUTODEV_PR_WORKFLOW_STATES = [
     "not_opened",
@@ -655,6 +671,87 @@ def _option_id_map_for_states(*, owner: str, project_number: int, field_name: st
     return mapping
 
 
+def _quote_graphql_string(raw: str) -> str:
+    return raw.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _sync_single_select_field_options(
+    *,
+    field_id: str,
+    options: list[dict[str, str]],
+) -> None:
+    if not field_id:
+        raise RuntimeError("missing project field id for single-select option sync")
+    if not options:
+        raise RuntimeError("single-select field option sync requires at least one option")
+
+    fragments: list[str] = []
+    for option in options:
+        name = str(option.get("name") or "").strip()
+        if not name:
+            continue
+        color = str(option.get("color") or "GRAY").strip().upper() or "GRAY"
+        description = str(option.get("description") or "")
+        option_id = str(option.get("id") or "").strip()
+        parts: list[str] = []
+        if option_id:
+            parts.append(f'id: "{_quote_graphql_string(option_id)}"')
+        parts.extend(
+            [
+                f'name: "{_quote_graphql_string(name)}"',
+                f"color: {color}",
+                f'description: "{_quote_graphql_string(description)}"',
+            ]
+        )
+        fragments.append("{ " + ", ".join(parts) + " }")
+
+    if not fragments:
+        raise RuntimeError("single-select field option sync produced no valid options")
+
+    mutation = "\n".join(
+        [
+            "mutation {",
+            "  updateProjectV2Field(",
+            f'    input: {{ fieldId: "{_quote_graphql_string(field_id)}", singleSelectOptions: [ {", ".join(fragments)} ] }}',
+            "  ) {",
+            "    projectV2Field {",
+            "      ... on ProjectV2SingleSelectField {",
+            "        id",
+            "      }",
+            "    }",
+            "  }",
+            "}",
+        ]
+    )
+    synced = _run_command(
+        [
+            "gh",
+            "api",
+            "graphql",
+            "-f",
+            f"query={mutation}",
+        ],
+        check=False,
+    )
+    if synced.returncode != 0:
+        detail = cast(str, synced.stderr or "").strip() or cast(str, synced.stdout or "").strip()
+        raise RuntimeError(f"failed to sync project single-select options: {detail}")
+
+
+def _sync_status_lifecycle_options(*, owner: str, project_number: int, status_field_id: str) -> None:
+    existing = _project_field_option_map(owner=owner, project_number=project_number, field_name="Status")
+    desired = [
+        {
+            "id": existing.get(state, ""),
+            "name": state,
+            "color": AUTODEV_PROJECT_STATUS_COLORS.get(state, "GRAY"),
+            "description": "",
+        }
+        for state in AUTODEV_PROJECT_STATUS_STATES
+    ]
+    _sync_single_select_field_options(field_id=status_field_id, options=desired)
+
+
 def _monitoring_block(*, setup: GitHubProjectSetup) -> str:
     state_mapping = setup.field_option_ids.get("state", {})
     pr_workflow_mapping = setup.field_option_ids.get("pr_workflow", {})
@@ -1136,9 +1233,9 @@ def init_project(
                     "state": _ensure_project_field(
                         owner=project_owner,
                         project_number=project_number,
-                        field_name="Workflow State",
+                        field_name="Status",
                         data_type="SINGLE_SELECT",
-                        single_select_options=AUTODEV_ISSUE_STATES,
+                        single_select_options=AUTODEV_PROJECT_STATUS_STATES,
                     ),
                     "stage": _ensure_project_field(
                         owner=project_owner,
@@ -1154,12 +1251,17 @@ def init_project(
                         single_select_options=AUTODEV_PR_WORKFLOW_STATES,
                     ),
                 }
+                _sync_status_lifecycle_options(
+                    owner=project_owner,
+                    project_number=project_number,
+                    status_field_id=field_ids["state"],
+                )
                 field_option_ids = {
                     "state": _option_id_map_for_states(
                         owner=project_owner,
                         project_number=project_number,
-                        field_name="Workflow State",
-                        states=AUTODEV_ISSUE_STATES,
+                        field_name="Status",
+                        states=AUTODEV_PROJECT_STATUS_STATES,
                     ),
                     "pr_workflow": _option_id_map_for_states(
                         owner=project_owner,
@@ -1238,9 +1340,9 @@ def init_project(
                             "state": _ensure_project_field(
                                 owner=configured_project_owner,
                                 project_number=project_number_to_link,
-                                field_name="Workflow State",
+                                field_name="Status",
                                 data_type="SINGLE_SELECT",
-                                single_select_options=AUTODEV_ISSUE_STATES,
+                                single_select_options=AUTODEV_PROJECT_STATUS_STATES,
                             ),
                             "stage": _ensure_project_field(
                                 owner=configured_project_owner,
@@ -1256,12 +1358,17 @@ def init_project(
                                 single_select_options=AUTODEV_PR_WORKFLOW_STATES,
                             ),
                         }
+                        _sync_status_lifecycle_options(
+                            owner=configured_project_owner,
+                            project_number=project_number_to_link,
+                            status_field_id=field_ids["state"],
+                        )
                         field_option_ids = {
                             "state": _option_id_map_for_states(
                                 owner=configured_project_owner,
                                 project_number=project_number_to_link,
-                                field_name="Workflow State",
-                                states=AUTODEV_ISSUE_STATES,
+                                field_name="Status",
+                                states=AUTODEV_PROJECT_STATUS_STATES,
                             ),
                             "pr_workflow": _option_id_map_for_states(
                                 owner=configured_project_owner,
