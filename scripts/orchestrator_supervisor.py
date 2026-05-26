@@ -3342,6 +3342,8 @@ def release_issue_execution(
     updated_at: str | None = None,
 ) -> None:
     release = cast(Callable[..., None], _lifecycle_helpers.release_issue_execution)
+    timestamp = _now(updated_at)
+    expected_target_state = str(final_state or ("ready" if restore_ready_for_agent else "failed") or "").strip() or "state-sync"
     release(
         base_dir=base_dir,
         issue_number=issue_number,
@@ -3358,6 +3360,27 @@ def release_issue_execution(
         final_state=final_state,
         updated_at=updated_at,
     )
+    if _project_fields_sync_enabled(base_dir=base_dir, issue_number=issue_number):
+        runtime_issue = read_issue(base_dir, issue_number) or {}
+        state_after_release = str(runtime_issue.get("state") or "").strip() or expected_target_state
+        project_error = _sync_project_fields_projection(
+            base_dir=base_dir,
+            issue_number=issue_number,
+            command_id=f"release:{issue_number}:{state_after_release}:project-fields",
+            updated_at=timestamp,
+        )
+        if project_error:
+            record_admin_decision(
+                base_dir,
+                command_id=f"release:{issue_number}:{state_after_release}:project-fields:admin-failed",
+                issue_number=issue_number,
+                decision_type="admin_github_projection_failure",
+                reason=(
+                    f"GitHub project field sync failed after release_issue_execution for issue #{issue_number}: "
+                    f"{project_error}"
+                ),
+                updated_at=timestamp,
+            )
 
 
 def quarantine_issue_execution(

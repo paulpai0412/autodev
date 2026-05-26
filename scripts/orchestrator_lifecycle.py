@@ -1363,7 +1363,7 @@ def release_issue_execution(
 
     current_state = str(issue_state.get("state") or "")
 
-    if target_state == "completed":
+    if target_state == "completed" and current_state in {"verifying", "release_pending"}:
         sync_error = sync_local_main_after_release_merge(
             base_dir=base_dir,
             issue_number=issue_number,

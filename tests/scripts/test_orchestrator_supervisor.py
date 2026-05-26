@@ -4947,6 +4947,59 @@ def test_release_issue_execution_completed_cleans_issue_worktree_and_runtime_con
     assert str(issue.get("worktree_path") or "") == ""
 
 
+def test_release_issue_execution_completed_syncs_project_fields_when_project_binding_exists(tmp_path: Path):
+    _ingest_issue_packet_text(tmp_path, "42", SAMPLE_ISSUE_PACKET)
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="release_pending",
+        command_id="cmd-release-pending",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_session_id="ses-release-42",
+    )
+    orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:00:00+08:00",
+        runtime_context={
+            "github_project_id": "PVT_project_1",
+            "github_project_field_ids": {
+                "state": "PVTF_state",
+            },
+        },
+    )
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="release_result",
+        payload={
+            "status": "success",
+            "merge": {"merged": True, "merged_sha": "abc123"},
+        },
+        updated_at="2026-05-07T17:00:30+08:00",
+    )
+
+    with patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""), patch(
+        "scripts.orchestrator_supervisor._sync_project_fields_projection",
+        return_value="",
+    ) as sync_project_fields, patch(
+        "scripts.orchestrator_lifecycle.subprocess.run",
+        return_value=CompletedProcess(args=["git"], returncode=0, stdout="", stderr=""),
+    ):
+        orchestrator_supervisor.release_issue_execution(
+            base_dir=tmp_path,
+            issue_number="42",
+            restore_ready_for_agent=False,
+            final_state="completed",
+            updated_at="2026-05-07T17:01:00+08:00",
+        )
+
+    sync_project_fields.assert_called_once()
+    kwargs = sync_project_fields.call_args.kwargs
+    assert kwargs["issue_number"] == "42"
+    assert kwargs["command_id"] == "release:42:completed:project-fields"
+
+
 def test_release_issue_execution_completed_raises_when_worktree_cleanup_fails(tmp_path: Path):
     _ingest_issue_packet_text(tmp_path, "42", SAMPLE_ISSUE_PACKET)
     issue_worktree = tmp_path / ".opencode" / "runtime" / "issue-worktrees" / "issue-42"
@@ -7527,6 +7580,49 @@ def test_retry_failed_issue_execution_restores_ready_when_failure_is_retryable(t
     assert latest_decision is not None
     assert latest_decision["decision_type"] == "admin_retry_failed_issue"
     assert latest_decision["to_state"] == "ready"
+
+
+def test_retry_failed_issue_execution_skips_local_main_sync_after_late_release_success(tmp_path: Path):
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="failed",
+        command_id="cmd-failed",
+        updated_at="2026-05-07T17:00:00+08:00",
+    )
+    orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:00:00+08:00",
+        last_failure={"kind": "environment_worktree_constraint", "retryable": True, "summary": "safe to retry"},
+    )
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="release_result",
+        payload={
+            "status": "success",
+            "merge": {"merged": True, "merged_sha": "abc123"},
+        },
+        updated_at="2026-05-07T17:00:30+08:00",
+    )
+
+    with patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""), patch(
+        "scripts.orchestrator_lifecycle.subprocess.run",
+        side_effect=AssertionError("local-main sync should not run from failed->ready retry path"),
+    ):
+        payload = orchestrator_supervisor.retry_failed_issue_execution(
+            base_dir=tmp_path,
+            issue_number="42",
+            reason="auto-recovery loop: retry failed issue",
+            updated_at="2026-05-07T17:01:00+08:00",
+        )
+
+    issue = read_issue(tmp_path, "42")
+
+    assert payload["status"] == "success"
+    assert issue is not None
+    assert issue["state"] == "ready"
 
 
 def test_clear_ready_issue_session_fence_clears_stale_current_session_id(tmp_path: Path):
