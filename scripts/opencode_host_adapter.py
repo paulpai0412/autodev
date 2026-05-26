@@ -15,6 +15,7 @@ from typing import IO, Any, Callable, Protocol, cast
 
 from scripts import opencode_db_path, read_session_summary
 from scripts.host_adapter import HostAdapter, SessionOutcome, SessionStartContext, SessionStartResult
+from scripts.runtime_exec import default_opencode_commands_dir, opencode_cli_fallback_candidates
 
 
 class FindSessionID(Protocol):
@@ -25,14 +26,13 @@ def resolve_opencode_cli() -> str | None:
     opencode_cli = shutil.which("opencode")
     if opencode_cli:
         return opencode_cli
-    known_install_paths = [
-        Path.home() / ".opencode/bin/opencode",
-        Path.home() / ".local/bin/opencode",
-        Path.home() / "bin/opencode",
-    ]
+    known_install_paths = opencode_cli_fallback_candidates()
     for candidate in known_install_paths:
         if candidate.exists():
             return str(candidate)
+    opencode_exe = shutil.which("opencode.exe")
+    if opencode_exe:
+        return opencode_exe
     return shutil.which("opencode-desktop")
 
 
@@ -447,7 +447,7 @@ class OpenCodeHostAdapter(HostAdapter):
     def capabilities(self) -> dict[str, object]:
         return {
             "host": "opencode",
-            "commands_dir": str((Path.home() / ".config/opencode/commands").expanduser()),
+            "commands_dir": str(default_opencode_commands_dir().expanduser()),
             "background_sessions": True,
             "subagents": True,
             "plugin_commands": True,

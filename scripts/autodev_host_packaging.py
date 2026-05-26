@@ -11,6 +11,7 @@ from pathlib import Path
 
 from scripts.host_adapter import HostAdapter
 from scripts.orchestrator_sessions import default_host_adapter
+from scripts.runtime_exec import shell_python_command_token
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,7 @@ def resolve_host_packaging_config(*, fallback_commands_dir: Path) -> HostPackagi
 
 def command_templates(*, root: Path, entrypoints: dict[str, str]) -> dict[str, str]:
     autodev_home = f'${{AUTODEV_HOME:-{root}}}'
+    python_cmd = shell_python_command_token()
     start_filename = entrypoints.get("start", "autodev-start.md")
     reconcile_filename = entrypoints.get("reconcile", "autodev-reconcile.md")
     release_filename = entrypoints.get("release", "autodev-release.md")
@@ -52,7 +54,7 @@ subtask: false
 Run autodev for issue number `$ARGUMENTS` in the current project.
 
 1. Execute:
-!`AUTODEV_HOME="{autodev_home}" PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" start --project-root "$PWD" --issue-number "$1"`
+!`AUTODEV_HOME="{autodev_home}" PYTHONPATH="$AUTODEV_HOME" {python_cmd} "$AUTODEV_HOME/scripts/autodev_project.py" start --project-root "$PWD" --issue-number "$1"`
 2. Report the DB-backed dispatch result, current root session, and next recommended action from the command output.
 
 Notes:
@@ -67,7 +69,7 @@ subtask: false
 ---
 
 Run:
-!`AUTODEV_HOME="{autodev_home}" PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" reconcile --project-root "$PWD"`
+!`AUTODEV_HOME="{autodev_home}" PYTHONPATH="$AUTODEV_HOME" {python_cmd} "$AUTODEV_HOME/scripts/autodev_project.py" reconcile --project-root "$PWD"`
 
 Report the supervisor decision and whether it requires a subagent or fresh main orchestrator session.
 
@@ -82,7 +84,7 @@ subtask: false
 Run the independent release path for issue number `$ARGUMENTS` in the current project. If no issue number is provided, autodev selects the first verified issue waiting for release.
 
 Run:
-!`AUTODEV_HOME="{autodev_home}" PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" release --project-root "$PWD" --issue-number "$1"`
+!`AUTODEV_HOME="{autodev_home}" PYTHONPATH="$AUTODEV_HOME" {python_cmd} "$AUTODEV_HOME/scripts/autodev_project.py" release --project-root "$PWD" --issue-number "$1"`
 
 Report the DB-backed release dispatch result and the release_worker session to resume.
 
@@ -97,7 +99,7 @@ subtask: false
 ---
 
 Run:
-!`AUTODEV_HOME="{autodev_home}" PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" show-session --project-root "$PWD"`
+!`AUTODEV_HOME="{autodev_home}" PYTHONPATH="$AUTODEV_HOME" {python_cmd} "$AUTODEV_HOME/scripts/autodev_project.py" show-session --project-root "$PWD"`
 
 Report how to inspect or resume the latest root session.
 
@@ -110,7 +112,7 @@ subtask: false
 ---
 
 Run:
-!`AUTODEV_HOME="{autodev_home}" PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" doctor --project-root "$PWD"`
+!`AUTODEV_HOME="{autodev_home}" PYTHONPATH="$AUTODEV_HOME" {python_cmd} "$AUTODEV_HOME/scripts/autodev_project.py" doctor --project-root "$PWD"`
 
 Report any missing config, runtime state, or command install problems.
 
@@ -125,12 +127,12 @@ subtask: false
 Run the shared full-cycle loop script against the current consumer project.
 
 Run:
-!`AUTODEV_HOME="{autodev_home}" PROJECT_ROOT="$PWD" bash "$AUTODEV_HOME/autodev_full_cycle.sh"`
+!`AUTODEV_HOME="{autodev_home}" PROJECT_ROOT="$PWD" {python_cmd} "$AUTODEV_HOME/scripts/autodev_full_cycle.py"`
 
 Report the final cycle status and the latest control-plane summary.
 
 Notes:
-- This command does **not** copy the script into the consumer repo; it always runs the shared script from `AUTODEV_HOME`.
-- Repo resolution is handled by `autodev_full_cycle.sh` from the consumer project context (`REPO` env → consumer `.env` → `.autodev.yaml` → git origin).
+- This command does **not** copy the runner into the consumer repo; it always runs the shared runner from `AUTODEV_HOME`.
+- Repo resolution is handled by `scripts/autodev_full_cycle.py` from the consumer project context (`REPO` env → consumer `.env` → `.autodev.yaml` → git origin).
 """,
     }

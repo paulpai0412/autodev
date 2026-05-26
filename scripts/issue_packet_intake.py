@@ -20,6 +20,7 @@ if __package__ in {None, ""}:
 from scripts.control_plane_db import ingest_issue_packet
 from scripts.autodev_project import doctor_project
 from scripts.issue_dependency import infer_dependency_lines
+from scripts.runtime_exec import shell_python_command_token
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -413,7 +414,7 @@ def main(argv: list[str] | None = None) -> int:
         for finding in tracked_findings:
             print(f"[issue-packet-intake] BLOCKED: {finding}")
         print(
-            f"[issue-packet-intake] Run `PYTHONPATH=. python3 scripts/autodev_project.py doctor --project-root \"{consumer_root}\"` and untrack runtime DB before retrying."
+            f"[issue-packet-intake] Run `PYTHONPATH=. {shell_python_command_token()} scripts/autodev_project.py doctor --project-root \"{consumer_root}\"` and untrack runtime DB before retrying."
         )
         return 1
     print("[issue-packet-intake] doctor tracked-runtime check: pass")

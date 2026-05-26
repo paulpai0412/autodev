@@ -21,6 +21,7 @@ from scripts.opencode_host_adapter import (
     stream_supports_fileno,
     wait_for_session_id_in_db,
 )
+from scripts.runtime_exec import opencode_cli_fallback_candidates
 
 
 def resolve_opencode_cli() -> str | None:
@@ -28,9 +29,13 @@ def resolve_opencode_cli() -> str | None:
     if cli:
         return cli
 
-    for candidate in [Path.home() / ".opencode/bin/opencode", Path.home() / ".local/bin/opencode", Path.home() / "bin/opencode"]:
+    for candidate in opencode_cli_fallback_candidates():
         if candidate.exists():
             return str(candidate)
+
+    opencode_exe = shutil.which("opencode.exe")
+    if opencode_exe:
+        return opencode_exe
 
     return shutil.which("opencode-desktop")
 

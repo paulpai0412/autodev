@@ -2,6 +2,10 @@
 
 set -u
 
+echo "[autodev_full_cycle.sh] DEPRECATED: This Bash runner is legacy and may not be portable on native Windows."
+echo "[autodev_full_cycle.sh] Use: python \"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd)/scripts/autodev_full_cycle.py\""
+echo "[autodev_full_cycle.sh] Continuing with legacy Bash runner..."
+
 # End-to-end autodev loop for this project:
 # init -> intake -> start -> reconcile -> release -> recovery -> monitor(gh)
 # Runs until no open GitHub issues remain (or max cycles reached).

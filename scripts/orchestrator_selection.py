@@ -14,6 +14,7 @@ from scripts.issue_selection_projection import (
     readiness_rank_score,
     resolve_issue_base_branch_from_unblocked_dependencies,
 )
+from scripts.runtime_exec import resolved_python_executable
 
 
 JsonObject = dict[str, object]
@@ -256,7 +257,7 @@ def run_issue_packet_intake(
     script_path = DEFAULT_ISSUE_INTAKE_SCRIPT_PATH
     repo = read_project_github_repo(base_dir)
     command = [
-        "python3",
+        resolved_python_executable(),
         str(script_path),
         "--project-root",
         str(base_dir),

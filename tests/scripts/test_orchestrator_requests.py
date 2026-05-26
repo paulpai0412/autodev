@@ -69,8 +69,8 @@ def test_build_prompt_for_main_orchestrator_uses_authoritative_shared_runtime_pa
     assert "The authoritative nonstop supervisor doc is /shared/autodev/docs/agents/runtime/nonstop-supervisor-loop.md." in prompt
     assert "Bootstrap from the SQLite-backed control plane" in prompt
     assert "Use the DB-backed supervisor reconcile flow before the first issue_worker launch" in prompt
-    assert 'PYTHONPATH="/shared/autodev" python3 "/shared/autodev/scripts/orchestrator_supervisor.py" submit-artifact' in prompt
-    assert 'python3 "/tmp/project/scripts/orchestrator_supervisor.py"' not in prompt
+    assert 'PYTHONPATH="/shared/autodev" python "/shared/autodev/scripts/orchestrator_supervisor.py" submit-artifact' in prompt
+    assert 'python "/tmp/project/scripts/orchestrator_supervisor.py"' not in prompt
 
 
 def test_build_prompt_uses_primary_workspace_absolute_artifact_paths() -> None:
@@ -109,7 +109,7 @@ def test_build_prompt_uses_primary_workspace_absolute_artifact_paths() -> None:
 
     assert "submit-artifact" in verifier_prompt
     assert "submit-artifact" in release_prompt
-    assert "python3 scripts/orchestrator_supervisor.py" in verifier_prompt
+    assert "python scripts/orchestrator_supervisor.py" in verifier_prompt
     assert "must not be required for progress" not in verifier_prompt
     assert "must not be required for progress" not in release_prompt
 
@@ -205,7 +205,7 @@ def test_build_prompt_for_pr_verifier_requires_evidence_packet_before_completion
     assert "not a prose description" in prompt
     assert "Do not stop, summarize, or report verification progress until the evidence_packet payload is stored in SQLite" in prompt
     assert "Immediately after submit-artifact for evidence_packet, run inspect" in prompt
-    assert "Inspect command: python3 scripts/orchestrator_supervisor.py inspect --base-dir" in prompt
+    assert "Inspect command: python scripts/orchestrator_supervisor.py inspect --base-dir" in prompt
     assert "artifact_status_json.evidence_packet.parse_ok=true" in prompt
     assert "browser evidence_ref file is missing" in prompt
     assert "If inspect does not show persisted evidence_packet" in prompt

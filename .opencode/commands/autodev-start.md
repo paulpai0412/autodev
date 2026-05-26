@@ -7,10 +7,10 @@ subtask: false
 Run autodev for issue number `$ARGUMENTS` in the current consumer project.
 
 Run:
-!`AUTODEV_HOME="${AUTODEV_HOME:-/home/timmypai/apps/autodev}" PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" start --project-root "$PWD" --issue-number "$1"`
+!`AUTODEV_HOME="${AUTODEV_HOME:-/home/timmypai/apps/autodev}" PYTHONPATH="$AUTODEV_HOME" python "$AUTODEV_HOME/scripts/autodev_project.py" start --project-root "$PWD" --issue-number "$1"`
 
 Then inspect latest root session when needed:
-!`AUTODEV_HOME="${AUTODEV_HOME:-/home/timmypai/apps/autodev}" PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" show-session --project-root "$PWD"`
+!`AUTODEV_HOME="${AUTODEV_HOME:-/home/timmypai/apps/autodev}" PYTHONPATH="$AUTODEV_HOME" python "$AUTODEV_HOME/scripts/autodev_project.py" show-session --project-root "$PWD"`
 
 Report:
 - root-session dispatch outcome

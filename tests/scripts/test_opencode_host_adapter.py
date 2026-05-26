@@ -337,4 +337,17 @@ def test_open_code_host_adapter_capabilities_include_commands_dir() -> None:
     capabilities = host.capabilities()
 
     assert capabilities["host"] == "opencode"
-    assert capabilities["commands_dir"] == str((Path.home() / ".config/opencode/commands").expanduser())
+    assert capabilities["commands_dir"] == str(adapter.default_opencode_commands_dir().expanduser())
+
+
+def test_resolve_opencode_cli_uses_windows_appdata_fallback_candidates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    candidate = tmp_path / "Programs" / "opencode" / "opencode.exe"
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    candidate.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(adapter.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(adapter, "opencode_cli_fallback_candidates", lambda: [candidate])
+
+    resolved = adapter.resolve_opencode_cli()
+
+    assert resolved == str(candidate)

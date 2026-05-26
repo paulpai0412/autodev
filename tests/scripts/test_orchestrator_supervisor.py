@@ -4104,14 +4104,15 @@ def test_run_issue_packet_intake_uses_consumer_project_github_repo(tmp_path: Pat
 
     with patch(
         "scripts.orchestrator_supervisor.subprocess.run",
-        return_value=CompletedProcess(args=["python3"], returncode=0, stdout="", stderr=""),
+        return_value=CompletedProcess(args=["python"], returncode=0, stdout="", stderr=""),
     ) as run:
         result = run_issue_packet_intake(tmp_path)
 
     assert result is True
     command = run.call_args.args[0]
     kwargs = run.call_args.kwargs
-    assert command[:2] == ["python3", str(orchestrator_supervisor.DEFAULT_ISSUE_INTAKE_SCRIPT_PATH)]
+    assert command[0]
+    assert command[1] == str(orchestrator_supervisor.DEFAULT_ISSUE_INTAKE_SCRIPT_PATH)
     assert "--repo" in command
     assert "owner/demo-repo" in command
     assert "--project-root" in command

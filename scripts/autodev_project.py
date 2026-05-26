@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -22,12 +24,14 @@ from scripts.control_plane_db import canonical_control_plane_base_dir, ensure_co
 from scripts.orchestrator_supervisor import show_latest_session
 from scripts.control_plane_db import list_issues
 from scripts.orchestrator_sessions import resolve_host_adapter
+from scripts.opencode_host_adapter import resolve_opencode_cli
 from scripts.issue_state_machine import ISSUE_STATES
 from scripts.state_projection import (
     PR_WORKFLOW_LABELS,
     TEAM_WORKFLOW_STATES,
     default_state_projection_config_lines,
 )
+from scripts.runtime_exec import default_opencode_commands_dir, resolved_python_executable, shell_python_command_token
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -114,14 +118,14 @@ def _host_adapter():
 def _operator_entrypoints() -> dict[str, str]:
     return autodev_host_packaging.host_packaging_config_from_adapter(
         adapter=_host_adapter(),
-        fallback_commands_dir=Path.home() / ".config/opencode/commands",
+        fallback_commands_dir=default_opencode_commands_dir(),
     ).entrypoints
 
 
 def _default_commands_dir() -> Path:
     return autodev_host_packaging.host_packaging_config_from_adapter(
         adapter=_host_adapter(),
-        fallback_commands_dir=Path.home() / ".config/opencode/commands",
+        fallback_commands_dir=default_opencode_commands_dir(),
     ).commands_dir
 
 
@@ -345,7 +349,7 @@ def _enforce_runtime_db_untracked(*, project_root: Path, command: str) -> bool:
     for finding in tracked_findings:
         print(f"[autodev:{command}] BLOCKED: {finding}", file=sys.stderr)
     print(
-        f"[autodev:{command}] Run `PYTHONPATH=. python3 scripts/autodev_project.py doctor --project-root \"{project_root}\"` and untrack runtime DB before retrying.",
+        f"[autodev:{command}] Run `PYTHONPATH=. {shell_python_command_token()} scripts/autodev_project.py doctor --project-root \"{project_root}\"` and untrack runtime DB before retrying.",
         file=sys.stderr,
     )
     return False
@@ -353,6 +357,44 @@ def _enforce_runtime_db_untracked(*, project_root: Path, command: str) -> bool:
 
 def _run_command(args: list[str], *, cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, cwd=cwd, check=check, capture_output=True, text=True)
+
+
+def _is_windows_platform() -> bool:
+    return platform.system().lower().startswith("win")
+
+
+def _windows_preflight_findings() -> list[str]:
+    findings: list[str] = []
+
+    resolved_python = resolved_python_executable()
+    python_available = Path(resolved_python).exists() or shutil.which(resolved_python) is not None
+    if not python_available:
+        findings.append(
+            "windows preflight: Python executable not found. "
+            f"Resolved AUTODEV_PYTHON/sys.executable to `{resolved_python}`. "
+            "Install Python 3 and ensure it is in PATH, or set AUTODEV_PYTHON explicitly."
+        )
+
+    if shutil.which("git") is None:
+        findings.append(
+            "windows preflight: `git` not found in PATH. "
+            "Install Git for Windows and enable PATH integration."
+        )
+
+    if shutil.which("gh") is None:
+        findings.append(
+            "windows preflight: `gh` (GitHub CLI) not found in PATH. "
+            "Install GitHub CLI for Windows and run `gh auth login`."
+        )
+
+    host_adapter = os.environ.get("AUTODEV_HOST_ADAPTER", "opencode").strip().lower() or "opencode"
+    if host_adapter == "opencode" and not resolve_opencode_cli():
+        findings.append(
+            "windows preflight: OpenCode CLI not found (tried PATH and common Windows AppData locations). "
+            "Install OpenCode Desktop/CLI and ensure `opencode` or `opencode.exe` is discoverable."
+        )
+
+    return findings
 
 
 def _repo_https_url(github_repo: str) -> str:
@@ -1480,6 +1522,8 @@ def doctor_project(root: Path) -> ActionReport:
             report.findings.append("unbalanced autodev managed markers in AGENTS.md")
     else:
         report.findings.append("missing AGENTS.md")
+    if _is_windows_platform():
+        report.findings.extend(_windows_preflight_findings())
     return report
 
 
@@ -1539,7 +1583,7 @@ def _shared_workflow_env(project_root: Path | None = None) -> dict[str, str]:
 
 def _reconcile_workspace_command(project_root: Path) -> list[str]:
     return [
-        "python3",
+        resolved_python_executable(),
         "-m",
         "scripts.orchestrator_supervisor",
         "reconcile-workspace",
@@ -1693,7 +1737,7 @@ def main(argv: list[str] | None = None) -> int:
         if not _enforce_runtime_db_untracked(project_root=project_root, command=command):
             return 1
         return subprocess.run(
-            ["python3", "-m", "scripts.orchestrator_supervisor", *_bootstrap_args(project_root, cast(str, args.issue_number))],
+            [resolved_python_executable(), "-m", "scripts.orchestrator_supervisor", *_bootstrap_args(project_root, cast(str, args.issue_number))],
             cwd=project_root,
             env=_shared_workflow_env(project_root),
         ).returncode
@@ -1720,7 +1764,7 @@ def main(argv: list[str] | None = None) -> int:
         if not _enforce_runtime_db_untracked(project_root=project_root, command=command):
             return 1
         release_args = [
-            "python3",
+            resolved_python_executable(),
             "-m",
             "scripts.orchestrator_supervisor",
             "release",

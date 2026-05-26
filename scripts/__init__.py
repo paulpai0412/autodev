@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 from contextlib import closing
 from pathlib import Path
 from typing import Any
 
+from scripts.runtime_exec import default_opencode_data_home
+
 
 def opencode_db_path() -> Path:
-    data_home = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+    data_home = default_opencode_data_home()
     return data_home / "opencode" / "opencode.db"
 
 

@@ -7,10 +7,10 @@ subtask: false
 Run the independent release path for issue number `$ARGUMENTS` in the current project. If no issue number is provided, autodev selects the first verified issue waiting for release.
 
 Run:
-!`AUTODEV_HOME="${AUTODEV_HOME:-/home/timmypai/apps/autodev}" PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" release --project-root "$PWD" --issue-number "$1" --auto-approve`
+!`AUTODEV_HOME="${AUTODEV_HOME:-/home/timmypai/apps/autodev}" PYTHONPATH="$AUTODEV_HOME" python "$AUTODEV_HOME/scripts/autodev_project.py" release --project-root "$PWD" --issue-number "$1" --auto-approve`
 
 Then inspect session pointers when needed:
-!`AUTODEV_HOME="${AUTODEV_HOME:-/home/timmypai/apps/autodev}" PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" show-session --project-root "$PWD"`
+!`AUTODEV_HOME="${AUTODEV_HOME:-/home/timmypai/apps/autodev}" PYTHONPATH="$AUTODEV_HOME" python "$AUTODEV_HOME/scripts/autodev_project.py" show-session --project-root "$PWD"`
 
 Report:
 - DB-backed release dispatch result

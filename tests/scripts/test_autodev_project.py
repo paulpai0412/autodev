@@ -428,7 +428,7 @@ def test_install_commands_writes_autodev_prefixed_global_commands(tmp_path: Path
     assert "scripts/autodev_project.py start" in start_command
     assert '--issue-number "$1"' in start_command
     assert f'AUTODEV_HOME="${{AUTODEV_HOME:-{autodev_project.ROOT}}}"' in start_command
-    assert 'PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" start' in start_command
+    assert 'PYTHONPATH="$AUTODEV_HOME" python "$AUTODEV_HOME/scripts/autodev_project.py" start' in start_command
     assert str(tmp_path) not in start_command
     assert (commands_dir / entrypoints["reconcile"]).exists()
     assert (commands_dir / entrypoints["release"]).exists()
@@ -495,6 +495,17 @@ def test_install_commands_defaults_to_host_adapter_commands_dir(tmp_path: Path):
     assert (commands_dir / "fake-full-cycle.md").exists()
 
 
+def test_default_commands_dir_uses_windows_appdata(tmp_path: Path):
+    with patch("scripts.runtime_exec.platform.system", return_value="Windows"), patch.dict(
+        os.environ,
+        {"APPDATA": str(tmp_path)},
+        clear=False,
+    ):
+        commands_dir = autodev_project._default_commands_dir()
+
+    assert commands_dir == tmp_path / "opencode" / "commands"
+
+
 def test_repo_local_commands_use_autodev_project_wrappers():
     start_command = read(autodev_project.ROOT / ".opencode/commands/autodev-start.md")
     reconcile_command = read(autodev_project.ROOT / ".opencode/commands/autodev-reconcile.md")
@@ -503,11 +514,11 @@ def test_repo_local_commands_use_autodev_project_wrappers():
     full_cycle_command = read(autodev_project.ROOT / ".opencode/commands/autodev-full-cycle.md")
 
     assert f'AUTODEV_HOME="${{AUTODEV_HOME:-{autodev_project.ROOT}}}"' in start_command
-    assert 'PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" start --project-root "$PWD" --issue-number "$1"' in start_command
-    assert 'PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" reconcile --project-root "$PWD"' in reconcile_command
-    assert 'PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" release --project-root "$PWD" --issue-number "$1" --auto-approve' in release_command
-    assert 'PYTHONPATH="$AUTODEV_HOME" python3 "$AUTODEV_HOME/scripts/autodev_project.py" show-session --project-root "$PWD"' in show_command
-    assert 'bash "$AUTODEV_HOME/autodev_full_cycle.sh"' in full_cycle_command
+    assert 'PYTHONPATH="$AUTODEV_HOME" python "$AUTODEV_HOME/scripts/autodev_project.py" start --project-root "$PWD" --issue-number "$1"' in start_command
+    assert 'PYTHONPATH="$AUTODEV_HOME" python "$AUTODEV_HOME/scripts/autodev_project.py" reconcile --project-root "$PWD"' in reconcile_command
+    assert 'PYTHONPATH="$AUTODEV_HOME" python "$AUTODEV_HOME/scripts/autodev_project.py" release --project-root "$PWD" --issue-number "$1" --auto-approve' in release_command
+    assert 'PYTHONPATH="$AUTODEV_HOME" python "$AUTODEV_HOME/scripts/autodev_project.py" show-session --project-root "$PWD"' in show_command
+    assert 'python "$AUTODEV_HOME/scripts/autodev_full_cycle.py"' in full_cycle_command
 
 
 def test_doctor_reports_missing_control_plane_db(tmp_path: Path, capsys: CaptureFixture[str]):
@@ -634,6 +645,59 @@ def test_doctor_passes_freshly_initialized_project(tmp_path: Path, capsys: Captu
     assert captured.out == "autodev project: no changes needed\n"
 
 
+def test_doctor_windows_preflight_reports_missing_tools(tmp_path: Path, capsys: CaptureFixture[str]):
+    write(tmp_path / ".autodev.yaml", 'schema_version: "1.0"\nproject:\n  name: demo\n')
+    write(tmp_path / "AGENTS.md", "# AGENTS.md\n")
+    write(tmp_path / ".opencode/runtime/control-plane.sqlite3", "")
+
+    def fake_which(command: str) -> str | None:
+        if command in {"git", "gh", "python", "python3", "opencode", "opencode.exe", "opencode-desktop"}:
+            return None
+        return f"/mock/{command}"
+
+    with patch("scripts.autodev_project.platform.system", return_value="Windows"), patch(
+        "scripts.autodev_project.shutil.which", side_effect=fake_which
+    ), patch("scripts.autodev_project.resolved_python_executable", return_value="python"), patch(
+        "scripts.autodev_project.resolve_opencode_cli", return_value=None
+    ):
+        exit_code = autodev_project.main(["doctor", "--project-root", str(tmp_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "windows preflight: Python executable not found" in captured.out
+    assert "windows preflight: `git` not found in PATH" in captured.out
+    assert "windows preflight: `gh` (GitHub CLI) not found in PATH" in captured.out
+    assert "windows preflight: OpenCode CLI not found" in captured.out
+
+
+def test_doctor_windows_preflight_passes_when_tools_exist(tmp_path: Path, capsys: CaptureFixture[str]):
+    write(tmp_path / ".autodev.yaml", 'schema_version: "1.0"\nproject:\n  name: demo\n')
+    write(tmp_path / "AGENTS.md", "# AGENTS.md\n")
+    write(tmp_path / ".opencode/runtime/control-plane.sqlite3", "")
+
+    def fake_which(command: str) -> str | None:
+        mapping = {
+            "git": "C:/Program Files/Git/cmd/git.exe",
+            "gh": "C:/Program Files/GitHub CLI/gh.exe",
+            "opencode": None,
+            "opencode.exe": "C:/Users/demo/AppData/Local/opencode/opencode.exe",
+            "opencode-desktop": None,
+            "python": "C:/Python311/python.exe",
+        }
+        return mapping.get(command, f"C:/mock/{command}.exe")
+
+    with patch("scripts.autodev_project.platform.system", return_value="Windows"), patch(
+        "scripts.autodev_project.shutil.which", side_effect=fake_which
+    ), patch("scripts.autodev_project.resolved_python_executable", return_value="python"), patch(
+        "scripts.autodev_project.resolve_opencode_cli", return_value="C:/Users/demo/AppData/Local/opencode/opencode.exe"
+    ):
+        exit_code = autodev_project.main(["doctor", "--project-root", str(tmp_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.out == "autodev project: no changes needed\n"
+
+
 def test_direct_script_doctor_works_without_pythonpath(tmp_path: Path):
     write(tmp_path / ".autodev.yaml", 'schema_version: "1.0"\nproject:\n  name: demo\n')
     write(tmp_path / "AGENTS.md", "# AGENTS.md\n")
@@ -644,7 +708,7 @@ def test_direct_script_doctor_works_without_pythonpath(tmp_path: Path):
 
     completed = subprocess.run(
         [
-            "python3",
+            autodev_project.resolved_python_executable(),
             str(autodev_project.ROOT / "scripts/autodev_project.py"),
             "doctor",
             "--project-root",
@@ -802,7 +866,7 @@ def test_main_reports_json_when_requested(tmp_path: Path, capsys: CaptureFixture
 def test_start_uses_consumer_project_artifact_paths(tmp_path: Path):
     with patch(
         "scripts.autodev_project.subprocess.run",
-        return_value=CompletedProcess(args=["python3"], returncode=0),
+        return_value=CompletedProcess(args=[autodev_project.resolved_python_executable()], returncode=0),
     ) as run:
         exit_code = autodev_project.main(
             ["start", "--project-root", str(tmp_path), "--issue-number", "34"]
@@ -811,7 +875,7 @@ def test_start_uses_consumer_project_artifact_paths(tmp_path: Path):
     assert exit_code == 0
     command = run.call_args.args[0]
     kwargs = run.call_args.kwargs
-    assert command[:4] == ["python3", "-m", "scripts.orchestrator_supervisor", "start-issue"]
+    assert command[:4] == [autodev_project.resolved_python_executable(), "-m", "scripts.orchestrator_supervisor", "start-issue"]
     assert ["--base-dir", str(tmp_path)] in [command[i:i+2] for i in range(len(command)-1)]
     assert ["--issue-number", "34"] in [command[i:i+2] for i in range(len(command)-1)]
     assert ["--source-session-id", "autodev-start"] in [command[i:i+2] for i in range(len(command)-1)]
@@ -825,7 +889,7 @@ def test_start_uses_consumer_project_artifact_paths(tmp_path: Path):
 def test_release_auto_approve_uses_release_only_override(tmp_path: Path):
     with patch(
         "scripts.autodev_project.subprocess.run",
-        return_value=CompletedProcess(args=["python3"], returncode=0),
+        return_value=CompletedProcess(args=[autodev_project.resolved_python_executable()], returncode=0),
     ) as run:
         exit_code = autodev_project.main(
             ["release", "--project-root", str(tmp_path), "--issue-number", "34", "--auto-approve"]
@@ -834,7 +898,7 @@ def test_release_auto_approve_uses_release_only_override(tmp_path: Path):
     assert exit_code == 0
     command = run.call_args.args[0]
     kwargs = run.call_args.kwargs
-    assert command[:4] == ["python3", "-m", "scripts.orchestrator_supervisor", "release"]
+    assert command[:4] == [autodev_project.resolved_python_executable(), "-m", "scripts.orchestrator_supervisor", "release"]
     assert ["--base-dir", str(tmp_path)] in [command[i:i+2] for i in range(len(command)-1)]
     assert ["--issue-number", "34"] in [command[i:i+2] for i in range(len(command)-1)]
     assert ["--source-session-id", "autodev-release"] in [command[i:i+2] for i in range(len(command)-1)]
@@ -855,7 +919,7 @@ def test_reconcile_uses_consumer_project_runtime_paths_and_dispatches_next_sessi
     )
     with patch(
         "scripts.autodev_project.subprocess.run",
-        return_value=CompletedProcess(args=["python3"], returncode=0),
+        return_value=CompletedProcess(args=[autodev_project.resolved_python_executable()], returncode=0),
     ) as run:
         exit_code = autodev_project.main(
             ["reconcile", "--project-root", str(tmp_path)]
@@ -864,7 +928,7 @@ def test_reconcile_uses_consumer_project_runtime_paths_and_dispatches_next_sessi
     assert exit_code == 0
     command = run.call_args.args[0]
     kwargs = run.call_args.kwargs
-    assert command[:4] == ["python3", "-m", "scripts.orchestrator_supervisor", "reconcile-workspace"]
+    assert command[:4] == [autodev_project.resolved_python_executable(), "-m", "scripts.orchestrator_supervisor", "reconcile-workspace"]
     assert ["--base-dir", str(tmp_path)] in [command[i:i+2] for i in range(len(command)-1)]
     assert kwargs["cwd"] == tmp_path
     assert kwargs["env"]["PYTHONPATH"].split(autodev_project.os.pathsep)[0] == str(autodev_project.ROOT)
@@ -877,7 +941,7 @@ def test_start_resolves_consumer_project_root_from_nested_directory(tmp_path: Pa
 
     with patch(
         "scripts.autodev_project.subprocess.run",
-        return_value=CompletedProcess(args=["python3"], returncode=0),
+        return_value=CompletedProcess(args=[autodev_project.resolved_python_executable()], returncode=0),
     ) as run:
         exit_code = autodev_project.main(
             ["start", "--project-root", str(nested), "--issue-number", "34"]
@@ -899,7 +963,7 @@ def test_start_resolves_canonical_project_root_from_issue_worktree_path(tmp_path
 
     with patch(
         "scripts.autodev_project.subprocess.run",
-        return_value=CompletedProcess(args=["python3"], returncode=0),
+        return_value=CompletedProcess(args=[autodev_project.resolved_python_executable()], returncode=0),
     ) as run:
         exit_code = autodev_project.main(
             ["start", "--project-root", str(issue_worktree), "--issue-number", "34"]
@@ -927,7 +991,7 @@ def test_reconcile_resolves_consumer_project_root_from_nested_directory(tmp_path
 
     with patch(
         "scripts.autodev_project.subprocess.run",
-        return_value=CompletedProcess(args=["python3"], returncode=0),
+        return_value=CompletedProcess(args=[autodev_project.resolved_python_executable()], returncode=0),
     ) as run:
         exit_code = autodev_project.main(["reconcile", "--project-root", str(nested)])
 
@@ -955,13 +1019,13 @@ def test_reconcile_uses_workspace_db_runtime_paths(tmp_path: Path):
 
     with patch(
         "scripts.autodev_project.subprocess.run",
-        return_value=CompletedProcess(args=["python3"], returncode=0),
+        return_value=CompletedProcess(args=[autodev_project.resolved_python_executable()], returncode=0),
     ) as run:
         exit_code = autodev_project.main(["reconcile", "--project-root", str(tmp_path)])
 
     assert exit_code == 0
     command = run.call_args.args[0]
-    assert command[:4] == ["python3", "-m", "scripts.orchestrator_supervisor", "reconcile-workspace"]
+    assert command[:4] == [autodev_project.resolved_python_executable(), "-m", "scripts.orchestrator_supervisor", "reconcile-workspace"]
     assert ["--base-dir", str(tmp_path)] in [command[i:i+2] for i in range(len(command)-1)]
 
 
@@ -976,13 +1040,13 @@ def test_reconcile_allows_ready_issue_without_active_session(tmp_path: Path):
 
     with patch(
         "scripts.autodev_project.subprocess.run",
-        return_value=CompletedProcess(args=["python3"], returncode=0),
+        return_value=CompletedProcess(args=[autodev_project.resolved_python_executable()], returncode=0),
     ) as run:
         exit_code = autodev_project.main(["reconcile", "--project-root", str(tmp_path)])
 
     assert exit_code == 0
     command = run.call_args.args[0]
-    assert command[:4] == ["python3", "-m", "scripts.orchestrator_supervisor", "reconcile-workspace"]
+    assert command[:4] == [autodev_project.resolved_python_executable(), "-m", "scripts.orchestrator_supervisor", "reconcile-workspace"]
 
 
 def test_reconcile_watch_runs_bounded_workspace_reconcile_cycles(tmp_path: Path):
@@ -1013,11 +1077,16 @@ def test_reconcile_watch_runs_bounded_workspace_reconcile_cycles(tmp_path: Path)
         )
 
     assert exit_code == 0
-    reconcile_calls = [command for command in calls if command[:4] == ["python3", "-m", "scripts.orchestrator_supervisor", "reconcile-workspace"]]
+    reconcile_calls = [
+        command
+        for command in calls
+        if command[:4]
+        == [autodev_project.resolved_python_executable(), "-m", "scripts.orchestrator_supervisor", "reconcile-workspace"]
+    ]
     assert len(reconcile_calls) == 3
     assert sleeps == [0.25, 0.25]
     for command in reconcile_calls:
-        assert command[:4] == ["python3", "-m", "scripts.orchestrator_supervisor", "reconcile-workspace"]
+        assert command[:4] == [autodev_project.resolved_python_executable(), "-m", "scripts.orchestrator_supervisor", "reconcile-workspace"]
         assert ["--base-dir", str(tmp_path)] in [command[i:i+2] for i in range(len(command)-1)]
 
 
@@ -1043,7 +1112,12 @@ def test_reconcile_watch_stops_on_error_when_requested(tmp_path: Path):
         )
 
     assert exit_code == 2
-    reconcile_calls = [command for command in calls if command[:4] == ["python3", "-m", "scripts.orchestrator_supervisor", "reconcile-workspace"]]
+    reconcile_calls = [
+        command
+        for command in calls
+        if command[:4]
+        == [autodev_project.resolved_python_executable(), "-m", "scripts.orchestrator_supervisor", "reconcile-workspace"]
+    ]
     assert len(reconcile_calls) == 1
     sleep.assert_not_called()
 
@@ -1059,7 +1133,7 @@ def test_reconcile_watch_fails_fast_when_runtime_db_missing(tmp_path: Path, caps
     def fake_run(args: list[str], **_kwargs: object) -> CompletedProcess[str]:
         if args[:3] == ["git", "rev-parse", "--is-inside-work-tree"]:
             return completed(args, stdout="false\n")
-        if args[:4] == ["python3", "-m", "scripts.orchestrator_supervisor", "reconcile-workspace"]:
+        if args[:4] == [autodev_project.resolved_python_executable(), "-m", "scripts.orchestrator_supervisor", "reconcile-workspace"]:
             return completed(
                 args,
                 returncode=1,
@@ -1136,14 +1210,14 @@ def test_start_prints_path_confirmation_before_dispatch(tmp_path: Path, capsys: 
 def test_reconcile_allows_workspace_intake_without_preexisting_db_issue(tmp_path: Path):
     with patch(
         "scripts.autodev_project.subprocess.run",
-        return_value=CompletedProcess(args=["python3"], returncode=0),
+        return_value=CompletedProcess(args=[autodev_project.resolved_python_executable()], returncode=0),
     ) as run:
         exit_code = autodev_project.main(["reconcile", "--project-root", str(tmp_path)])
 
     assert exit_code == 0
     command = run.call_args.args[0]
     kwargs = run.call_args.kwargs
-    assert command[:4] == ["python3", "-m", "scripts.orchestrator_supervisor", "reconcile-workspace"]
+    assert command[:4] == [autodev_project.resolved_python_executable(), "-m", "scripts.orchestrator_supervisor", "reconcile-workspace"]
     assert ["--base-dir", str(tmp_path)] in [command[i:i + 2] for i in range(len(command) - 1)]
     assert kwargs["cwd"] == tmp_path
 

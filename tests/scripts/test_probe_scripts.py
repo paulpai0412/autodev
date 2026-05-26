@@ -59,7 +59,7 @@ def test_session_readability_main_emits_probe_summary(
     monkeypatch: MonkeyPatch,
     capsys: CaptureFixture[str],
 ) -> None:
-    monkeypatch.setattr(readability_probe, "resolve_opencode_cli", lambda: "/bin/opencode")
+    monkeypatch.setattr(readability_probe, "resolve_opencode_cli", lambda: "C:/tools/opencode.exe")
     monkeypatch.setattr(readability_probe, "spawn_detached_opencode_run", lambda command, *, workdir: FakeProcess())
     monkeypatch.setattr(
         readability_probe,
@@ -90,7 +90,7 @@ def test_session_readability_main_emits_probe_summary(
     payload = json.loads(capsys.readouterr().out)
     assert payload["title"] == "probe-title"
     assert payload["ids_match"] is True
-    assert payload["command"][:6] == ["/bin/opencode", "run", "--format", "json", "--title", "probe-title"]
+    assert payload["command"][:6] == ["C:/tools/opencode.exe", "run", "--format", "json", "--title", "probe-title"]
     assert payload["table_snapshots"]["ses_stdout"]["session_count"] == 1
 
 
@@ -115,7 +115,7 @@ def test_launch_replay_from_session_reconstructs_command(tmp_path: Path, monkeyp
     }
     monkeypatch.setattr(silent_stop_probe, "read_session_summary", lambda session_id: source_summary if session_id == "ses-source" else {"session_id": session_id})
     monkeypatch.setattr(silent_stop_probe, "session_summary_abort_reason", lambda summary: "aborted" if summary else "missing")
-    monkeypatch.setattr(silent_stop_probe, "resolve_opencode_cli", lambda: "/bin/opencode")
+    monkeypatch.setattr(silent_stop_probe, "resolve_opencode_cli", lambda: "C:/tools/opencode.exe")
     monkeypatch.setattr(silent_stop_probe, "spawn_detached_opencode_run", lambda command, *, workdir: FakeProcess())
     monkeypatch.setattr(
         silent_stop_probe,
@@ -137,7 +137,7 @@ def test_launch_replay_from_session_reconstructs_command(tmp_path: Path, monkeyp
     assert result["replay_session_id"] == "ses-replay"
     assert result["source_abort_reason"] == "aborted"
     assert result["command"] == [
-        "/bin/opencode",
+        "C:/tools/opencode.exe",
         "run",
         "--format",
         "json",

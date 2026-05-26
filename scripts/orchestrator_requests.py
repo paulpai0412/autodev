@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Callable, cast
 from uuid import uuid4
 
+from scripts.runtime_exec import shell_python_command_token
+
 
 JsonObject = dict[str, object]
 NowFunc = Callable[[str | None], str]
@@ -84,8 +86,8 @@ def build_common_prompt_lines(ledger: JsonObject, *, default_supervisor_doc_path
 
     def runtime_command(relative_script_path: str) -> str:
         if shared_runtime_root:
-            return f'PYTHONPATH="{shared_runtime_root}" python3 "{shared_runtime_root}/{relative_script_path}"'
-        return f"python3 {relative_script_path}"
+            return f'PYTHONPATH="{shared_runtime_root}" {shell_python_command_token()} "{shared_runtime_root}/{relative_script_path}"'
+        return f"{shell_python_command_token()} {relative_script_path}"
 
     return [
         "Bootstrap from the SQLite-backed control plane, not from runtime JSON/YAML artifacts.",
@@ -322,8 +324,8 @@ def build_prompt_spec(
 
     def shared_runtime_command(relative_script_path: str) -> str:
         if shared_runtime_root:
-            return f'PYTHONPATH="{shared_runtime_root}" python3 "{shared_runtime_root}/{relative_script_path}"'
-        return f"python3 {relative_script_path}"
+            return f'PYTHONPATH="{shared_runtime_root}" {shell_python_command_token()} "{shared_runtime_root}/{relative_script_path}"'
+        return f"{shell_python_command_token()} {relative_script_path}"
 
     common = build_common_prompt_lines(ledger, default_supervisor_doc_path=default_supervisor_doc_path)
     if role == "main_orchestrator" and stage == "orchestrator_bootstrap":
