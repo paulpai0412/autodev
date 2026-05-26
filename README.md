@@ -33,12 +33,79 @@ Standalone autonomous development harness extracted into its own workspace at `~
 - Chinese user manual: [`docs/autodev-user-manual.zh-TW.md`](docs/autodev-user-manual.zh-TW.md)
 - Runtime architecture one-pager: [`docs/agents/runtime/current-architecture.md`](docs/agents/runtime/current-architecture.md)
 
+## Required tools and skills
+
+### Required tools
+
+- Python 3.10+ (`python` command available in PATH)
+- `git`
+- `gh` (GitHub CLI, authenticated)
+- OpenCode CLI (`opencode` or `opencode-desktop`) when `AUTODEV_HOST_ADAPTER=opencode`
+- `pytest` (for local regression verification)
+
+Quick verification:
+
+```bash
+python --version
+git --version
+gh --version
+opencode --version
+gh auth status
+python -m pytest --version
+```
+
+One-command install suggestions:
+
+```powershell
+# Windows (PowerShell, winget)
+winget install Python.Python.3.11 Git.Git GitHub.cli
+python -m pip install -U pip pytest
+```
+
+```bash
+# macOS (Homebrew)
+brew install python git gh
+python -m pip install -U pip pytest
+```
+
+```bash
+# Ubuntu/Debian
+sudo apt-get update
+sudo apt-get install -y python3 python3-pip git gh
+python3 -m pip install --user -U pytest
+```
+
+OpenCode CLI install path differs by host distribution; after installation, ensure `opencode --version` works.
+
+### Required skills
+
+- Operator primary entrypoint: `autodev-flow` (`C0..C6`)
+- `issue_worker` default required skills: `tdd`, `karpathy-guidelines`, `git-master`
+- `pr_verifier` default required skills: `review-work`, `karpathy-guidelines`
+- Web/UI issue add-ons:
+  - `issue_worker`: `web-design-engineer`
+  - `pr_verifier`: `browser-qa`, `e2e-testing`
+
+Skill availability should be ensured in your OpenCode environment (`~/.config/opencode/skills`).
+
+Quick skill checks:
+
+```bash
+ls ~/.config/opencode/skills | grep -E 'autodev-flow|tdd|karpathy-guidelines|git-master|review-work|web-design-engineer|browser-qa|e2e-testing'
+```
+
+```powershell
+Get-ChildItem "$HOME/.config/opencode/skills" | Where-Object {
+  $_.Name -match 'autodev-flow|tdd|karpathy-guidelines|git-master|review-work|web-design-engineer|browser-qa|e2e-testing'
+}
+```
+
 ## Consumer project setup
 
 Initialize a project so it can be driven by the shared autodev workflow:
 
 ```bash
-PYTHONPATH=. python3 scripts/autodev_project.py init --project-root /path/to/project --github-repo owner/repo
+PYTHONPATH=. python scripts/autodev_project.py init --project-root /path/to/project --github-repo owner/repo
 ```
 
 `init` bootstraps the consumer project contract **and** repository wiring:
@@ -51,7 +118,7 @@ PYTHONPATH=. python3 scripts/autodev_project.py init --project-root /path/to/pro
 Install user-global autodev host commands (the shipped default is the OpenCode adapter command set):
 
 ```bash
-PYTHONPATH=. python3 scripts/autodev_project.py install-commands
+PYTHONPATH=. python scripts/autodev_project.py install-commands
 ```
 
 From an initialized project, prefer the `autodev-flow` skill contracts (`C0..C6`) as the primary operator entrypoint.
@@ -61,7 +128,7 @@ These wrappers sit over the same DB-only control plane in `.opencode/runtime/con
 For continuous development backfill, run the high-level watch wrapper:
 
 ```bash
-PYTHONPATH=. python3 scripts/autodev_project.py reconcile-watch --project-root /path/to/project --interval-seconds 30
+PYTHONPATH=. python scripts/autodev_project.py reconcile-watch --project-root /path/to/project --interval-seconds 30
 ```
 
 `reconcile-watch` keeps `reconcile-workspace` as the one-shot scheduler and repeats it on an interval. Use `--iterations <n>` for bounded test runs and `--stop-on-error` to stop after the first failing cycle.
@@ -69,7 +136,7 @@ PYTHONPATH=. python3 scripts/autodev_project.py reconcile-watch --project-root /
 ## Run
 
 ```bash
-PYTHONPATH=. python3 scripts/orchestrator_bootstrap_runner.py --base-dir /path/to/project --issue-number 32 --source-session-id auto-dev
+PYTHONPATH=. python scripts/orchestrator_bootstrap_runner.py --base-dir /path/to/project --issue-number 32 --source-session-id auto-dev
 ```
 
 `--source-session-id` is an explicit caller tag (the bootstrap runner default is `orchestrator-bootstrap`).
@@ -91,5 +158,23 @@ The active branch contract is:
 GitHub intake defaults to `paulpai0412/autodev`. Point it at the consumer project so `ready-for-agent` issues are synced into that project's SQLite-backed intake flow:
 
 ```bash
-AUTODEV_GITHUB_REPO=<owner/repo> PYTHONPATH=. python3 scripts/issue_packet_intake.py --project-root /path/to/project
+AUTODEV_GITHUB_REPO=<owner/repo> PYTHONPATH=. python scripts/issue_packet_intake.py --project-root /path/to/project
 ```
+
+## Native Windows (PowerShell)
+
+The runtime command surface is Windows-compatible. Use PowerShell command forms like:
+
+```powershell
+$env:PYTHONPATH = "."
+python scripts/autodev_project.py init --project-root C:\path\to\project --github-repo owner/repo
+python scripts/autodev_project.py install-commands
+python scripts/autodev_project.py doctor --project-root C:\path\to\project
+python scripts/autodev_project.py reconcile-watch --project-root C:\path\to\project --interval-seconds 30
+python scripts/autodev_full_cycle.py
+```
+
+Notes:
+
+- `doctor` now includes a Windows preflight for `python`, `git`, `gh`, and OpenCode CLI discovery.
+- Legacy `autodev_full_cycle.sh` is deprecated; use `scripts/autodev_full_cycle.py` on Windows.

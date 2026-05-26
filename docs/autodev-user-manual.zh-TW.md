@@ -278,20 +278,54 @@ GitHub 仍是 operator 協調面，但不是 canonical truth。
 
 ### 4.1 基本需求
 
-建議在 Linux / macOS 的 shell 環境中使用，至少需要：
+支援 Linux / macOS / Windows（PowerShell）。至少需要：
 
-- `python3`
+- `python`（Python 3.10+，PATH 可用）
 - `git`
 - `gh`（GitHub CLI）
 - `opencode` 或 `opencode-desktop`
 - `pytest`
+
+建議先快速檢查：
+
+```bash
+python --version
+git --version
+gh --version
+opencode --version
+gh auth status
+python -m pytest --version
+```
+
+跨平台一鍵安裝建議：
+
+```powershell
+# Windows (PowerShell + winget)
+winget install Python.Python.3.11 Git.Git GitHub.cli
+python -m pip install -U pip pytest
+```
+
+```bash
+# macOS (Homebrew)
+brew install python git gh
+python -m pip install -U pip pytest
+```
+
+```bash
+# Ubuntu / Debian
+sudo apt-get update
+sudo apt-get install -y python3 python3-pip git gh
+python3 -m pip install --user -U pytest
+```
+
+> `opencode` CLI 的安裝方式依你的 host 發行管道而定；安裝後請確認 `opencode --version` 可執行。
 
 ### 4.2 最小驗證安裝
 
 在 repo 根目錄執行：
 
 ```bash
-python3 -m pip install pytest
+python -m pip install pytest
 ```
 
 如果你要實際對 GitHub issue 執行 workflow，還需要：
@@ -299,16 +333,41 @@ python3 -m pip install pytest
 - `gh auth status` 正常
 - `opencode` CLI 在 PATH 中可用
 
-### 4.3 初始化 consumer project
+### 4.3 必要 skills（OpenCode）
+
+若要完整跑 autodev 開發循環，請確認 OpenCode 可用以下 skills：
+
+- Operator 入口（建議優先）：`autodev-flow`
+- `issue_worker` 預設必備：`tdd`、`karpathy-guidelines`、`git-master`
+- `pr_verifier` 預設必備：`review-work`、`karpathy-guidelines`
+- Web/UI 類 issue 追加：
+  - `issue_worker`：`web-design-engineer`
+  - `pr_verifier`：`browser-qa`、`e2e-testing`
+
+skills 一般位於 `~/.config/opencode/skills`，請確認目標環境可載入這些 skills。
+
+可用以下命令快速檢查：
 
 ```bash
-PYTHONPATH=. python3 scripts/autodev_project.py init --project-root <project> --github-repo <owner/repo>
+ls ~/.config/opencode/skills | grep -E 'autodev-flow|tdd|karpathy-guidelines|git-master|review-work|web-design-engineer|browser-qa|e2e-testing'
+```
+
+```powershell
+Get-ChildItem "$HOME/.config/opencode/skills" | Where-Object {
+  $_.Name -match 'autodev-flow|tdd|karpathy-guidelines|git-master|review-work|web-design-engineer|browser-qa|e2e-testing'
+}
+```
+
+### 4.4 初始化 consumer project
+
+```bash
+PYTHONPATH=. python scripts/autodev_project.py init --project-root <project> --github-repo <owner/repo>
 ```
 
 例如：
 
 ```bash
-PYTHONPATH=. python3 scripts/autodev_project.py init --project-root /path/to/project --github-repo myorg/myrepo
+PYTHONPATH=. python scripts/autodev_project.py init --project-root /path/to/project --github-repo myorg/myrepo
 ```
 
 常用選項：
@@ -318,10 +377,10 @@ PYTHONPATH=. python3 scripts/autodev_project.py init --project-root /path/to/pro
 - `--force`：必要時更新既有 remote / managed 內容
 - `--json`：以 JSON 方式輸出結果
 
-### 4.4 安裝全域 autodev host 命令（目前預設 OpenCode adapter）
+### 4.5 安裝全域 autodev host 命令（目前預設 OpenCode adapter）
 
 ```bash
-PYTHONPATH=. python3 scripts/autodev_project.py install-commands
+PYTHONPATH=. python scripts/autodev_project.py install-commands
 ```
 
 常用選項：
@@ -331,10 +390,10 @@ PYTHONPATH=. python3 scripts/autodev_project.py install-commands
 - `--force`
 - `--json`
 
-### 4.5 專案健康檢查
+### 4.6 專案健康檢查
 
 ```bash
-PYTHONPATH=. python3 scripts/autodev_project.py doctor --project-root <project>
+PYTHONPATH=. python scripts/autodev_project.py doctor --project-root <project>
 ```
 
 doctor 會檢查至少以下項目：
@@ -342,6 +401,12 @@ doctor 會檢查至少以下項目：
 - `.autodev.yaml`
 - `.opencode/runtime/control-plane.sqlite3`
 - `AGENTS.md` managed markers
+
+在 Windows 環境，doctor 額外檢查 preflight：
+
+- Python 可執行檔解析結果是否可用
+- `git` / `gh` 是否在 PATH
+- OpenCode CLI（`opencode` / `opencode.exe`）是否可發現
 
 若 consumer project 已正確初始化，doctor 通常會輸出：
 
@@ -358,19 +423,19 @@ autodev project: no changes needed
 預設 tracker repo 是 `paulpai0412/autodev`。請把 intake 指到 consumer project，這樣 ready issue 會直接同步進該專案的 SQLite-backed intake flow。若要指定其他 repo：
 
 ```bash
-AUTODEV_GITHUB_REPO=<owner/repo> PYTHONPATH=. python3 scripts/issue_packet_intake.py --project-root <project>
+AUTODEV_GITHUB_REPO=<owner/repo> PYTHONPATH=. python scripts/issue_packet_intake.py --project-root <project>
 ```
 
 若要用 fixture JSON 做本地測試：
 
 ```bash
-PYTHONPATH=. python3 scripts/issue_packet_intake.py --issues-json /path/to/issues.json
+PYTHONPATH=. python scripts/issue_packet_intake.py --issues-json /path/to/issues.json
 ```
 
 ### 5.2 啟動指定 issue（高階 wrapper，建議用）
 
 ```bash
-PYTHONPATH=. python3 scripts/autodev_project.py start --project-root <project> --issue-number <n>
+PYTHONPATH=. python scripts/autodev_project.py start --project-root <project> --issue-number <n>
 ```
 
 這個 wrapper 會在目標 consumer project 內：
@@ -412,7 +477,7 @@ runtime:
 ### 5.3 持續 reconcile（高階 wrapper，建議用）
 
 ```bash
-PYTHONPATH=. python3 scripts/autodev_project.py reconcile --project-root <project>
+PYTHONPATH=. python scripts/autodev_project.py reconcile --project-root <project>
 ```
 
 這個 wrapper 會以 DB-backed issue state 執行 workspace reconcile，先處理所有 active / fenced issues，再視 available development capacity 啟動新的 ready issue；整個流程不依賴任何本地 ledger / request / session-result artifact。
@@ -426,7 +491,7 @@ PYTHONPATH=. python3 scripts/autodev_project.py reconcile --project-root <projec
 若你需要直接使用低階命令，對應的是：
 
 ```bash
-PYTHONPATH=. python3 scripts/orchestrator_supervisor.py reconcile-workspace --base-dir <project>
+PYTHONPATH=. python scripts/orchestrator_supervisor.py reconcile-workspace --base-dir <project>
 ```
 
 若已安裝全域命令，也可使用：
@@ -438,7 +503,7 @@ PYTHONPATH=. python3 scripts/orchestrator_supervisor.py reconcile-workspace --ba
 若要讓 workspace 持續自動補位，可使用 watch wrapper：
 
 ```bash
-PYTHONPATH=. python3 scripts/autodev_project.py reconcile-watch --project-root <project> --interval-seconds 30
+PYTHONPATH=. python scripts/autodev_project.py reconcile-watch --project-root <project> --interval-seconds 30
 ```
 
 `reconcile-watch` 不改變 supervisor 的核心排程邏輯；它只是定期重跑 DB-backed `reconcile-workspace`，讓 development 與 release 兩條 lane 一起補位。測試或短期執行時可加上 `--iterations <n>` 限制輪數，若希望任何一輪失敗就停止，可加上 `--stop-on-error`。
@@ -446,7 +511,7 @@ PYTHONPATH=. python3 scripts/autodev_project.py reconcile-watch --project-root <
 ### 5.4 查看目前 root session
 
 ```bash
-PYTHONPATH=. python3 scripts/autodev_project.py show-session --project-root <project>
+PYTHONPATH=. python scripts/autodev_project.py show-session --project-root <project>
 ```
 
 這會從 SQLite control plane 輸出目前 issue 的 session / resume 資訊。
@@ -470,7 +535,7 @@ opencode --session <rootSessionID>
 ### 5.5 專案 readiness 檢查
 
 ```bash
-PYTHONPATH=. python3 scripts/autodev_project.py doctor --project-root <project>
+PYTHONPATH=. python scripts/autodev_project.py doctor --project-root <project>
 ```
 
 若已安裝全域命令，也可使用：
@@ -486,7 +551,7 @@ PYTHONPATH=. python3 scripts/autodev_project.py doctor --project-root <project>
 ### 6.1 直接使用 bootstrap runner
 
 ```bash
-PYTHONPATH=. python3 scripts/orchestrator_bootstrap_runner.py --base-dir <project> --issue-number <n> --source-session-id auto-dev
+PYTHONPATH=. python scripts/orchestrator_bootstrap_runner.py --base-dir <project> --issue-number <n> --source-session-id auto-dev
 ```
 
 這是 lower-level 啟動方式。它會：
@@ -499,19 +564,19 @@ PYTHONPATH=. python3 scripts/orchestrator_bootstrap_runner.py --base-dir <projec
 ### 6.2 直接使用 supervisor reconcile
 
 ```bash
-PYTHONPATH=. python3 scripts/orchestrator_supervisor.py reconcile --base-dir <project> --issue-number <n>
+PYTHONPATH=. python scripts/orchestrator_supervisor.py reconcile --base-dir <project> --issue-number <n>
 ```
 
 這是單一 issue 的低階 reconcile。若要讓 supervisor 在整個 workspace 內先處理 active issues、再補滿 development capacity，請使用：
 
 ```bash
-PYTHONPATH=. python3 scripts/orchestrator_supervisor.py reconcile-workspace --base-dir <project>
+PYTHONPATH=. python scripts/orchestrator_supervisor.py reconcile-workspace --base-dir <project>
 ```
 
 ### 6.3 inspect：檢查 control-plane 狀態
 
 ```bash
-PYTHONPATH=. python3 scripts/orchestrator_supervisor.py inspect --base-dir <project> --issue-number <n>
+PYTHONPATH=. python scripts/orchestrator_supervisor.py inspect --base-dir <project> --issue-number <n>
 ```
 
 輸出內容包含：
@@ -532,25 +597,25 @@ PYTHONPATH=. python3 scripts/orchestrator_supervisor.py inspect --base-dir <proj
 ### 6.4 quarantine：人工隔離 issue
 
 ```bash
-PYTHONPATH=. python3 scripts/orchestrator_supervisor.py quarantine --base-dir <project> --issue-number <n> --reason <why>
+PYTHONPATH=. python scripts/orchestrator_supervisor.py quarantine --base-dir <project> --issue-number <n> --reason <why>
 ```
 
 ### 6.5 resume-quarantined：恢復隔離 issue
 
 ```bash
-PYTHONPATH=. python3 scripts/orchestrator_supervisor.py resume-quarantined --base-dir <project> --issue-number <n> --reason <why>
+PYTHONPATH=. python scripts/orchestrator_supervisor.py resume-quarantined --base-dir <project> --issue-number <n> --reason <why>
 ```
 
 ### 6.6 fail-quarantined：將隔離 issue 判定為失敗
 
 ```bash
-PYTHONPATH=. python3 scripts/orchestrator_supervisor.py fail-quarantined --base-dir <project> --issue-number <n> --reason <why>
+PYTHONPATH=. python scripts/orchestrator_supervisor.py fail-quarantined --base-dir <project> --issue-number <n> --reason <why>
 ```
 
 ### 6.7 retry-github-sync：重試 GitHub label 同步
 
 ```bash
-PYTHONPATH=. python3 scripts/orchestrator_supervisor.py retry-github-sync --base-dir <project> --issue-number <n> --command-id <id>
+PYTHONPATH=. python scripts/orchestrator_supervisor.py retry-github-sync --base-dir <project> --issue-number <n> --command-id <id>
 ```
 
 這個指令只會重播**已記錄且最新的失敗 GitHub sync attempt**，不是任意重放所有歷史操作。
@@ -558,7 +623,7 @@ PYTHONPATH=. python3 scripts/orchestrator_supervisor.py retry-github-sync --base
 ### 6.8 retry-failed：重試可重試的 failed issue
 
 ```bash
-PYTHONPATH=. python3 scripts/orchestrator_supervisor.py retry-failed --base-dir <project> --issue-number <n> --reason <why>
+PYTHONPATH=. python scripts/orchestrator_supervisor.py retry-failed --base-dir <project> --issue-number <n> --reason <why>
 ```
 
 這個指令會把符合條件的 failed issue 移回可再調度狀態，並把操作記錄進 SQLite audit trail。
@@ -670,31 +735,31 @@ append-only audit table，用來保存：
 ### 步驟 1：初始化 consumer project
 
 ```bash
-PYTHONPATH=. python3 scripts/autodev_project.py init --project-root <project> --github-repo <owner/repo>
+PYTHONPATH=. python scripts/autodev_project.py init --project-root <project> --github-repo <owner/repo>
 ```
 
 ### 步驟 2：檢查環境
 
 ```bash
-PYTHONPATH=. python3 scripts/autodev_project.py doctor --project-root <project>
+PYTHONPATH=. python scripts/autodev_project.py doctor --project-root <project>
 ```
 
 ### 步驟 3：同步 GitHub issues 進 SQLite intake
 
 ```bash
-AUTODEV_GITHUB_REPO=<owner/repo> PYTHONPATH=. python3 scripts/issue_packet_intake.py --project-root <project>
+AUTODEV_GITHUB_REPO=<owner/repo> PYTHONPATH=. python scripts/issue_packet_intake.py --project-root <project>
 ```
 
 ### 步驟 4：啟動指定 issue
 
 ```bash
-PYTHONPATH=. python3 scripts/autodev_project.py start --project-root <project> --issue-number <n>
+PYTHONPATH=. python scripts/autodev_project.py start --project-root <project> --issue-number <n>
 ```
 
 ### 步驟 5：持續 reconcile
 
 ```bash
-PYTHONPATH=. python3 scripts/autodev_project.py reconcile --project-root <project>
+PYTHONPATH=. python scripts/autodev_project.py reconcile --project-root <project>
 ```
 
 > 補充：此步驟即使在「目前 SQLite 尚無 active issue」也可執行；reconcile 會走 workspace path，先嘗試 intake 再判斷是否可啟動新 issue。
@@ -702,8 +767,8 @@ PYTHONPATH=. python3 scripts/autodev_project.py reconcile --project-root <projec
 ### 步驟 6：必要時查看 session / inspect / quarantine
 
 ```bash
-PYTHONPATH=. python3 scripts/autodev_project.py show-session --project-root <project>
-PYTHONPATH=. python3 scripts/orchestrator_supervisor.py inspect --base-dir <project> --issue-number <n>
+PYTHONPATH=. python scripts/autodev_project.py show-session --project-root <project>
+PYTHONPATH=. python scripts/orchestrator_supervisor.py inspect --base-dir <project> --issue-number <n>
 ```
 
 ---
@@ -713,13 +778,13 @@ PYTHONPATH=. python3 scripts/orchestrator_supervisor.py inspect --base-dir <proj
 ### 10.1 全量 regression
 
 ```bash
-python3 -m pytest tests/scripts -q
+python -m pytest tests/scripts -q
 ```
 
 ### 10.2 單一腳本 focused regression
 
 ```bash
-python3 -m pytest tests/scripts/test_<script_name>.py -q
+python -m pytest tests/scripts/test_<script_name>.py -q
 ```
 
 ### 10.3 建議優先檢查的面向
