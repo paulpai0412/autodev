@@ -520,7 +520,7 @@ def queue_orchestrator_recovery(
             summary=next_summary,
         )
     attempts = cast(dict[str, int], ledger["attempts"])
-    attempts["main_orchestrator"] += 1
+    attempts["main_orchestrator"] = int(attempts.get("main_orchestrator", 0)) + 1
     ledger.pop("queuedNextIssue", None)
     queue_transition_func(
         ledger,
@@ -1257,7 +1257,8 @@ def reconcile_release_worker(
             final_state="failed",
         )
     status = cast(str, persisted_release.get("status") or "")
-    if status == "success":
+    normalized_status = status.strip().lower()
+    if normalized_status in {"success", "completed"}:
         if read_issue(base_dir, issue["number"]):
             transition_issue_state_if_possible(
                 base_dir=base_dir,
@@ -1391,7 +1392,7 @@ def reconcile_release_worker(
             final_state="verified",
         )
     recovery_summary = (
-        f"Release worker for issue #{issue['number']} is blocked by {blocked_reason or status}. Route to main_orchestrator recovery so the broader workflow can continue without waiting for a human reply."
+        f"Release worker for issue #{issue['number']} is blocked by {blocked_reason or normalized_status or status}. Route to main_orchestrator recovery so the broader workflow can continue without waiting for a human reply."
     )
     return queue_orchestrator_recovery_func(
         ledger,

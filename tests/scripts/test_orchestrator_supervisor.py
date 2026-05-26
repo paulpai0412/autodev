@@ -3464,6 +3464,63 @@ def test_reconcile_release_success_selects_next_ready_issue(tmp_path: Path):
     assert read_issue(tmp_path, "31") is not None
 
 
+def test_reconcile_release_completed_selects_next_ready_issue(tmp_path: Path):
+    issue_packets_dir = tmp_path / "docs/agents/issue-packets"
+    issue_packets_dir.mkdir(parents=True, exist_ok=True)
+    issue_31 = issue_packets_dir / "issue-31.yaml"
+    issue_32 = issue_packets_dir / "issue-32.yaml"
+    issue_31.write_text(SAMPLE_ISSUE_PACKET.replace('"42"', '"31"').replace('issue-42', 'issue-31').replace('Demo issue', 'Issue 31').replace('agent/issue-42-demo', 'agent/issue-31-demo'), encoding="utf-8")
+    issue_32.write_text(
+        SAMPLE_ISSUE_PACKET.replace('"42"', '"32"')
+        .replace('issue-42', 'issue-32')
+        .replace('Demo issue', 'Issue 32')
+        .replace('agent/issue-42-demo', 'agent/issue-32-demo')
+        .replace('prior_handoff: "docs/agents/handoffs/issue-41.yaml"', 'prior_handoff: "docs/agents/handoffs/issue-31.yaml"'),
+        encoding="utf-8",
+    )
+    _ingest_issue_packet_text(tmp_path, "31", issue_31.read_text(encoding="utf-8"))
+    _ingest_issue_packet_text(tmp_path, "32", issue_32.read_text(encoding="utf-8"))
+
+    issue_packet = parse_issue_packet_text(issue_31.read_text(encoding="utf-8"), "docs/agents/issue-packets/issue-31.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, root_session_agent="build",
+    updated_at="2026-05-07T17:00:00+08:00",)
+    ledger["current"] = {"role": "main_orchestrator", "stage": "release_root_execution", "status": "queued"}
+    cast(dict[str, str], ledger["artifacts"])["release_result_ref"] = "docs/agents/release-results/issue-31-pr-88.yaml"
+
+    release_path = tmp_path / "docs/agents/release-results/issue-31-pr-88.yaml"
+    release_path.parent.mkdir(parents=True, exist_ok=True)
+    release_path.write_text(
+        'schema_version: "1.0"\nkind: release_result\nline_cap: 60\nraw_evidence_policy: index_only_refs_no_raw_logs_or_transcripts\nsubject:\n  issue_number: "31"\n  pr_number: "88"\n  branch: "agent/issue-31-demo"\nstatus: "completed"\nblocked_reason: "none"\nsummary:\n  outcome: "merged"\n  next_recommended_step: "continue"\nfailure_classification: {kind: "none", retryable: false, routed_to: "none", root_cause_signature: "none"}\nmerge:\n  attempted: false\n  merged: true\n  merged_sha: "abc"\nrole_boundary:\n  actor_role: "release_worker"\n  may_run_final_acceptance_qa: false\n  may_merge_only_after_verifier_pass: true\nmetadata:\n  worker: "r"\n  worker_session_id: "ses-r"\n  completed_at: "2026-05-07T17:20:00+08:00"\n',
+        encoding="utf-8",
+    )
+    _submit_artifact(
+        tmp_path,
+        issue_number="31",
+        artifact_kind="release_result",
+        payload={
+            "status": "completed",
+            "blocked_reason": "none",
+            "next_recommended_step": "continue",
+            "failure_kind": "none",
+            "retryable": False,
+        },
+        updated_at="2026-05-07T17:20:00+08:00",
+        body_text=release_path.read_text(encoding="utf-8"),
+    )
+
+    updated_ledger, decision, request = reconcile_ledger(ledger, artifact_base_dir=tmp_path,
+    updated_at="2026-05-07T17:21:00+08:00",)
+    issue = cast(dict[str, object], updated_ledger["issue"])
+    persisted_issue = read_issue(tmp_path, "31")
+
+    assert issue["number"] == "32"
+    assert decision["action"] == "queue_next_issue"
+    assert request is not None
+    assert request["issueNumber"] == "32"
+    assert persisted_issue is not None
+    assert persisted_issue["state"] == "completed"
+
+
 def test_reconcile_release_success_syncs_control_plane_runtime_phase_after_handoff(tmp_path: Path):
     issue_packets_dir = tmp_path / "docs/agents/issue-packets"
     issue_packets_dir.mkdir(parents=True, exist_ok=True)
