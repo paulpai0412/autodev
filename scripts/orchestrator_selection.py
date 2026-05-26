@@ -12,7 +12,7 @@ from scripts.control_plane_db import available_development_slots, completed_issu
 from scripts.issue_selection_projection import (
     dependency_issue_numbers_for_selection as projection_dependency_issue_numbers_for_selection,
     readiness_rank_score,
-    resolve_issue_base_branch_from_completed,
+    resolve_issue_base_branch_from_unblocked_dependencies,
 )
 
 
@@ -61,12 +61,18 @@ def resolve_issue_base_branch(
     default_base_branch: str,
     dependency_issue_numbers: Callable[[str, list[str]], list[str]],
 ) -> str:
-    completed = completed_issue_numbers(base_dir)
-    return resolve_issue_base_branch_from_completed(
+    unblocked = completed_issue_numbers(base_dir)
+    release_pending_issue_numbers = {
+        str(issue.get("issue_number") or "")
+        for issue in issues_in_states(base_dir, ["release_pending"])
+        if str(issue.get("issue_number") or "")
+    }
+    unblocked.update(release_pending_issue_numbers)
+    return resolve_issue_base_branch_from_unblocked_dependencies(
         issue_number=issue_number,
         dependencies=dependencies,
         default_base_branch=default_base_branch,
-        completed_issue_numbers=completed,
+        unblocked_issue_numbers=unblocked,
     )
 
 

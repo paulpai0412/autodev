@@ -15,15 +15,15 @@ def dependency_issue_numbers_for_selection(issue_number: str, dependencies: list
     return dependency_issue_numbers(issue_number, dependencies)
 
 
-def resolve_issue_base_branch_from_completed(
+def resolve_issue_base_branch_from_unblocked_dependencies(
     *,
     issue_number: str,
     dependencies: list[str],
     default_base_branch: str,
-    completed_issue_numbers: set[str],
+    unblocked_issue_numbers: set[str],
 ) -> str:
     dependency_numbers = dependency_issue_numbers_for_selection(issue_number, dependencies)
-    unresolved = [number for number in dependency_numbers if number not in completed_issue_numbers]
+    unresolved = [number for number in dependency_numbers if number not in unblocked_issue_numbers]
     if unresolved:
         return ""
     return default_base_branch or "main"

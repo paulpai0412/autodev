@@ -65,12 +65,12 @@ def test_select_blocks_child_issue_until_parent_completed(tmp_path: Path) -> Non
     upsert_issue_state(
         tmp_path,
         issue_number="11",
-        state="completed",
-        command_id="complete-11",
+        state="release_pending",
+        command_id="release-pending-11",
         updated_at="2026-05-16T10:05:00+08:00",
     )
 
-    selected_after_complete = select_issue_packets_for_capacity(
+    selected_after_unblocked = select_issue_packets_for_capacity(
         tmp_path,
         current_issue_number="",
         current_parent_reference="",
@@ -79,7 +79,7 @@ def test_select_blocks_child_issue_until_parent_completed(tmp_path: Path) -> Non
         development_capacity=1,
     )
 
-    assert [packet.issue_number for packet in selected_after_complete] == ["12"]
+    assert [packet.issue_number for packet in selected_after_unblocked] == ["12"]
 
 
 def test_select_issue_candidates_for_capacity_returns_compact_candidate_shape(tmp_path: Path) -> None:
@@ -194,8 +194,8 @@ def test_select_blocks_child_issue_with_publisher_blocked_by_issue_format(tmp_pa
     upsert_issue_state(
         tmp_path,
         issue_number="9",
-        state="completed",
-        command_id="complete-9",
+        state="release_pending",
+        command_id="release-pending-9",
         updated_at="2026-05-19T10:02:30+08:00",
     )
 
