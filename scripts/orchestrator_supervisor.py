@@ -1968,6 +1968,146 @@ def _quarantine_stale_dispatching_issue_without_root_session(
     return True
 
 
+def _recover_stale_claimed_issue_without_dispatch_evidence(
+    *,
+    base_dir: Path,
+    ledger: JsonObject,
+    runtime_issue: dict[str, object],
+    updated_at: str,
+) -> bool:
+    if str(runtime_issue.get("state") or "") != "claimed":
+        return False
+    if str(runtime_issue.get("current_session_id") or ""):
+        return False
+    issue = cast(dict[str, str], ledger["issue"])
+    issue_number = issue.get("number", "")
+    if not issue_number:
+        return False
+    if _has_role_stage_dispatch_evidence(
+        base_dir=base_dir,
+        issue_number=issue_number,
+        role="main_orchestrator",
+        stage="orchestrator_bootstrap",
+    ):
+        return False
+    claimed_at = str(runtime_issue.get("claimed_at") or runtime_issue.get("updated_at") or "")
+    current_time = _parse_iso8601(updated_at)
+    claimed_time = _parse_iso8601(claimed_at)
+    if current_time is None or claimed_time is None:
+        return False
+    if current_time - claimed_time <= timedelta(seconds=root_heartbeat_timeout_seconds()):
+        return False
+
+    release_issue_execution(
+        base_dir=base_dir,
+        issue_number=issue_number,
+        restore_ready_for_agent=True,
+        rollback_reason=(
+            f"Issue #{issue_number} stayed in claimed without dispatch evidence since {claimed_at}; "
+            "release stale claim fence back to ready so development capacity can continue."
+        ),
+        updated_at=updated_at,
+    )
+    return True
+
+
+def _recover_stale_quarantined_dispatching_issue_without_live_session(
+    *,
+    base_dir: Path,
+    ledger: JsonObject,
+    runtime_issue: dict[str, object],
+    updated_at: str,
+) -> bool:
+    if str(runtime_issue.get("state") or "") != "quarantined":
+        return False
+    if str(runtime_issue.get("current_session_id") or ""):
+        return False
+
+    issue = cast(dict[str, str], ledger["issue"])
+    issue_number = issue.get("number", "")
+    if not issue_number:
+        return False
+
+    latest_transition = read_latest_history_entry(
+        base_dir,
+        issue_number=issue_number,
+        entry_type="state_transition",
+    )
+    if latest_transition is None:
+        return False
+    if str(latest_transition.get("to_state") or "") != "quarantined":
+        return False
+    if str(latest_transition.get("from_state") or "") != "dispatching":
+        return False
+
+    if _has_role_stage_dispatch_evidence(
+        base_dir=base_dir,
+        issue_number=issue_number,
+        role="main_orchestrator",
+        stage="orchestrator_bootstrap",
+    ):
+        return False
+
+    latest_dispatch_result = read_latest_dispatch_result(base_dir, issue_number=issue_number)
+    if latest_dispatch_result is not None:
+        if str(latest_dispatch_result.get("status") or "") == "success" and str(
+            latest_dispatch_result.get("rootSessionID") or ""
+        ):
+            return False
+
+    command_id = f"auto-recover-quarantined-dispatching:{issue_number}:{updated_at}"
+    clear_issue_execution_claim_projection(
+        base_dir=base_dir,
+        issue_number=issue_number,
+        updated_at=updated_at,
+    )
+    _ = upsert_issue_state(
+        base_dir,
+        issue_number=issue_number,
+        state="ready",
+        command_id=command_id,
+        updated_at=updated_at,
+        current_session_id="",
+    )
+    clear_issue_runtime_phase_projection(
+        base_dir=base_dir,
+        issue_number=issue_number,
+        updated_at=updated_at,
+    )
+    record_admin_decision(
+        base_dir,
+        command_id=f"{command_id}:admin",
+        issue_number=issue_number,
+        decision_type="admin_auto_recover_quarantined_dispatching_orphan",
+        reason=(
+            f"Auto-recover issue #{issue_number} from quarantined to ready after confirming "
+            "stale dispatching quarantine has no live root session and no dispatch evidence."
+        ),
+        updated_at=updated_at,
+        from_state="quarantined",
+        to_state="ready",
+    )
+    sync_error = _sync_projected_issue_labels(
+        base_dir=base_dir,
+        issue_number=issue_number,
+        command_id=f"{command_id}:labels",
+        updated_at=updated_at,
+    )
+    if sync_error:
+        record_admin_decision(
+            base_dir,
+            command_id=f"{command_id}:labels:admin-failed",
+            issue_number=issue_number,
+            decision_type="admin_github_projection_failure",
+            reason=(
+                f"GitHub projected label sync failed after quarantined dispatching auto-recovery for issue #{issue_number}: "
+                f"{sync_error}"
+            ),
+            updated_at=updated_at,
+        )
+    return True
+
+
 def _quarantine_stale_queued_subagent_with_stale_root(
     *,
     base_dir: Path,
@@ -4834,6 +4974,14 @@ def reconcile_ledger(
         ):
             runtime_issue = read_issue(base_dir, issue["number"])
 
+        if runtime_issue and _recover_stale_claimed_issue_without_dispatch_evidence(
+            base_dir=base_dir,
+            ledger=ledger,
+            runtime_issue=cast(dict[str, object], runtime_issue),
+            updated_at=timestamp,
+        ):
+            runtime_issue = read_issue(base_dir, issue["number"])
+
         if (
             runtime_issue
             and current["role"] == "issue_worker"
@@ -4868,6 +5016,20 @@ def reconcile_ledger(
             ledger=ledger,
             runtime_issue=cast(dict[str, object], runtime_issue),
             updated_at=timestamp,
+        ):
+            runtime_issue = read_issue(base_dir, issue["number"])
+
+        if (
+            runtime_issue
+            and runtime_issue.get("state") == "quarantined"
+            and pre_sync_runtime_issue is not None
+            and str(pre_sync_runtime_issue.get("state") or "") == "quarantined"
+            and _recover_stale_quarantined_dispatching_issue_without_live_session(
+                base_dir=base_dir,
+                ledger=ledger,
+                runtime_issue=cast(dict[str, object], runtime_issue),
+                updated_at=timestamp,
+            )
         ):
             runtime_issue = read_issue(base_dir, issue["number"])
 

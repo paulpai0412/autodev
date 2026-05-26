@@ -8310,6 +8310,193 @@ def test_reconcile_quarantines_stale_dispatching_issue_worker_without_root_sessi
     assert issue["state"] == "quarantined"
 
 
+def test_reconcile_auto_recovers_quarantined_dispatching_orphan_to_ready(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "issue_worker", "stage": "issue_worker_execution", "status": "queued"}
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="dispatching",
+        command_id="cmd-dispatching",
+        updated_at="2026-05-07T17:00:00+08:00",
+    )
+
+    with patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+        _ = reconcile_ledger(
+            ledger,
+            artifact_base_dir=tmp_path,
+            updated_at="2026-05-07T17:16:00+08:00",
+        )
+
+    issue_after_first = read_issue(tmp_path, "42")
+    assert issue_after_first is not None
+    assert issue_after_first["state"] == "quarantined"
+
+    with patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+        updated_ledger, decision, request = reconcile_ledger(
+            ledger,
+            artifact_base_dir=tmp_path,
+            updated_at="2026-05-07T17:17:00+08:00",
+        )
+
+    issue_after_second = read_issue(tmp_path, "42")
+    assert updated_ledger is ledger
+    assert decision["action"] == "no_change"
+    assert request is None
+    assert issue_after_second is not None
+    assert issue_after_second["state"] == "ready"
+    assert issue_after_second["current_session_id"] == ""
+
+
+def test_reconcile_does_not_auto_recover_quarantined_dispatching_when_dispatch_result_has_live_root(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "issue_worker", "stage": "issue_worker_execution", "status": "queued"}
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="dispatching",
+        command_id="cmd-dispatching",
+        updated_at="2026-05-07T17:00:00+08:00",
+    )
+
+    with patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+        _ = reconcile_ledger(
+            ledger,
+            artifact_base_dir=tmp_path,
+            updated_at="2026-05-07T17:16:00+08:00",
+        )
+
+    orchestrator_supervisor._record_dispatch_result_history(
+        base_dir=tmp_path,
+        session_result={
+            "status": "success",
+            "rootSessionID": "ses-root-42",
+            "recordedAt": "2026-05-07T17:16:30+08:00",
+            "issueNumber": "42",
+            "branch": "agent/issue-42-demo",
+            "sourceSessionID": "workspace_reconcile",
+            "role": "main_orchestrator",
+            "stage": "orchestrator_bootstrap",
+            "reason": "bootstrap dispatch result",
+            "title": "Continue issue #42 on agent/issue-42-demo",
+        },
+    )
+
+    with patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+        updated_ledger, decision, request = reconcile_ledger(
+            ledger,
+            artifact_base_dir=tmp_path,
+            updated_at="2026-05-07T17:17:00+08:00",
+        )
+
+    issue_after_second = read_issue(tmp_path, "42")
+    assert updated_ledger is ledger
+    assert decision["action"] == "hold_quarantined_issue"
+    assert request is None
+    assert issue_after_second is not None
+    assert issue_after_second["state"] == "quarantined"
+
+
+def test_reconcile_recovers_stale_claimed_issue_without_dispatch_evidence_to_ready(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "issue_worker", "stage": "issue_worker_execution", "status": "queued"}
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="claimed",
+        command_id="cmd-claimed",
+        updated_at="2026-05-07T17:00:00+08:00",
+    )
+
+    with patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+        updated_ledger, decision, request = reconcile_ledger(
+            ledger,
+            artifact_base_dir=tmp_path,
+            updated_at="2026-05-07T17:16:00+08:00",
+        )
+
+    issue = read_issue(tmp_path, "42")
+
+    assert updated_ledger is ledger
+    assert decision["action"] == "no_change"
+    assert request is None
+    assert issue is not None
+    assert issue["state"] == "ready"
+    assert issue["current_session_id"] == ""
+
+
+def test_reconcile_does_not_recover_recent_claimed_issue_without_dispatch_evidence(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "issue_worker", "stage": "issue_worker_execution", "status": "queued"}
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="claimed",
+        command_id="cmd-claimed",
+        updated_at="2026-05-07T17:12:00+08:00",
+    )
+
+    updated_ledger, decision, request = reconcile_ledger(
+        ledger,
+        artifact_base_dir=tmp_path,
+        updated_at="2026-05-07T17:16:00+08:00",
+    )
+
+    issue = read_issue(tmp_path, "42")
+
+    assert updated_ledger is ledger
+    assert decision["action"] == "no_change"
+    assert request is None
+    assert issue is not None
+    assert issue["state"] == "claimed"
+
+
+def test_reconcile_workspace_releases_stale_claimed_capacity_before_starting_ready_issue(tmp_path: Path):
+    claimed_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ready_packet = parse_issue_packet_text(
+        SAMPLE_ISSUE_PACKET.replace("number: 42", "number: 43").replace("branch: agent/issue-42-demo", "branch: agent/issue-43-demo"),
+        "docs/agents/issue-packets/issue-43.yaml",
+    )
+    orchestrator_supervisor._sync_issue_packet_to_db(tmp_path, claimed_packet, updated_at="2026-05-07T17:00:00+08:00")
+    orchestrator_supervisor._sync_issue_packet_to_db(tmp_path, ready_packet, updated_at="2026-05-07T17:00:00+08:00")
+
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="claimed",
+        command_id="cmd-claimed",
+        updated_at="2026-05-07T17:00:00+08:00",
+    )
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="43",
+        state="ready",
+        command_id="cmd-ready",
+        updated_at="2026-05-07T17:00:00+08:00",
+    )
+
+    with patch("scripts.orchestrator_supervisor._default_host_adapter", return_value=successful_host_adapter(session_id="ses-root-43")), patch(
+        "scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""
+    ):
+        payload = orchestrator_supervisor.reconcile_workspace_from_db(
+            base_dir=tmp_path,
+            updated_at="2026-05-07T17:16:00+08:00",
+        )
+
+    claimed_issue = read_issue(tmp_path, "42")
+    started_issue = read_issue(tmp_path, "43")
+
+    assert claimed_issue is not None
+    assert claimed_issue["state"] != "claimed"
+    assert started_issue is not None
+    started = cast(list[dict[str, object]], payload["started_issues"])
+    assert started
+
+
 def test_reconcile_quarantines_stale_queued_pr_verifier_with_stale_root_heartbeat(tmp_path: Path):
     issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
