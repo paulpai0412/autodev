@@ -184,6 +184,7 @@ def test_init_creates_project_contract_dirs_and_agents_managed_block(tmp_path: P
     assert 'github_project_id: ""' in config
     assert '  pr_workflow: ""' in config
     assert "control_plane_db: .opencode/runtime/control-plane.sqlite3" in config
+    assert "opencode_initial_session_id_timeout_seconds: 60" in config
     assert "state_projection:" in config
     assert "sqlite_to_primary_label:" in config
     assert "release_pending: agent-in-progress" in config
