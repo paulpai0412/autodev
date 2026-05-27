@@ -7543,6 +7543,55 @@ def test_reconcile_allows_early_return_without_extra_cleanup_work(tmp_path: Path
     assert True
 
 
+def test_reconcile_issue_worker_terminal_without_worker_result_requeues_contract_repair(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "issue_worker", "stage": "issue_worker_execution", "status": "queued"}
+    attempts = cast(dict[str, int], ledger["attempts"])
+    starting_attempts = attempts["issue_worker"]
+    orchestrator_supervisor.upsert_issue_state(tmp_path,
+    issue_number="42",
+    state="running",
+    command_id="cmd-running",
+    updated_at="2026-05-07T17:10:00+08:00", current_session_id="ses-root-42", )
+    orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:10:00+08:00",
+        runtime_context={
+            "issue_worker_child_session": {
+                "childRole": "issue_worker",
+                "childSessionID": "ses-issue-worker-42",
+                "childSessionStatus": "running",
+                "rootSessionID": "ses-root-42",
+                "recordedAt": "2026-05-07T17:10:00+08:00",
+            }
+        },
+    )
+
+    class TerminalOutcomeHostAdapter(FakeHostAdapter):
+        def read_session_outcome(self, runtime_session_id: str):
+            del runtime_session_id
+            return SessionOutcome(status="completed", session_id="ses-issue-worker-42")
+
+    with patch("scripts.orchestrator_supervisor._default_host_adapter", return_value=TerminalOutcomeHostAdapter(successful_host_adapter(session_id="ses-ignored").start_result)), patch(
+        "scripts.orchestrator_supervisor._read_db_artifact_fact", return_value={}
+    ):
+        updated_ledger, decision, request = reconcile_ledger(
+            ledger,
+            artifact_base_dir=tmp_path,
+            updated_at="2026-05-07T17:11:00+08:00",
+        )
+
+    assert updated_ledger is not None
+    assert decision["action"] == "delegate_subagent"
+    assert decision["next_role"] == "issue_worker"
+    assert decision["next_stage"] == "issue_worker_repair"
+    assert request is None
+    assert attempts["issue_worker"] == starting_attempts + 1
+    assert "ended without recording a worker_result in SQLite" in cast(str, decision["summary"])
+
+
 def test_reconcile_holds_quarantined_issue_without_auto_retry(tmp_path: Path):
     issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
@@ -7561,6 +7610,50 @@ def test_reconcile_holds_quarantined_issue_without_auto_retry(tmp_path: Path):
     assert updated_ledger is ledger
     assert decision["action"] == "hold_quarantined_issue"
     assert request is None
+
+
+def test_reconcile_does_not_quarantine_stale_root_when_issue_worker_child_is_running(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "issue_worker", "stage": "issue_worker_execution", "status": "queued"}
+    orchestrator_supervisor.upsert_issue_state(tmp_path,
+    issue_number="42",
+    state="running",
+    command_id="cmd-running",
+    updated_at="2026-05-07T17:00:00+08:00", current_session_id="ses-root-42", )
+    orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:10:00+08:00",
+        runtime_context={
+            "issue_worker_child_session": {
+                "childRole": "issue_worker",
+                "childSessionID": "ses-issue-worker-42",
+                "childSessionStatus": "running",
+                "rootSessionID": "ses-root-42",
+                "recordedAt": "2026-05-07T17:10:00+08:00",
+            }
+        },
+    )
+    connection = sqlite3.connect(tmp_path / ".opencode/runtime/control-plane.sqlite3")
+    try:
+        _ = connection.execute(
+            "UPDATE issues SET last_event_at = ? WHERE issue_number = ?",
+            ("2026-05-07T17:00:00+08:00", "42"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    updated_ledger, decision, request = reconcile_ledger(ledger, artifact_base_dir=tmp_path,
+    updated_at="2026-05-07T17:16:00+08:00",)
+
+    issue = read_issue(tmp_path, "42")
+    assert updated_ledger is ledger
+    assert decision["action"] != "hold_quarantined_issue"
+    assert request is None
+    assert issue is not None
+    assert issue["state"] == "running"
 
 
 def test_reconcile_quarantines_running_issue_when_root_event_goes_stale(tmp_path: Path):
@@ -7626,6 +7719,32 @@ def test_resume_quarantined_issue_execution_restores_running(tmp_path: Path):
         state="quarantined",
         command_id="cmd-quarantined",
         updated_at="2026-05-07T17:00:00+08:00",
+        current_session_id="ses-root-42",
+    )
+    orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_role="issue_worker",
+        current_stage="issue_worker_execution",
+        current_status="running",
+        runtime_context={
+            "verifier_session_id": "ses-verifier-stale",
+            "release_child_session": {
+                "childRole": "release_worker",
+                "childSessionID": "ses-release-stale",
+                "childSessionStatus": "running",
+                "rootSessionID": "ses-root-42",
+                "recordedAt": "2026-05-07T17:00:00+08:00",
+            },
+            "issue_worker_child_session": {
+                "childRole": "issue_worker",
+                "childSessionID": "ses-worker-stale",
+                "childSessionStatus": "running",
+                "rootSessionID": "ses-root-42",
+                "recordedAt": "2026-05-07T17:00:00+08:00",
+            },
+        },
     )
 
     with patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value="") as sync_labels:
@@ -7637,14 +7756,43 @@ def test_resume_quarantined_issue_execution_restores_running(tmp_path: Path):
         )
 
     issue = read_issue(tmp_path, "42")
+    runtime_context = orchestrator_supervisor.read_runtime_context(tmp_path, "42")
 
     assert issue is not None
     assert issue["state"] == "running"
+    assert issue["current_role"] == "issue_worker"
+    assert issue["current_stage"] == "issue_worker_execution"
+    assert issue["current_status"] == "running"
+    assert "verifier_session_id" not in runtime_context
+    assert "release_child_session" not in runtime_context
+    assert "issue_worker_child_session" not in runtime_context
     sync_labels.assert_called_once()
     sync_kwargs = sync_labels.call_args.kwargs
     assert sync_kwargs["add_labels"] == ["agent-in-progress", "pr-not-opened"]
     assert "ready-for-agent" in sync_kwargs["remove_labels"]
     assert "agent-dispatching" in sync_kwargs["remove_labels"]
+
+
+def test_resume_quarantined_issue_execution_rejects_missing_root_session_fence(tmp_path: Path):
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="quarantined",
+        command_id="cmd-quarantined",
+        updated_at="2026-05-07T17:00:00+08:00",
+    )
+
+    try:
+        orchestrator_supervisor.resume_quarantined_issue_execution(
+            base_dir=tmp_path,
+            issue_number="42",
+            reason="operator approved fenced resume",
+            updated_at="2026-05-07T17:01:00+08:00",
+        )
+    except ValueError as error:
+        assert "use redispatch-quarantined instead" in str(error)
+    else:
+        raise AssertionError("expected fenced resume without root session fence to fail")
 
 
 def test_redispatch_quarantined_command_creates_fresh_root_session(tmp_path: Path, capsys) -> None:
@@ -7660,6 +7808,31 @@ def test_redispatch_quarantined_command_creates_fresh_root_session(tmp_path: Pat
     state="quarantined",
     command_id="cmd-quarantined",
     updated_at="2026-05-07T17:00:00+08:00", current_session_id="ses-old-root", )
+    orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_role="pr_verifier",
+        current_stage="pr_review",
+        current_status="pending_approval",
+        runtime_context={
+            "verifier_session_id": "ses-verifier-stale",
+            "release_child_session": {
+                "childRole": "release_worker",
+                "childSessionID": "ses-release-stale",
+                "childSessionStatus": "running",
+                "rootSessionID": "ses-old-root",
+                "recordedAt": "2026-05-07T17:00:00+08:00",
+            },
+            "issue_worker_child_session": {
+                "childRole": "issue_worker",
+                "childSessionID": "ses-worker-stale",
+                "childSessionStatus": "running",
+                "rootSessionID": "ses-old-root",
+                "recordedAt": "2026-05-07T17:00:00+08:00",
+            },
+        },
+    )
     with patch(
         "scripts.orchestrator_supervisor._default_host_adapter",
         return_value=successful_host_adapter(session_id="ses_root_retry", resume_command="opencode --session ses_root_retry"),
@@ -7683,6 +7856,7 @@ def test_redispatch_quarantined_command_creates_fresh_root_session(tmp_path: Pat
     session_result = cast(dict[str, object], json.loads(capsys.readouterr().out))
     issue = read_issue(tmp_path, "42")
     artifact_refs = json.loads(str(issue["artifact_refs_json"])) if issue is not None else {}
+    runtime_context = orchestrator_supervisor.read_runtime_context(tmp_path, "42") if issue is not None else {}
 
     assert exit_code == 0
     assert session_result["status"] == "success"
@@ -7690,8 +7864,14 @@ def test_redispatch_quarantined_command_creates_fresh_root_session(tmp_path: Pat
     assert issue is not None
     assert issue["state"] == "running"
     assert issue["current_session_id"] == "ses_root_retry"
+    assert issue["current_role"] == ""
+    assert issue["current_stage"] == ""
+    assert issue["current_status"] == ""
     assert artifact_refs["rootSessionID"] == "ses_root_retry"
     assert artifact_refs["status"] == "root_session_started"
+    assert "verifier_session_id" not in runtime_context
+    assert "release_child_session" not in runtime_context
+    assert "issue_worker_child_session" not in runtime_context
     assert sync_labels.call_count >= 2
     dispatch_sync_kwargs = sync_labels.call_args_list[0].kwargs
     assert dispatch_sync_kwargs["add_labels"] == ["agent-dispatching", "pr-not-opened"]
@@ -7875,6 +8055,31 @@ def test_redispatch_quarantined_command_restores_quarantine_when_dispatch_fails(
     state="quarantined",
     command_id="cmd-quarantined",
     updated_at="2026-05-07T17:00:00+08:00", current_session_id="ses-old-root", )
+    orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_role="pr_verifier",
+        current_stage="pr_review",
+        current_status="pending_approval",
+        runtime_context={
+            "verifier_session_id": "ses-verifier-stale",
+            "release_child_session": {
+                "childRole": "release_worker",
+                "childSessionID": "ses-release-stale",
+                "childSessionStatus": "running",
+                "rootSessionID": "ses-old-root",
+                "recordedAt": "2026-05-07T17:00:00+08:00",
+            },
+            "issue_worker_child_session": {
+                "childRole": "issue_worker",
+                "childSessionID": "ses-worker-stale",
+                "childSessionStatus": "running",
+                "rootSessionID": "ses-old-root",
+                "recordedAt": "2026-05-07T17:00:00+08:00",
+            },
+        },
+    )
 
     with patch(
         "scripts.orchestrator_supervisor._default_host_adapter",
@@ -7901,12 +8106,19 @@ def test_redispatch_quarantined_command_restores_quarantine_when_dispatch_fails(
 
     session_result = cast(dict[str, object], json.loads(capsys.readouterr().out))
     issue = read_issue(tmp_path, "42")
+    runtime_context = orchestrator_supervisor.read_runtime_context(tmp_path, "42") if issue is not None else {}
 
     assert exit_code == 0
     assert session_result["status"] == "error"
     assert issue is not None
     assert issue["state"] == "quarantined"
     assert issue["current_session_id"] == ""
+    assert issue["current_role"] == ""
+    assert issue["current_stage"] == ""
+    assert issue["current_status"] == ""
+    assert "verifier_session_id" not in runtime_context
+    assert "release_child_session" not in runtime_context
+    assert "issue_worker_child_session" not in runtime_context
 
 
 def test_dispatch_failure_quarantine_rollback_removes_ready_label(tmp_path: Path) -> None:

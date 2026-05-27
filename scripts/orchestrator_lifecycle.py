@@ -301,6 +301,19 @@ def clear_issue_session_ids(*, base_dir: Path, issue_number: str, updated_at: st
     )
 
 
+def clear_issue_child_session_projection(*, base_dir: Path, issue_number: str, updated_at: str) -> None:
+    _ = sync_issue_runtime_context(
+        base_dir,
+        issue_number=issue_number,
+        updated_at=updated_at,
+        runtime_context={
+            "verifier_session_id": None,
+            "release_child_session": None,
+            "issue_worker_child_session": None,
+        },
+    )
+
+
 def clear_issue_runtime_phase_projection(*, base_dir: Path, issue_number: str, updated_at: str) -> None:
     apply_issue_runtime_phase_projection_policy(
         base_dir=base_dir,
@@ -327,6 +340,11 @@ def apply_issue_runtime_phase_projection_policy(
         current_role="",
         current_stage="",
         current_status="",
+        runtime_context={
+            "verifier_session_id": None,
+            "release_child_session": None,
+            "issue_worker_child_session": None,
+        },
     )
 
 
@@ -1631,6 +1649,12 @@ def resume_quarantined_issue_execution(
 ) -> None:
     timestamp = now(updated_at)
     ensure_control_plane_db(base_dir)
+    issue = read_issue(base_dir, issue_number) or {}
+    if not str(issue.get("current_session_id") or ""):
+        raise ValueError(
+            f"cannot resume quarantined issue #{issue_number} without an active root session fence; use redispatch-quarantined instead"
+        )
+    clear_issue_child_session_projection(base_dir=base_dir, issue_number=issue_number, updated_at=timestamp)
     transition_state(
         base_dir=base_dir,
         issue_number=issue_number,
@@ -1663,6 +1687,7 @@ def redispatch_quarantined_issue_execution(
     timestamp = now(updated_at)
     ensure_control_plane_db(base_dir)
     command_id = uuid4().hex
+    clear_issue_runtime_phase_projection(base_dir=base_dir, issue_number=issue_number, updated_at=timestamp)
     transition_state(
         base_dir=base_dir,
         issue_number=issue_number,
