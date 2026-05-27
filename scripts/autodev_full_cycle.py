@@ -614,45 +614,49 @@ class FullCycleRunner:
             remaining -= step
 
     def run(self) -> int:
-        self.require_tools()
-        self.state_dir.mkdir(parents=True, exist_ok=True)
-        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.require_tools()
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
 
-        self.log("Start autodev full cycle")
-        self.log(f"FULL_CYCLE_LOG_PATH={self.log_path}")
-        self.log(f"PROJECT_ROOT={self.project_root}")
-        self.log(f"AUTODEV_HOME={self.autodev_home}")
-        self.log(f"REPO={self.repo}")
-        self.print_autodev_yaml_settings()
-        self.print_startup_github_issue_list()
+            self.log("Start autodev full cycle")
+            self.log(f"FULL_CYCLE_LOG_PATH={self.log_path}")
+            self.log(f"PROJECT_ROOT={self.project_root}")
+            self.log(f"AUTODEV_HOME={self.autodev_home}")
+            self.log(f"REPO={self.repo}")
+            self.print_autodev_yaml_settings()
+            self.print_startup_github_issue_list()
 
-        self.autodev_bootstrap_once()
+            self.autodev_bootstrap_once()
 
-        cycle = 0
-        while True:
-            cycle += 1
-            self.log(f"===== CYCLE {cycle} =====")
+            cycle = 0
+            while True:
+                cycle += 1
+                self.log(f"===== CYCLE {cycle} =====")
 
-            self.autodev_intake()
-            self.autodev_start_one()
-            self.autodev_recovery()
-            self.autodev_reconcile()
-            self.autodev_release_verified()
+                self.autodev_intake()
+                self.autodev_start_one()
+                self.autodev_recovery()
+                self.autodev_reconcile()
+                self.autodev_release_verified()
 
-            self.print_db_snapshot()
-            self.print_github_snapshot()
+                self.print_db_snapshot()
+                self.print_github_snapshot()
 
-            open_count = self.open_issue_count()
-            self.log(f"Open issue count: {open_count}")
-            if open_count == 0:
-                self.log("All GitHub issues are closed. Done.")
-                break
-            if self.max_cycles and cycle >= self.max_cycles:
-                self.log(f"Reached MAX_CYCLES={self.max_cycles}. Stop loop.")
-                break
-            self.log(f"Sleep {self.interval_seconds}s before next cycle")
-            self.sleep_with_heartbeat(self.interval_seconds, open_count)
-        return 0
+                open_count = self.open_issue_count()
+                self.log(f"Open issue count: {open_count}")
+                if open_count == 0:
+                    self.log("All GitHub issues are closed. Done.")
+                    break
+                if self.max_cycles and cycle >= self.max_cycles:
+                    self.log(f"Reached MAX_CYCLES={self.max_cycles}. Stop loop.")
+                    break
+                self.log(f"Sleep {self.interval_seconds}s before next cycle")
+                self.sleep_with_heartbeat(self.interval_seconds, open_count)
+            return 0
+        except KeyboardInterrupt:
+            self.log("KeyboardInterrupt received (Ctrl+C); stopping full-cycle loop gracefully.")
+            return 130
 
 
 def main() -> int:
