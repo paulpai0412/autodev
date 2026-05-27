@@ -45,10 +45,10 @@ def _create_opencode_db(path: Path) -> None:
         connection.close()
 
 
-def _session_context(tmp_path: Path, *, agent: str = "build") -> SessionStartContext:
+def _session_context(tmp_path: Path, *, agent: str = "build", prompt: str = "Do work.") -> SessionStartContext:
     return SessionStartContext(
         title="Issue 42 root",
-        prompt="Do work.",
+        prompt=prompt,
         agent=agent,
         workdir=tmp_path,
         source_session_id="ses-source",
@@ -148,6 +148,25 @@ def test_read_initial_session_id_supports_non_fileno_streams() -> None:
     assert session_id == "ses-root"
     assert '"sessionID":"ses-root"' in stdout_text
     assert stderr_text == "stderr text\n"
+
+
+def test_read_initial_session_id_reads_session_id_from_detached_log_when_pipes_missing(tmp_path: Path) -> None:
+    log_path = tmp_path / "detached.log"
+    log_path.write_text('{"type":"status"}\n{"sessionID":"ses-from-log"}\n', encoding="utf-8")
+
+    process = _FakeProcess(stdout=None, stderr=None, poll_result=0)
+    setattr(process, "_autodev_log_path", str(log_path))
+
+    session_id, stdout_text, stderr_text = adapter.read_initial_session_id(
+        cast(Any, process),
+        timeout_seconds=1.0,
+        extract_session_id=adapter.extract_session_id_from_run_output,
+        supports_fileno=lambda _stream: True,
+    )
+
+    assert session_id == "ses-from-log"
+    assert '"sessionID":"ses-from-log"' in stdout_text
+    assert stderr_text == ""
 
 
 def test_read_session_summary_extracts_finish_and_tool_sequence(tmp_path: Path) -> None:
@@ -258,6 +277,26 @@ def test_open_code_host_adapter_sets_retry_flag_for_prefill_error(monkeypatch: p
     assert result.should_retry_without_source_session is True
 
 
+def test_open_code_host_adapter_does_not_call_db_fallback_when_session_id_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    process = _FakeProcess(stdout=io.StringIO(), stderr=io.StringIO("no session id"), poll_result=None)
+    monkeypatch.setattr(adapter, "spawn_detached_opencode_run", lambda command, workdir: process)
+    monkeypatch.setattr(adapter, "read_initial_session_id", lambda *args, **kwargs: (None, "", "no session id"))
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("wait_for_session_id_in_db should not be called")
+
+    monkeypatch.setattr(adapter, "wait_for_session_id_in_db", _fail_if_called)
+
+    host = adapter.OpenCodeHostAdapter(cli_resolver=lambda: "/fake/opencode")
+    result = host.start_root_session(_session_context(tmp_path, agent="build"))
+
+    assert result.status == "error"
+    assert "no session id" in result.error
+
+
 def test_open_code_host_adapter_start_root_session_success_omits_build_agent(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     captured: dict[str, object] = {}
     process = _FakeProcess(stdout=io.StringIO(), stderr=io.StringIO(), poll_result=0)
@@ -279,6 +318,91 @@ def test_open_code_host_adapter_start_root_session_success_omits_build_agent(mon
     assert result.resume_command == "opencode --session ses-root"
     assert captured["workdir"] == tmp_path
     assert captured["command"] == ["/fake/opencode", "run", "--format", "json", "--title", "Issue 42 root", "Do work."]
+
+
+def test_open_code_host_adapter_start_root_session_splits_multiline_prompt_for_cli_compatibility(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, object] = {}
+    process = _FakeProcess(stdout=io.StringIO(), stderr=io.StringIO(), poll_result=0)
+
+    def fake_spawn(command: list[str], *, workdir: Path):
+        captured["command"] = command
+        captured["workdir"] = workdir
+        return process
+
+    monkeypatch.setattr(adapter, "spawn_detached_opencode_run", fake_spawn)
+    monkeypatch.setattr(adapter, "read_initial_session_id", lambda *args, **kwargs: ("ses-root", "stdout", "stderr"))
+    monkeypatch.setattr(adapter, "probe_same_repo_session_readability", lambda *args, **kwargs: (True, "Session: ses-root"))
+
+    host = adapter.OpenCodeHostAdapter(cli_resolver=lambda: "/fake/opencode")
+    result = host.start_root_session(_session_context(tmp_path, prompt="L1-first\nL2-second\nL3-third"))
+
+    assert result.status == "success"
+    assert captured["workdir"] == tmp_path
+    assert captured["command"] == [
+        "/fake/opencode",
+        "run",
+        "--format",
+        "json",
+        "--title",
+        "Issue 42 root",
+        "L1-first",
+        "L2-second",
+        "L3-third",
+    ]
+
+
+def test_open_code_host_adapter_uses_configured_initial_session_timeout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    process = _FakeProcess(stdout=io.StringIO(), stderr=io.StringIO(), poll_result=0)
+    captured_timeout: dict[str, float] = {}
+
+    monkeypatch.setenv("AUTODEV_OPENCODE_INITIAL_SESSION_ID_TIMEOUT_SECONDS", "75")
+    monkeypatch.setattr(adapter, "spawn_detached_opencode_run", lambda command, workdir: process)
+
+    def _fake_read_initial_session_id(*args, **kwargs):
+        captured_timeout["value"] = float(kwargs.get("timeout_seconds", 0.0))
+        return ("ses-root", "stdout", "stderr")
+
+    monkeypatch.setattr(adapter, "read_initial_session_id", _fake_read_initial_session_id)
+    monkeypatch.setattr(adapter, "probe_same_repo_session_readability", lambda *args, **kwargs: (True, "Session: ses-root"))
+
+    host = adapter.OpenCodeHostAdapter(cli_resolver=lambda: "/fake/opencode")
+    result = host.start_root_session(_session_context(tmp_path, agent="build"))
+
+    assert result.status == "success"
+    assert captured_timeout["value"] == 75.0
+
+
+def test_open_code_host_adapter_uses_timeout_from_autodev_yaml_when_env_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    process = _FakeProcess(stdout=io.StringIO(), stderr=io.StringIO(), poll_result=0)
+    captured_timeout: dict[str, float] = {}
+
+    config_path = tmp_path / ".autodev.yaml"
+    config_path.write_text(
+        'schema_version: "1.0"\n\nruntime:\n  control_plane_db: .opencode/runtime/control-plane.sqlite3\n  opencode_initial_session_id_timeout_seconds: 90\n',
+        encoding="utf-8",
+    )
+
+    monkeypatch.delenv("AUTODEV_OPENCODE_INITIAL_SESSION_ID_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.setattr(adapter, "spawn_detached_opencode_run", lambda command, workdir: process)
+
+    def _fake_read_initial_session_id(*args, **kwargs):
+        captured_timeout["value"] = float(kwargs.get("timeout_seconds", 0.0))
+        return ("ses-root", "stdout", "stderr")
+
+    monkeypatch.setattr(adapter, "read_initial_session_id", _fake_read_initial_session_id)
+    monkeypatch.setattr(adapter, "probe_same_repo_session_readability", lambda *args, **kwargs: (True, "Session: ses-root"))
+
+    host = adapter.OpenCodeHostAdapter(cli_resolver=lambda: "/fake/opencode")
+    result = host.start_root_session(_session_context(tmp_path, agent="build"))
+
+    assert result.status == "success"
+    assert captured_timeout["value"] == 90.0
 
 
 def test_open_code_host_adapter_start_child_role_marks_foreground_child_mode(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

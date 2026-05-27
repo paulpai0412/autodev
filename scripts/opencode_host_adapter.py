@@ -11,11 +11,65 @@ import sqlite3
 import subprocess
 import time
 from pathlib import Path
-from typing import IO, Any, Callable, Protocol, cast
+from typing import IO, Callable, Protocol, cast
+
+import yaml
 
 from scripts import opencode_db_path, read_session_summary
 from scripts.host_adapter import HostAdapter, SessionOutcome, SessionStartContext, SessionStartResult
 from scripts.runtime_exec import default_opencode_commands_dir, opencode_cli_fallback_candidates
+
+
+DEFAULT_INITIAL_SESSION_ID_TIMEOUT_SECONDS = 60.0
+
+
+def _autodev_config_path_for_workdir(workdir: Path) -> Path | None:
+    resolved = workdir.resolve()
+    for current in (resolved, *resolved.parents):
+        candidate = current / ".autodev.yaml"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _initial_session_timeout_from_config(*, workdir: Path) -> float | None:
+    config_path = _autodev_config_path_for_workdir(workdir)
+    if config_path is None:
+        return None
+    try:
+        parsed = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    runtime = parsed.get("runtime")
+    if not isinstance(runtime, dict):
+        return None
+    raw = runtime.get("opencode_initial_session_id_timeout_seconds")
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def initial_session_id_timeout_seconds(*, workdir: Path | None = None) -> float:
+    raw = os.environ.get("AUTODEV_OPENCODE_INITIAL_SESSION_ID_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        if workdir is not None:
+            from_config = _initial_session_timeout_from_config(workdir=workdir)
+            if from_config is not None:
+                return from_config
+        return DEFAULT_INITIAL_SESSION_ID_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_INITIAL_SESSION_ID_TIMEOUT_SECONDS
+    return value if value > 0 else DEFAULT_INITIAL_SESSION_ID_TIMEOUT_SECONDS
 
 
 class FindSessionID(Protocol):
@@ -34,6 +88,21 @@ def resolve_opencode_cli() -> str | None:
     if opencode_exe:
         return opencode_exe
     return shutil.which("opencode-desktop")
+
+
+def _opencode_message_args(prompt: str) -> list[str]:
+    """Convert a logical prompt into CLI message args.
+
+    OpenCode CLI accepts positional `message..` arguments and joins them for the
+    user message. Passing raw multiline text as a single positional argument can
+    drop lines on some host/CLI combinations, so we split by lines to preserve
+    full prompt content across platforms.
+    """
+
+    if not prompt:
+        return [""]
+    lines = prompt.splitlines()
+    return lines if lines else [prompt]
 
 
 def extract_session_id_from_run_output(output: str) -> str:
@@ -60,7 +129,7 @@ def spawn_detached_opencode_run(command: list[str], *, workdir: Path) -> subproc
     log_path = log_dir / f"opencode-run-{int(time.time() * 1000)}.log"
     log_handle = log_path.open("a", encoding="utf-8")
     try:
-        return subprocess.Popen(
+        process = subprocess.Popen(
             command,
             cwd=str(resolved_workdir),
             stdout=log_handle,
@@ -70,6 +139,8 @@ def spawn_detached_opencode_run(command: list[str], *, workdir: Path) -> subproc
             close_fds=True,
             env=env,
         )
+        setattr(process, "_autodev_log_path", str(log_path))
+        return process
     finally:
         log_handle.close()
 
@@ -142,6 +213,47 @@ def wait_for_child_session_summary(
     return None
 
 
+def _read_initial_session_id_from_log(
+    process: subprocess.Popen[str],
+    *,
+    timeout_seconds: float,
+    extract_session_id: Callable[[str], str],
+) -> tuple[str | None, str, str]:
+    log_path_raw = getattr(process, "_autodev_log_path", "")
+    if not isinstance(log_path_raw, str) or not log_path_raw:
+        return None, "", ""
+
+    log_path = Path(log_path_raw)
+    offset = 0
+    combined_text = ""
+    end_time = time.monotonic() + timeout_seconds
+
+    while time.monotonic() < end_time:
+        chunk = ""
+        try:
+            with log_path.open("r", encoding="utf-8", errors="replace") as handle:
+                handle.seek(offset)
+                chunk = handle.read()
+                offset = handle.tell()
+        except OSError:
+            chunk = ""
+
+        if chunk:
+            combined_text += chunk
+            try:
+                session_id = extract_session_id(combined_text)
+            except RuntimeError:
+                session_id = None
+            if session_id:
+                return session_id, combined_text, ""
+
+        if process.poll() is not None:
+            break
+        time.sleep(0.1)
+
+    return None, combined_text, ""
+
+
 def read_initial_session_id(
     process: subprocess.Popen[str],
     *,
@@ -154,6 +266,12 @@ def read_initial_session_id(
     stdout_pipe = process.stdout
     stderr_pipe = process.stderr
     if stdout_pipe is None or stderr_pipe is None:
+        if stdout_pipe is None and stderr_pipe is None:
+            return _read_initial_session_id_from_log(
+                process,
+                timeout_seconds=timeout_seconds,
+                extract_session_id=extract_session_id,
+            )
         return None, "", ""
     if not supports_fileno(stdout_pipe) or not supports_fileno(stderr_pipe):
         stdout_text = stdout_pipe.read()
@@ -293,26 +411,17 @@ class OpenCodeHostAdapter(HostAdapter):
         normalized_agent = context.agent.strip()
         if normalized_agent and normalized_agent.lower() != "build":
             command.extend(["--agent", normalized_agent])
-        command.append(context.prompt)
-        started_at_ms = int(time.time() * 1000)
+        command.extend(_opencode_message_args(context.prompt))
         try:
             process = spawn_detached_opencode_run(command, workdir=context.workdir)
         except OSError as error:
             return SessionStartResult(status="error", launch_title=launch_title, error=str(error))
         session_id, stdout_text, stderr_text = read_initial_session_id(
             process,
-            timeout_seconds=20.0,
+            timeout_seconds=initial_session_id_timeout_seconds(workdir=context.workdir),
             extract_session_id=extract_session_id_from_run_output,
             supports_fileno=stream_supports_fileno,
         )
-        if not session_id:
-            session_id = wait_for_session_id_in_db(
-                title=launch_title,
-                workdir=context.workdir,
-                created_after_ms=started_at_ms,
-                timeout_seconds=30.0,
-                find_session_id=find_session_id_in_db,
-            )
         if not session_id:
             if process.poll() is None:
                 process.terminate()
