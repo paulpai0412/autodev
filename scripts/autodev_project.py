@@ -1256,9 +1256,15 @@ def init_project(
     github_project_owner: str = "",
 ) -> ActionReport:
     github_repo = _validate_github_repo(github_repo)
-    project_owner = github_project_owner.strip() or _github_owner(github_repo)
-    project_title = github_project_title.strip() or _default_github_project_title(github_repo)
+    repo_owner = _github_owner(github_repo)
+    requested_owner = github_project_owner.strip()
+    project_owner = repo_owner
     report = ActionReport(actions=[], findings=[])
+    if requested_owner and requested_owner != repo_owner:
+        report.findings.append(
+            f"ignoring --github-project-owner={requested_owner!r}; using consumer repo owner {repo_owner!r}"
+        )
+    project_title = github_project_title.strip() or _default_github_project_title(github_repo)
     config_path = root / ".autodev.yaml"
     expected_config = _config_text(root, github_repo)
 
@@ -1397,7 +1403,12 @@ def init_project(
         configured_monitoring = _extract_configured_monitoring(config_for_link)
         configured_project_number = configured_monitoring.number or _extract_project_number_from_config(config_for_link)
         configured_project_id = configured_monitoring.project_id
-        configured_project_owner = configured_monitoring.owner or project_owner
+        configured_project_owner = project_owner
+        if configured_monitoring.owner and configured_monitoring.owner != project_owner:
+            report.findings.append(
+                "configured github_project_owner differs from consumer repo owner; "
+                f"using {project_owner!r} for project operations"
+            )
         configured_project_title = configured_monitoring.title
 
         has_configured_monitoring = bool(configured_project_number > 0 or configured_project_id or configured_project_title)

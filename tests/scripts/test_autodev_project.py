@@ -500,6 +500,28 @@ def test_extract_monitoring_prefers_managed_block_over_legacy_top_level_fields()
     }
 
 
+def test_init_ignores_mismatched_github_project_owner_override(tmp_path: Path):
+    write(tmp_path / "AGENTS.md", "# Project Agents\n")
+
+    with patch("scripts.autodev_project.subprocess.run", side_effect=fake_init_with_project_bootstrap_run):
+        exit_code = autodev_project.main(
+            [
+                "init",
+                "--project-root",
+                str(tmp_path),
+                "--github-repo",
+                "tcci-timmy/letter",
+                "--github-project-owner",
+                "paulpai0412",
+            ]
+        )
+
+    assert exit_code == 1
+    config = read(tmp_path / ".autodev.yaml")
+    assert 'github_project_owner: "tcci-timmy"' in config
+    assert 'github_project_title: "Autodev Control Plane (tcci-timmy/letter)"' in config
+
+
 def test_init_dry_run_writes_nothing(tmp_path: Path):
     with patch("scripts.autodev_project.subprocess.run") as run:
         exit_code = autodev_project.main(["init", "--project-root", str(tmp_path), "--dry-run"])
