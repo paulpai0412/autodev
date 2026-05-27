@@ -1914,7 +1914,7 @@ def test_reconcile_workspace_reconciles_active_issues_and_starts_ready_issue_wit
         state="verified",
         command_id="cmd-verified-43",
         updated_at="2026-05-07T17:00:00+08:00",
-        current_session_id="ses-v-43",
+        current_session_id="ses-release-root-43",
     )
     orchestrator_supervisor.record_pr_opened(
         base_dir=tmp_path,
@@ -2097,7 +2097,7 @@ def test_reconcile_workspace_respects_full_development_capacity(tmp_path: Path, 
         state="verified",
         command_id="cmd-verified-43",
         updated_at="2026-05-07T17:00:00+08:00",
-        current_session_id="ses-v-43",
+        current_session_id="ses-release-root-43",
     )
     orchestrator_supervisor.record_pr_opened(
         base_dir=tmp_path,
@@ -2154,7 +2154,7 @@ def test_reconcile_workspace_manual_release_backfill_mode_skips_release_starts(t
         state="verified",
         command_id="cmd-verified-43",
         updated_at="2026-05-07T17:00:00+08:00",
-        current_session_id="ses-v-43",
+        current_session_id="ses-release-root-43",
     )
     orchestrator_supervisor.record_pr_opened(
         base_dir=tmp_path,
@@ -2191,7 +2191,7 @@ def test_reconcile_workspace_auto_release_bypass_approval_injects_override(tmp_p
         state="verified",
         command_id="cmd-verified-43",
         updated_at="2026-05-07T17:00:00+08:00",
-        current_session_id="ses-v-43",
+        current_session_id="ses-release-root-43",
     )
     orchestrator_supervisor.record_pr_opened(
         base_dir=tmp_path,
@@ -2244,7 +2244,7 @@ def test_auto_release_backfill_bypass_approval_can_complete_end_to_end(tmp_path:
         state="verified",
         command_id="cmd-verified-43",
         updated_at="2026-05-07T17:00:00+08:00",
-        current_session_id="ses-v-43",
+        current_session_id="ses-release-root-43",
     )
     orchestrator_supervisor.record_pr_opened(
         base_dir=tmp_path,
@@ -2605,6 +2605,33 @@ def test_dispatch_session_request_surfaces_child_session_tracking_for_release_ro
     assert result.get("childRole") == "release_worker"
     assert result.get("childSessionID") == "ses-release-worker-42"
     assert result.get("childSessionStatus") == "stop"
+
+
+def test_record_session_result_projects_issue_worker_child_session(tmp_path: Path) -> None:
+    _ingest_issue_packet_text(tmp_path, "42", SAMPLE_ISSUE_PACKET)
+    ledger = cast(dict[str, object], {"issue": {"number": "42"}})
+    orchestrator_supervisor._record_session_result_history(
+        tmp_path,
+        ledger,
+        {
+            "status": "success",
+            "rootSessionID": "ses-root-42",
+            "recordedAt": "2026-05-07T17:10:00+08:00",
+            "issueNumber": "42",
+            "sourceSessionID": "manual",
+            "role": "issue_worker",
+            "stage": "issue_worker_execution",
+            "reason": "worker child running",
+            "childRole": "issue_worker",
+            "childSessionID": "ses-issue-worker-42",
+            "childSessionStatus": "running",
+        },
+    )
+
+    runtime_context = orchestrator_supervisor.read_runtime_context(tmp_path, "42")
+    child = cast(dict[str, object], runtime_context["issue_worker_child_session"])
+    assert child["childSessionID"] == "ses-issue-worker-42"
+    assert child["rootSessionID"] == "ses-root-42"
 
 
 def test_dispatch_request_from_db_persists_release_child_session_trace_in_history_payload(tmp_path: Path) -> None:
@@ -5978,7 +6005,9 @@ next_recommended_step: \"Release it\"
     assert decision["next_stage"] == "release_command"
     assert issue is not None
     assert issue["state"] == "verified"
-    assert issue["current_session_id"] == "ses-v"
+    assert issue["current_session_id"] == "ses-root-42"
+    runtime_context = orchestrator_supervisor.read_runtime_context(tmp_path, "42")
+    assert runtime_context["verifier_session_id"] == "ses-v"
     assert cast(dict[str, object], artifact_status["evidence_packet"])["parse_ok"] is True
     assert cast(dict[str, object], artifact_status["evidence_packet"])["status"] == "pass"
     assert cast(dict[str, object], artifact_status["evidence_packet"])["pr_number"] == "77"
@@ -6086,6 +6115,53 @@ def test_reconcile_verifier_release_waiting_syncs_project_fields_when_project_bi
     assert kwargs["command_id"] == "reconcile:42:pr-verifier-release-waiting:project-fields"
 
 
+def test_reconcile_verifier_with_persisted_evidence_skips_stale_root_quarantine(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "pr_verifier", "stage": "pr_verifier_execution", "status": "queued"}
+    cast(dict[str, str], ledger["artifacts"])["evidence_packet_ref"] = "docs/agents/evidence/issue-42-pr-77.yaml"
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="evidence_packet",
+        payload={
+            "status": "pass",
+            "pr_number": "77",
+            "verifier_session_id": "ses-v",
+            "next_recommended_step": "Release it",
+            "failure_kind": "none",
+            "retryable": True,
+            "gates": {"surface_qa_gate": {"status": "pass", "evidence_ref": "db:evidence:42"}},
+        },
+        updated_at="2026-05-07T17:11:00+08:00",
+    )
+    orchestrator_supervisor.upsert_issue_state(tmp_path,
+    issue_number="42",
+    state="running",
+    command_id="cmd-running",
+    updated_at="2026-05-07T17:00:00+08:00", current_session_id="ses-root-42", )
+    connection = sqlite3.connect(tmp_path / ".opencode/runtime/control-plane.sqlite3")
+    try:
+        _ = connection.execute(
+            "UPDATE issues SET last_event_at = ? WHERE issue_number = ?",
+            ("2026-05-07T17:00:00+08:00", "42"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    updated_ledger, decision, request = reconcile_ledger(ledger, artifact_base_dir=tmp_path,
+    updated_at="2026-05-07T17:16:00+08:00",)
+
+    issue = read_issue(tmp_path, "42")
+
+    assert updated_ledger is not None
+    assert decision["action"] == "release_waiting"
+    assert request is None
+    assert issue is not None
+    assert issue["state"] == "verified"
+
+
 def test_reconcile_verifier_requires_persisted_evidence_fact(tmp_path: Path):
     issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
@@ -6113,6 +6189,12 @@ next_recommended_step: \"Release it\"
     state="running",
     command_id="cmd-running",
     updated_at="2026-05-07T17:09:00+08:00", current_session_id="ses-root-42", )
+    orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:09:00+08:00",
+        runtime_context={"verifier_session_id": "ses-v"},
+    )
 
     class CompletedOutcomeHostAdapter(FakeHostAdapter):
         def read_session_outcome(self, runtime_session_id: str):
@@ -7407,6 +7489,20 @@ def test_reconcile_release_worker_terminal_without_release_result_redispatches_s
         command_id="cmd-release-running",
         updated_at="2026-05-07T17:10:00+08:00",
         current_session_id="ses-release-42",
+    )
+    orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:10:00+08:00",
+        runtime_context={
+            "release_child_session": {
+                "childRole": "release_worker",
+                "childSessionID": "ses-release-worker-42",
+                "childSessionStatus": "running",
+                "rootSessionID": "ses-release-42",
+                "recordedAt": "2026-05-07T17:10:00+08:00",
+            }
+        },
     )
 
     class TerminalOutcomeHostAdapter(FakeHostAdapter):
@@ -9161,7 +9257,7 @@ def test_reconcile_release_success_keeps_issue_completed(tmp_path: Path):
     issue_number="31",
     state="release_pending",
     command_id="cmd-verifying",
-    updated_at="2026-05-07T17:19:00+08:00", current_session_id="ses-v", )
+    updated_at="2026-05-07T17:19:00+08:00", current_session_id="ses-release-root", )
 
     updated_ledger, decision, request = reconcile_ledger(ledger, artifact_base_dir=tmp_path,
     updated_at="2026-05-07T17:21:00+08:00",)
@@ -9226,7 +9322,7 @@ def test_reconcile_ignores_stale_session_result_for_different_issue_after_queue_
     issue_number="31",
     state="release_pending",
     command_id="cmd-verifying",
-    updated_at="2026-05-07T17:19:00+08:00", current_session_id="ses-v", )
+    updated_at="2026-05-07T17:19:00+08:00", current_session_id="ses-release-root", )
 
     updated_ledger, decision, request = reconcile_ledger(ledger, artifact_base_dir=tmp_path,
     updated_at="2026-05-07T17:21:00+08:00",)
@@ -9403,7 +9499,7 @@ def test_reconcile_skips_runtime_phase_rebuild_for_completed_issue(tmp_path: Pat
     issue_number="31",
     state="completed",
     command_id="cmd-completed",
-    updated_at="2026-05-07T17:19:00+08:00", current_session_id="ses-v", )
+    updated_at="2026-05-07T17:19:00+08:00", current_session_id="ses-release-root", )
 
     updated_ledger, decision, request = reconcile_ledger(ledger, artifact_base_dir=tmp_path,
     updated_at="2026-05-07T17:21:00+08:00",)
@@ -9511,7 +9607,7 @@ def test_reconcile_release_blocked_exhaustion_marks_issue_failed(tmp_path: Path)
     issue_number="42",
     state="release_pending",
     command_id="cmd-verifying",
-    updated_at="2026-05-07T17:19:00+08:00", current_session_id="ses-v", )
+    updated_at="2026-05-07T17:19:00+08:00", current_session_id="ses-release-root", )
 
     updated_ledger, decision, request = reconcile_ledger(ledger, artifact_base_dir=tmp_path,
     updated_at="2026-05-07T17:21:00+08:00",)
@@ -9550,7 +9646,7 @@ def test_reconcile_release_human_approval_block_stays_release_pending(tmp_path: 
     issue_number="42",
     state="release_pending",
     command_id="cmd-release-pending",
-    updated_at="2026-05-07T17:19:00+08:00", current_session_id="ses-v", )
+    updated_at="2026-05-07T17:19:00+08:00", current_session_id="ses-release-root", )
     _submit_artifact(
         tmp_path,
         issue_number="42",
@@ -9578,10 +9674,87 @@ def test_reconcile_release_human_approval_block_stays_release_pending(tmp_path: 
     assert request is None
     assert issue is not None
     assert issue["state"] == "release_pending"
-    assert issue["current_session_id"] == "ses-v"
+    assert issue["current_session_id"] == "ses-release-root"
     assert issue["current_role"] == "main_orchestrator"
     assert issue["current_stage"] == "release_root_execution"
     assert issue["current_status"] == "pending_approval"
+
+
+def test_reconcile_release_with_persisted_result_skips_stale_root_quarantine(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "main_orchestrator", "stage": "release_root_execution", "status": "queued"}
+    cast(dict[str, str], ledger["artifacts"])["release_result_ref"] = "docs/agents/release-results/issue-42-pr-88.yaml"
+    release_path = tmp_path / "docs/agents/release-results/issue-42-pr-88.yaml"
+    release_path.parent.mkdir(parents=True, exist_ok=True)
+    release_path.write_text(
+        """schema_version: "1.0"
+kind: release_result
+line_cap: 60
+subject:
+  issue_number: "42"
+  pr_number: "88"
+  branch: "agent/issue-42-demo"
+status: "blocked"
+blocked_reason: "approval_override_mode is none"
+summary:
+  outcome: "blocked"
+  next_recommended_step: "human_approves_pr_merge_then_supervisor_retries_release"
+failure_classification: {kind: "human_approval_pending", retryable: true, routed_to: "main_orchestrator", root_cause_signature: "approval"}
+merge:
+  attempted: true
+  merged: false
+  merged_sha: ""
+role_boundary:
+  actor_role: "release_worker"
+  may_run_final_acceptance_qa: false
+  may_merge_only_after_verifier_pass: true
+metadata:
+  worker: "r"
+  worker_session_id: "ses-r"
+  completed_at: "2026-05-07T17:20:00+08:00"
+""",
+        encoding="utf-8",
+    )
+    orchestrator_supervisor.upsert_issue_state(tmp_path,
+    issue_number="42",
+    state="release_pending",
+    command_id="cmd-release-pending",
+    updated_at="2026-05-07T17:00:00+08:00", current_session_id="ses-release-root", )
+    _submit_artifact(
+        tmp_path,
+        issue_number="42",
+        artifact_kind="release_result",
+        payload={
+            "status": "blocked",
+            "blocked_reason": "approval_override_mode is none",
+            "next_recommended_step": "human_approves_pr_merge_then_supervisor_retries_release",
+            "failure_kind": "human_approval_pending",
+            "retryable": True,
+        },
+        updated_at="2026-05-07T17:20:00+08:00",
+        body_text=release_path.read_text(encoding="utf-8"),
+    )
+    connection = sqlite3.connect(tmp_path / ".opencode/runtime/control-plane.sqlite3")
+    try:
+        _ = connection.execute(
+            "UPDATE issues SET last_event_at = ? WHERE issue_number = ?",
+            ("2026-05-07T17:00:00+08:00", "42"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    updated_ledger, decision, request = reconcile_ledger(ledger, artifact_base_dir=tmp_path,
+    updated_at="2026-05-07T17:16:00+08:00",)
+
+    issue = read_issue(tmp_path, "42")
+
+    assert updated_ledger is not None
+    assert decision["action"] == "release_waiting"
+    assert request is None
+    assert issue is not None
+    assert issue["state"] == "release_pending"
 
 
 def test_submit_artifact_release_result_normalizes_human_approval_block_reason(tmp_path: Path) -> None:
@@ -9798,7 +9971,7 @@ def test_reconcile_late_successful_release_result_recovers_failed_issue_to_compl
     issue_number="42",
     state="failed",
     command_id="cmd-failed",
-    updated_at="2026-05-07T17:21:00+08:00", current_session_id="ses-v", )
+    updated_at="2026-05-07T17:21:00+08:00", current_session_id="ses-release-root", )
     release_path = tmp_path / "docs/agents/release-results/issue-42-pr-88.yaml"
     release_path.parent.mkdir(parents=True, exist_ok=True)
     release_path.write_text(
@@ -9847,7 +10020,7 @@ def test_reconcile_late_release_success_requires_persisted_release_fact(tmp_path
     issue_number="42",
     state="failed",
     command_id="cmd-failed",
-    updated_at="2026-05-07T17:21:00+08:00", current_session_id="ses-v", )
+    updated_at="2026-05-07T17:21:00+08:00", current_session_id="ses-release-root", )
     release_path = tmp_path / "docs/agents/release-results/issue-42-pr-88.yaml"
     release_path.parent.mkdir(parents=True, exist_ok=True)
     release_path.write_text(
@@ -9879,7 +10052,7 @@ def test_reconcile_late_successful_release_result_without_blocked_reason_recover
     issue_number="42",
     state="failed",
     command_id="cmd-failed",
-    updated_at="2026-05-07T17:21:00+08:00", current_session_id="ses-v", )
+    updated_at="2026-05-07T17:21:00+08:00", current_session_id="ses-release-root", )
     release_path = tmp_path / "docs/agents/release-results/issue-42-pr-88.yaml"
     release_path.parent.mkdir(parents=True, exist_ok=True)
     release_path.write_text(
@@ -9923,7 +10096,7 @@ def test_reconcile_release_result_ignores_nested_blocked_reason_when_top_level_m
     issue_number="42",
     state="failed",
     command_id="cmd-failed",
-    updated_at="2026-05-07T17:21:00+08:00", current_session_id="ses-v", )
+    updated_at="2026-05-07T17:21:00+08:00", current_session_id="ses-release-root", )
     release_path = tmp_path / "docs/agents/release-results/issue-42-pr-88.yaml"
     release_path.parent.mkdir(parents=True, exist_ok=True)
     release_path.write_text(
@@ -9967,7 +10140,7 @@ def test_reconcile_late_successful_release_result_recovers_ready_issue_to_comple
     issue_number="42",
     state="ready",
     command_id="cmd-ready",
-    updated_at="2026-05-07T17:21:00+08:00", current_session_id="ses-v", )
+    updated_at="2026-05-07T17:21:00+08:00", current_session_id="ses-release-root", )
     release_path = tmp_path / "docs/agents/release-results/issue-42-pr-88.yaml"
     release_path.parent.mkdir(parents=True, exist_ok=True)
     release_path.write_text(
@@ -10127,7 +10300,7 @@ def test_reconcile_issue_selection_or_recovery_queues_retryable_failed_issue_rec
     issue_number="42",
     state="failed",
     command_id="cmd-failed",
-    updated_at="2026-05-07T17:21:00+08:00", current_session_id="ses-v", )
+    updated_at="2026-05-07T17:21:00+08:00", current_session_id="ses-release-root", )
 
     with patch("scripts.orchestrator_supervisor.run_issue_packet_intake", return_value=False):
         updated_ledger, decision, request = reconcile_ledger(ledger, artifact_base_dir=tmp_path,

@@ -678,9 +678,18 @@ def test_upsert_issue_state_uses_single_current_session_id(tmp_path: Path):
     issue_number="42",
     state="verified",
     command_id="cmd-verified",
-    updated_at="2026-05-11T10:05:00+08:00", current_session_id="ses-verifier-42", )
+    updated_at="2026-05-11T10:05:00+08:00", )
+    synced = sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-11T10:05:00+08:00",
+        runtime_context={"verifier_session_id": "ses-verifier-42"},
+    )
+    runtime_context = read_runtime_context(tmp_path, "42")
 
-    assert verified["current_session_id"] == "ses-verifier-42"
+    assert verified["current_session_id"] == "ses-root-42"
+    assert synced["current_session_id"] == "ses-root-42"
+    assert runtime_context["verifier_session_id"] == "ses-verifier-42"
     assert "current_root_session_id" not in verified
     assert "current_verifier_session_id" not in verified
     assert verified["verified_at"] == "2026-05-11T10:05:00+08:00"

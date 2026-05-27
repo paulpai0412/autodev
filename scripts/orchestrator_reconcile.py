@@ -575,6 +575,8 @@ def reconcile_issue_worker(
     updated_at: str,
     is_successful_release_status: Callable[[str], bool],
     read_artifact_fact: Callable[[str], dict[str, object]],
+    read_runtime_context: Callable[[Path, str], JsonObject],
+    read_session_outcome: Callable[[str], object | None],
     record_pr_opened: Callable[..., dict[str, object]],
     set_failure_func: Callable[..., None],
     requeue_issue_worker_func: Callable[..., tuple[JsonObject, None]],
@@ -583,8 +585,22 @@ def reconcile_issue_worker(
     subagent_decision_func: Callable[..., JsonObject],
 ) -> ReconcileResult:
     persisted_worker = _stored_fact(artifacts, "worker_result", read_artifact_fact)
+    runtime_context = read_runtime_context(base_dir, issue["number"])
+    issue_worker_child_session = cast(dict[str, object], runtime_context.get("issue_worker_child_session", {})) if runtime_context else {}
+    issue_worker_child_session_id = str(issue_worker_child_session.get("childSessionID") or "") if issue_worker_child_session else ""
     if not bool(persisted_worker.get("parse_ok")):
-        if current.get("status") == "queued":
+        current_status = str(current.get("status") or "")
+        session_terminal_without_artifact = False
+        if issue_worker_child_session_id and current_status in {"running", "queued"}:
+            outcome = read_session_outcome(issue_worker_child_session_id)
+            outcome_status = ""
+            if isinstance(outcome, dict):
+                outcome_status = str(outcome.get("status") or "")
+            else:
+                outcome_status = str(getattr(outcome, "status", "") or "")
+            if outcome_status and outcome_status not in {"running", "queued", "unknown"}:
+                session_terminal_without_artifact = True
+        if current_status == "queued" and not session_terminal_without_artifact:
             summary = (
                 f"Issue worker for issue #{issue['number']} is queued and SQLite has not recorded a worker_result yet. "
                 "Keep the queued dispatch state unchanged."
@@ -730,6 +746,7 @@ def reconcile_pr_verifier(
     read_issue: Callable[[Path, str], JsonObject | None],
     read_issue_packet: Callable[[Path, str], JsonObject],
     read_artifact_fact: Callable[[str], dict[str, object]],
+    read_runtime_context: Callable[[Path, str], JsonObject],
     read_session_outcome: Callable[[str], object | None],
     record_pr_opened: Callable[..., dict[str, object]],
     record_current_verifier_session: Callable[..., None],
@@ -741,8 +758,9 @@ def reconcile_pr_verifier(
     subagent_decision_func: Callable[..., JsonObject],
 ) -> ReconcileResult:
     issue_state = read_issue(base_dir, issue["number"])
+    runtime_context = read_runtime_context(base_dir, issue["number"])
     current_issue_state = str(issue_state.get("state") or "") if issue_state else ""
-    verifier_session_id = str(issue_state.get("current_session_id") or "") if issue_state else ""
+    verifier_session_id = str(runtime_context.get("verifier_session_id") or "") if runtime_context else ""
     persisted_evidence = _stored_fact(artifacts, "evidence_packet", read_artifact_fact)
     if not bool(persisted_evidence.get("parse_ok")):
         current_status = str(current.get("status") or "")
@@ -1049,7 +1067,6 @@ def reconcile_pr_verifier(
             updated_at=updated_at,
             reason=f"Verifier accepted issue #{issue['number']} and recorded PR #{pr_number}.",
             from_state="verifying",
-            current_session_id=verifier_session_id or None,
         )
         summary = (
             f"Verifier for issue #{issue['number']} passed and recorded PR #{pr_number}. "
@@ -1156,6 +1173,7 @@ def reconcile_release_worker(
     non_terminal_release_failure_kinds: set[str],
     read_issue: Callable[[Path, str], JsonObject | None],
     read_artifact_fact: Callable[[str], dict[str, object]],
+    read_runtime_context: Callable[[Path, str], JsonObject],
     read_session_outcome: Callable[[str], object | None],
     transition_issue_state_if_possible: Callable[..., None],
     set_failure_func: Callable[..., None],
@@ -1165,7 +1183,9 @@ def reconcile_release_worker(
     sync_issue_runtime_context: Callable[..., JsonObject],
 ) -> ReconcileResult:
     issue_state = read_issue(base_dir, issue["number"])
-    verifier_session_id = str(issue_state.get("current_session_id") or "") if issue_state else ""
+    runtime_context = read_runtime_context(base_dir, issue["number"])
+    release_child_session = cast(dict[str, object], runtime_context.get("release_child_session", {})) if runtime_context else {}
+    release_child_session_id = str(release_child_session.get("childSessionID") or "") if release_child_session else ""
     persisted_release = _stored_fact(artifacts, "release_result", read_artifact_fact)
     if not bool(persisted_release.get("parse_ok")):
         current_status = str(current.get("status") or "")
@@ -1185,8 +1205,8 @@ def reconcile_release_worker(
                 None,
             )
         session_terminal_without_artifact = False
-        if verifier_session_id and current_status in {"running", "queued"}:
-            outcome = read_session_outcome(verifier_session_id)
+        if release_child_session_id and current_status in {"running", "queued"}:
+            outcome = read_session_outcome(release_child_session_id)
             outcome_status = ""
             if isinstance(outcome, dict):
                 outcome_status = str(outcome.get("status") or "")
@@ -1232,7 +1252,6 @@ def reconcile_release_worker(
                 command_id=uuid4().hex,
                 updated_at=updated_at,
                 reason=f"Retry release_worker for issue #{issue['number']} after missing release result.",
-                current_session_id=verifier_session_id or None,
             )
             queue_transition_func(
                 ledger,
@@ -1266,7 +1285,6 @@ def reconcile_release_worker(
                 updated_at=updated_at,
                 reason=f"Release worker completed issue #{issue['number']} after verifier-owned evidence passed.",
                 from_state="release_pending",
-                current_session_id=verifier_session_id or None,
             )
         summary = (
             f"Release worker completed issue #{issue['number']}. Hand off to main_orchestrator to select the next ready issue and keep the workflow moving."
@@ -1311,7 +1329,6 @@ def reconcile_release_worker(
             command_id=uuid4().hex,
             updated_at=updated_at,
             reason=f"Retry release_worker for issue #{issue['number']} after transient release blocker {blocked_reason}.",
-            current_session_id=verifier_session_id or None,
         )
         queue_transition_func(
             ledger,
@@ -1340,7 +1357,6 @@ def reconcile_release_worker(
             reason=(
                 f"Keep issue #{issue['number']} in release_pending while waiting for human merge approval."
             ),
-            current_session_id=verifier_session_id or None,
         )
         _ = sync_issue_runtime_context(
             base_dir,

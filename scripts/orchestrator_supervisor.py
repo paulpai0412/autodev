@@ -1969,8 +1969,12 @@ def _quarantine_stale_running_issue(
     ledger: JsonObject,
     runtime_issue: dict[str, object],
     updated_at: str,
+    issue_worker_child_session: dict[str, object] | None = None,
 ) -> bool:
     if str(runtime_issue.get("state") or "") != "running":
+        return False
+    child_session_status = str((issue_worker_child_session or {}).get("childSessionStatus") or "")
+    if child_session_status in {"running", "queued", "unknown"}:
         return False
     root_session_id = str(runtime_issue.get("current_session_id") or "")
     last_event_at = str(runtime_issue.get("last_event_at") or "")
@@ -2204,6 +2208,9 @@ def _quarantine_stale_queued_subagent_with_stale_root(
     current: dict[str, str],
     runtime_issue: dict[str, object],
     updated_at: str,
+    evidence_packet: dict[str, object] | None = None,
+    release_result: dict[str, object] | None = None,
+    issue_worker_child_session: dict[str, object] | None = None,
 ) -> bool:
     if current.get("status") != "queued":
         return False
@@ -2213,6 +2220,15 @@ def _quarantine_stale_queued_subagent_with_stale_root(
         return False
     if str(runtime_issue.get("state") or "") not in {"running", "verifying", "release_pending"}:
         return False
+    if current.get("role") == "issue_worker":
+        child_session_status = str((issue_worker_child_session or {}).get("childSessionStatus") or "")
+        if child_session_status in {"running", "queued", "unknown"}:
+            return False
+    if current.get("role") == "pr_verifier" and bool((evidence_packet or {}).get("parse_ok")):
+        return False
+    if current.get("role") == "main_orchestrator" and current.get("stage") == "release_root_execution" and bool((release_result or {}).get("parse_ok")):
+        return False
+
     issue = cast(dict[str, str], ledger["issue"])
     issue_number = issue["number"]
     root_session_id = str(runtime_issue.get("current_session_id") or "")
@@ -2317,17 +2333,14 @@ def _record_current_verifier_session(
     updated_at: str,
     fallback_state: str = "verifying",
 ) -> None:
+    del fallback_state
     if not verifier_session_id:
         return
-    issue_state = read_issue(base_dir, issue_number)
-    state = str(issue_state.get("state") or fallback_state) if issue_state else fallback_state
-    upsert_issue_state(
+    _ = sync_issue_runtime_context(
         base_dir,
         issue_number=issue_number,
-        state=state,
-        command_id=uuid4().hex,
         updated_at=updated_at,
-        current_session_id=verifier_session_id,
+        runtime_context={"verifier_session_id": verifier_session_id},
     )
 
 def has_issue_execution_lock(base_dir: Path, issue_number: str) -> bool:
@@ -4328,40 +4341,44 @@ def _record_session_result_history(base_dir: Path, ledger: JsonObject, session_r
         payload=dict(session_result),
         unique_key=f"session-result:{issue_number}:{request_id}:{recorded_at}",
     )
-    if (
-        str(session_result.get("role") or "") != "main_orchestrator"
-        or str(session_result.get("stage") or "") != "release_root_execution"
-    ):
-        return
     child_role = str(session_result.get("childRole") or "")
     child_session_id = str(session_result.get("childSessionID") or "")
     child_session_status = str(session_result.get("childSessionStatus") or "")
     if not any((child_role, child_session_id, child_session_status)):
         return
-    release_child_session = {
+    child_session_projection = {
         "childRole": child_role,
         "childSessionID": child_session_id,
         "childSessionStatus": child_session_status,
         "rootSessionID": root_session_id,
         "recordedAt": recorded_at,
     }
-    _ = sync_issue_runtime_context(
-        base_dir,
-        issue_number=issue_number,
-        updated_at=recorded_at,
-        runtime_context={"release_child_session": release_child_session},
-    )
-    record_latest_ref_snapshot(
-        base_dir,
-        issue_number=issue_number,
-        entry_type="release_child_session",
-        history_id=history_id,
-        created_at=recorded_at,
-        command_id=request_id,
-        session_id=root_session_id,
-        status=child_session_status or status,
-        extra=release_child_session,
-    )
+    if str(session_result.get("role") or "") == "main_orchestrator" and str(session_result.get("stage") or "") == "release_root_execution":
+        _ = sync_issue_runtime_context(
+            base_dir,
+            issue_number=issue_number,
+            updated_at=recorded_at,
+            runtime_context={"release_child_session": child_session_projection},
+        )
+        record_latest_ref_snapshot(
+            base_dir,
+            issue_number=issue_number,
+            entry_type="release_child_session",
+            history_id=history_id,
+            created_at=recorded_at,
+            command_id=request_id,
+            session_id=root_session_id,
+            status=child_session_status or status,
+            extra=child_session_projection,
+        )
+        return
+    if str(session_result.get("role") or "") == "issue_worker":
+        _ = sync_issue_runtime_context(
+            base_dir,
+            issue_number=issue_number,
+            updated_at=recorded_at,
+            runtime_context={"issue_worker_child_session": child_session_projection},
+        )
 
 
 def _record_same_repo_probe_degraded_event(
@@ -5145,6 +5162,7 @@ def reconcile_ledger(
             ledger=ledger,
             runtime_issue=cast(dict[str, object], runtime_issue),
             updated_at=timestamp,
+            issue_worker_child_session=read_runtime_context(base_dir, issue["number"]).get("issue_worker_child_session", {}),
         ):
             runtime_issue = read_issue(base_dir, issue["number"])
 
@@ -5154,6 +5172,9 @@ def reconcile_ledger(
             current=current,
             runtime_issue=cast(dict[str, object], runtime_issue),
             updated_at=timestamp,
+            evidence_packet=_read_db_artifact_fact(base_dir=artifact_lookup_base_dir, issue_number=issue["number"], artifact_kind="evidence_packet"),
+            release_result=_read_db_artifact_fact(base_dir=artifact_lookup_base_dir, issue_number=issue["number"], artifact_kind="release_result"),
+            issue_worker_child_session=read_runtime_context(base_dir, issue["number"]).get("issue_worker_child_session", {}),
         ):
             runtime_issue = read_issue(base_dir, issue["number"])
 
@@ -5227,6 +5248,8 @@ def reconcile_ledger(
                     issue_number=issue["number"],
                     artifact_kind=entry_type,
                 ),
+                read_runtime_context=read_runtime_context,
+                read_session_outcome=lambda runtime_session_id: _default_host_adapter().read_session_outcome(runtime_session_id),
                 record_pr_opened=record_pr_opened,
                 set_failure_func=_set_failure,
                 requeue_issue_worker_func=_requeue_issue_worker,
@@ -5300,6 +5323,7 @@ def reconcile_ledger(
                     issue_number=issue["number"],
                     artifact_kind=entry_type,
                 ),
+                read_runtime_context=read_runtime_context,
                 read_session_outcome=lambda runtime_session_id: _default_host_adapter().read_session_outcome(runtime_session_id),
                 record_pr_opened=record_pr_opened,
                 record_current_verifier_session=_record_current_verifier_session,
@@ -5382,6 +5406,7 @@ def reconcile_ledger(
                     issue_number=issue["number"],
                     artifact_kind=entry_type,
                 ),
+                read_runtime_context=read_runtime_context,
                 read_session_outcome=lambda runtime_session_id: _default_host_adapter().read_session_outcome(runtime_session_id),
                 transition_issue_state_if_possible=_transition_issue_state_if_possible,
                 set_failure_func=_set_failure,
