@@ -42,6 +42,7 @@ DEFAULT_REPO_DESCRIPTION = "Autodev consumer project"
 GITHUB_MONITORING_BEGIN = "# AUTODEV_GITHUB_MONITORING:BEGIN"
 GITHUB_MONITORING_END = "# AUTODEV_GITHUB_MONITORING:END"
 DEFAULT_GITHUB_PROJECT_TITLE = "Autodev Control Plane"
+CONFIG_TEMPLATE_PATH = ROOT / ".autodev_example.yaml"
 
 BOOTSTRAP_LABELS = [
     ("needs-triage", "D4C5F9", "Maintainer needs to evaluate this issue"),
@@ -410,6 +411,10 @@ def _repo_https_url(github_repo: str) -> str:
 def _github_owner(github_repo: str) -> str:
     owner, _, _repo = github_repo.partition("/")
     return owner
+
+
+def _default_github_project_title(github_repo: str) -> str:
+    return f"{DEFAULT_GITHUB_PROJECT_TITLE} ({github_repo})"
 
 
 def _validate_github_repo(github_repo: str) -> str:
@@ -1144,7 +1149,7 @@ def _bootstrap_project_repository(root: Path, *, github_repo: str, dry_run: bool
         report.findings.append(f"bootstrap command failed: {' '.join(cast(list[str], error.cmd))}: {detail}")
 
 
-def _config_text(root: Path, github_repo: str) -> str:
+def _legacy_config_text(root: Path, github_repo: str) -> str:
     project_name = root.name
     lines = [
         'schema_version: "1.0"',
@@ -1169,6 +1174,40 @@ def _config_text(root: Path, github_repo: str) -> str:
         "",
     ]
     return "\n".join(lines)
+
+
+def _strip_monitoring_block(config_text: str) -> str:
+    if (GITHUB_MONITORING_BEGIN in config_text) != (GITHUB_MONITORING_END in config_text):
+        return config_text
+    if GITHUB_MONITORING_BEGIN not in config_text:
+        return config_text
+    before, rest = config_text.split(GITHUB_MONITORING_BEGIN, 1)
+    _middle, after = rest.split(GITHUB_MONITORING_END, 1)
+    return f"{before}{after.lstrip(chr(10))}"
+
+
+def _config_text(root: Path, github_repo: str) -> str:
+    if not CONFIG_TEMPLATE_PATH.exists():
+        return _legacy_config_text(root, github_repo)
+
+    config = _read_text(CONFIG_TEMPLATE_PATH)
+    config = _strip_monitoring_block(config)
+    config = re.sub(r'(?m)^  name:\s*.*$', f"  name: {root.name}", config, count=1)
+    config = re.sub(r'(?m)^  root:\s*.*$', f"  root: {root}", config, count=1)
+    config = re.sub(r'(?m)^  github_repo:\s*.*$', f"  github_repo: {github_repo}", config, count=1)
+    config = re.sub(r'(?m)^github_project_id:\s*.*$', 'github_project_id: ""', config, count=1)
+    config = re.sub(
+        r'(?ms)^github_project_field_ids:\n(?:  [^\n]*\n)+',
+        'github_project_field_ids:\n  state: ""\n  stage: ""\n  pr_workflow: ""\n',
+        config,
+        count=1,
+    )
+    if "state_projection:" not in config:
+        suffix = "\n".join(default_state_projection_config_lines())
+        config = f"{config.rstrip()}\n\n{suffix}\n"
+    elif not config.endswith("\n"):
+        config = f"{config}\n"
+    return config
 
 
 def _managed_agents_block() -> str:
@@ -1212,13 +1251,13 @@ def init_project(
     dry_run: bool,
     check: bool,
     force: bool,
-    create_github_project: bool = False,
+    create_github_project: bool = True,
     github_project_title: str = DEFAULT_GITHUB_PROJECT_TITLE,
     github_project_owner: str = "",
 ) -> ActionReport:
     github_repo = _validate_github_repo(github_repo)
     project_owner = github_project_owner.strip() or _github_owner(github_repo)
-    project_title = github_project_title.strip() or DEFAULT_GITHUB_PROJECT_TITLE
+    project_title = github_project_title.strip() or _default_github_project_title(github_repo)
     report = ActionReport(actions=[], findings=[])
     config_path = root / ".autodev.yaml"
     expected_config = _config_text(root, github_repo)
@@ -1471,6 +1510,10 @@ def init_project(
         report=report,
     )
 
+    commands_report = install_commands(root / ".opencode/commands", dry_run=(dry_run or check), force=False)
+    report.actions.extend(commands_report.actions)
+    report.findings.extend(commands_report.findings)
+
     return report
 
 
@@ -1642,12 +1685,20 @@ def build_parser() -> argparse.ArgumentParser:
     _ = init.add_argument(
         "--create-github-project",
         action="store_true",
-        help="Create/link a GitHub Project and persist project+field bindings for monitoring",
+        dest="create_github_project",
+        help="Create/link a GitHub Project and persist project+field bindings for monitoring (default: enabled)",
     )
     _ = init.add_argument(
+        "--no-create-github-project",
+        action="store_false",
+        dest="create_github_project",
+        help="Skip creating/linking GitHub Project during init",
+    )
+    init.set_defaults(create_github_project=True)
+    _ = init.add_argument(
         "--github-project-title",
-        default=DEFAULT_GITHUB_PROJECT_TITLE,
-        help="GitHub Project title used when --create-github-project is enabled",
+        default="",
+        help="GitHub Project title used when project setup is enabled (default: derived from --github-repo)",
     )
     _ = init.add_argument(
         "--github-project-owner",

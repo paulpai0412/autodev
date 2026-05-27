@@ -27,6 +27,8 @@ def completed(args: list[str], *, returncode: int = 0, stdout: str = "", stderr:
 
 
 def fake_init_bootstrap_run(args: list[str], **_kwargs: object) -> CompletedProcess[str]:
+    status_options = [{"id": f"opt_state_{state}", "name": state} for state in autodev_project.AUTODEV_PROJECT_STATUS_STATES]
+    pr_options = [{"id": f"opt_pr_{state}", "name": state} for state in autodev_project.AUTODEV_PR_WORKFLOW_STATES]
     if args[:3] == ["git", "rev-parse", "--is-inside-work-tree"]:
         return completed(args, returncode=128, stderr="not a git repository")
     if args[:4] == ["git", "rev-parse", "--verify", "HEAD"]:
@@ -43,6 +45,40 @@ def fake_init_bootstrap_run(args: list[str], **_kwargs: object) -> CompletedProc
         return completed(args, stdout="created")
     if args[:3] == ["gh", "label", "create"]:
         return completed(args)
+    if args[:4] == ["gh", "project", "list", "--owner"]:
+        return completed(args, stdout="[]")
+    if args[:4] == ["gh", "project", "create", "--owner"]:
+        return completed(args, stdout=json.dumps({"id": "PVT_project_1", "number": 7, "title": "Autodev Control Plane (paulpai0412/autodev)"}))
+    if args[:4] == ["gh", "project", "link", "7"]:
+        return completed(args)
+    if args[:4] == ["gh", "project", "field-list", "7"]:
+        return completed(
+            args,
+            stdout=json.dumps(
+                [
+                    {
+                        "id": "PVTF_state",
+                        "name": "Status",
+                        "options": status_options,
+                    },
+                    {"id": "PVTF_stage", "name": "Current Stage", "options": []},
+                    {
+                        "id": "PVTF_pr_workflow",
+                        "name": "PR Workflow",
+                        "options": pr_options,
+                    },
+                ]
+            ),
+        )
+    if args[:4] == ["gh", "project", "field-create", "7"]:
+        if "Status" in args:
+            return completed(args, stdout=json.dumps({"id": "PVTF_state"}))
+        if "Current Stage" in args:
+            return completed(args, stdout=json.dumps({"id": "PVTF_stage"}))
+        if "PR Workflow" in args:
+            return completed(args, stdout=json.dumps({"id": "PVTF_pr_workflow"}))
+    if args[:3] == ["gh", "api", "graphql"]:
+        return completed(args, stdout=json.dumps({"data": {"updateProjectV2Field": {"projectV2Field": {"id": "PVTF_state"}}}}))
     raise AssertionError(f"unexpected command: {args}")
 
 
@@ -66,7 +102,7 @@ def fake_init_with_project_bootstrap_run(args: list[str], **_kwargs: object) -> 
     if args[:4] == ["gh", "project", "list", "--owner"]:
         return completed(args, stdout="[]")
     if args[:4] == ["gh", "project", "create", "--owner"]:
-        return completed(args, stdout=json.dumps({"id": "PVT_project_1", "number": 7, "title": "Autodev Control Plane"}))
+        return completed(args, stdout=json.dumps({"id": "PVT_project_1", "number": 7, "title": "Autodev Control Plane (paulpai0412/autodev)"}))
     if args[:4] == ["gh", "project", "link", "7"]:
         return completed(args)
     if args[:4] == ["gh", "project", "field-list", "7"]:
@@ -143,14 +179,32 @@ def test_init_creates_project_contract_dirs_and_agents_managed_block(tmp_path: P
     assert exit_code == 0
     config = read(tmp_path / ".autodev.yaml")
     assert 'schema_version: "1.0"' in config
+    assert "# Optional: enable GitHub Projects V2 projection by filling these values." in config
     assert "github_repo: paulpai0412/autodev" in config
+    assert 'github_project_id: ""' in config
+    assert '  pr_workflow: ""' in config
     assert "control_plane_db: .opencode/runtime/control-plane.sqlite3" in config
     assert "state_projection:" in config
     assert "sqlite_to_primary_label:" in config
     assert "release_pending: agent-in-progress" in config
     assert "pr_workflow_to_label:" in config
+    assert "AUTODEV_GITHUB_MONITORING:BEGIN" in config
+    assert 'github_project_title: "Autodev Control Plane (paulpai0412/autodev)"' in config
+    assert 'github_project_id: "PVT_project_1"' in config
+    assert '  state: "PVTF_state"' in config
+    assert '  stage: "PVTF_stage"' in config
+    assert '  pr_workflow: "PVTF_pr_workflow"' in config
     assert (tmp_path / ".opencode/runtime/.gitkeep").exists()
     assert (tmp_path / ".opencode/runtime/control-plane.sqlite3").exists()
+    entrypoints = autodev_project._operator_entrypoints()
+    assert (tmp_path / ".opencode/commands" / entrypoints["start"]).exists()
+    assert (tmp_path / ".opencode/commands" / entrypoints["reconcile"]).exists()
+    assert (tmp_path / ".opencode/commands" / entrypoints["release"]).exists()
+    assert (tmp_path / ".opencode/commands" / entrypoints["inspect"]).exists()
+    assert (tmp_path / ".opencode/commands" / entrypoints["doctor"]).exists()
+    assert (tmp_path / ".opencode/commands" / entrypoints["full_cycle"]).exists()
+    start_command = read(tmp_path / ".opencode/commands" / entrypoints["start"])
+    assert 'PYTHONPATH="$AUTODEV_HOME" python "$AUTODEV_HOME/scripts/autodev_project.py" start --project-root "$PWD" --issue-number "$1"' in start_command
     gitignore = read(tmp_path / ".gitignore")
     assert ".env" in gitignore
     assert "AGENTS.md" in gitignore
@@ -171,6 +225,47 @@ def test_init_creates_project_contract_dirs_and_agents_managed_block(tmp_path: P
     assert len(label_commands) == len(autodev_project.BOOTSTRAP_LABELS)
 
 
+def test_init_can_opt_out_of_github_project_creation(tmp_path: Path):
+    write(tmp_path / "AGENTS.md", "# Project Agents\n\nKeep this project-specific guidance.\n")
+
+    def fake_run(args: list[str], **_kwargs: object) -> CompletedProcess[str]:
+        if args[:3] == ["git", "rev-parse", "--is-inside-work-tree"]:
+            return completed(args, returncode=128, stderr="not a git repository")
+        if args[:4] == ["git", "rev-parse", "--verify", "HEAD"]:
+            return completed(args, returncode=128, stderr="fatal: Needed a single revision")
+        if args[:4] == ["git", "remote", "get-url", "origin"]:
+            return completed(args, returncode=2, stderr="no such remote")
+        if args[:3] == ["gh", "repo", "view"]:
+            return completed(args, returncode=1, stderr="not found")
+        if args[:3] == ["git", "init", "-b"]:
+            return completed(args, stdout="initialized")
+        if args[:3] == ["git", "remote", "add"]:
+            return completed(args)
+        if args[:3] == ["gh", "repo", "create"]:
+            return completed(args, stdout="created")
+        if args[:3] == ["gh", "label", "create"]:
+            return completed(args)
+        if args[:3] == ["gh", "project"]:
+            raise AssertionError(f"project command should not be called: {args}")
+        return completed(args)
+
+    with patch("scripts.autodev_project.subprocess.run", side_effect=fake_run):
+        exit_code = autodev_project.main(
+            [
+                "init",
+                "--project-root",
+                str(tmp_path),
+                "--github-repo",
+                "paulpai0412/autodev",
+                "--no-create-github-project",
+            ]
+        )
+
+    assert exit_code == 0
+    config = read(tmp_path / ".autodev.yaml")
+    assert "AUTODEV_GITHUB_MONITORING:BEGIN" not in config
+
+
 def test_init_create_github_project_writes_monitoring_block(tmp_path: Path):
     write(tmp_path / "AGENTS.md", "# Project Agents\n")
 
@@ -182,7 +277,6 @@ def test_init_create_github_project_writes_monitoring_block(tmp_path: Path):
                 str(tmp_path),
                 "--github-repo",
                 "paulpai0412/autodev",
-                "--create-github-project",
             ]
         )
 
@@ -208,7 +302,7 @@ def test_init_links_repo_to_existing_github_project_when_monitoring_exists(tmp_p
                 "",
                 "# AUTODEV_GITHUB_MONITORING:BEGIN",
                 'github_project_owner: "paulpai0412"',
-                'github_project_title: "Autodev Control Plane"',
+                'github_project_title: "Autodev Control Plane (paulpai0412/autodev)"',
                 "github_project_number: 7",
                 'github_project_id: "PVT_project_1"',
                 "github_project_field_ids:",
@@ -235,6 +329,7 @@ def test_init_links_repo_to_existing_github_project_when_monitoring_exists(tmp_p
                 str(tmp_path),
                 "--github-repo",
                 "paulpai0412/autodev",
+                "--no-create-github-project",
             ]
         )
 
@@ -269,7 +364,7 @@ def test_init_resolves_existing_github_project_by_title_and_backfills_monitoring
                 "",
                 "# AUTODEV_GITHUB_MONITORING:BEGIN",
                 'github_project_owner: "paulpai0412"',
-                'github_project_title: "Autodev Control Plane"',
+                'github_project_title: "Autodev Control Plane (paulpai0412/autodev)"',
                 'github_project_id: "PVT_stale_project"',
                 "github_project_field_ids:",
                 '  state: ""',
@@ -310,7 +405,7 @@ def test_init_resolves_existing_github_project_by_title_and_backfills_monitoring
                         {
                             "id": "PVT_project_1",
                             "number": 7,
-                            "title": "Autodev Control Plane",
+                            "title": "Autodev Control Plane (paulpai0412/autodev)",
                         }
                     ]
                 ),
@@ -348,6 +443,7 @@ def test_init_resolves_existing_github_project_by_title_and_backfills_monitoring
                 str(tmp_path),
                 "--github-repo",
                 "paulpai0412/autodev",
+                "--no-create-github-project",
             ]
         )
 
@@ -563,7 +659,7 @@ def test_doctor_reports_incomplete_github_monitoring_block(tmp_path: Path, capsy
                 'project:',
                 '  name: demo',
                 '# AUTODEV_GITHUB_MONITORING:BEGIN',
-                'github_project_title: "Autodev Control Plane"',
+                'github_project_title: "Autodev Control Plane (paulpai0412/autodev)"',
                 'github_project_field_ids:',
                 '  state: "PVTF_state"',
                 '# AUTODEV_GITHUB_MONITORING:END',
@@ -804,6 +900,7 @@ def test_init_updates_origin_when_force_is_set(tmp_path: Path):
                 "--github-repo",
                 "paulpai0412/autodev-demo-todo",
                 "--force",
+                "--no-create-github-project",
             ]
         )
 
@@ -874,6 +971,7 @@ def test_init_seeds_local_main_from_origin_for_unborn_repo(tmp_path: Path):
                 str(tmp_path),
                 "--github-repo",
                 "paulpai0412/autodev-demo-todo",
+                "--no-create-github-project",
             ]
         )
 
