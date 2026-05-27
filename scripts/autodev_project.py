@@ -1259,11 +1259,13 @@ def init_project(
     repo_owner = _github_owner(github_repo)
     requested_owner = github_project_owner.strip()
     project_owner = repo_owner
-    report = ActionReport(actions=[], findings=[])
     if requested_owner and requested_owner != repo_owner:
+        report = ActionReport(actions=[], findings=[])
         report.findings.append(
             f"ignoring --github-project-owner={requested_owner!r}; using consumer repo owner {repo_owner!r}"
         )
+    else:
+        report = ActionReport(actions=[], findings=[])
     project_title = github_project_title.strip() or _default_github_project_title(github_repo)
     config_path = root / ".autodev.yaml"
     expected_config = _config_text(root, github_repo)
