@@ -1000,6 +1000,15 @@ def test_init_rejects_invalid_github_repo_slug(tmp_path: Path):
         raise AssertionError("expected invalid github_repo slug to be rejected")
 
 
+def test_config_text_supports_windows_root_backslashes() -> None:
+    root = Path(r"D:\myai\letter")
+
+    config = autodev_project._config_text(root, "tcci-timmy/letter")
+
+    assert f"  root: {root}" in config
+    assert "  github_repo: tcci-timmy/letter" in config
+
+
 def test_main_reports_json_when_requested(tmp_path: Path, capsys: CaptureFixture[str]):
     exit_code = autodev_project.main(
         ["doctor", "--project-root", str(tmp_path), "--json"]

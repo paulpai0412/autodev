@@ -1192,9 +1192,9 @@ def _config_text(root: Path, github_repo: str) -> str:
 
     config = _read_text(CONFIG_TEMPLATE_PATH)
     config = _strip_monitoring_block(config)
-    config = re.sub(r'(?m)^  name:\s*.*$', f"  name: {root.name}", config, count=1)
-    config = re.sub(r'(?m)^  root:\s*.*$', f"  root: {root}", config, count=1)
-    config = re.sub(r'(?m)^  github_repo:\s*.*$', f"  github_repo: {github_repo}", config, count=1)
+    config = re.sub(r'(?m)^  name:\s*.*$', lambda _match: f"  name: {root.name}", config, count=1)
+    config = re.sub(r'(?m)^  root:\s*.*$', lambda _match: f"  root: {root}", config, count=1)
+    config = re.sub(r'(?m)^  github_repo:\s*.*$', lambda _match: f"  github_repo: {github_repo}", config, count=1)
     config = re.sub(r'(?m)^github_project_id:\s*.*$', 'github_project_id: ""', config, count=1)
     config = re.sub(
         r'(?ms)^github_project_field_ids:\n(?:  [^\n]*\n)+',
