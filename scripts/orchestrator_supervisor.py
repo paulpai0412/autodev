@@ -1395,10 +1395,9 @@ def _recover_approved_merged_release_pending_issue(
     )
     if not pr_status:
         return False
-    if not bool(pr_status.get("merged")):
-        return False
     if str(pr_status.get("reviewDecision") or "") != "APPROVED":
         return False
+    recovered_after_merge = bool(pr_status.get("merged"))
 
     _ = sync_issue_runtime_context(
         base_dir,
@@ -1425,12 +1424,14 @@ def _recover_approved_merged_release_pending_issue(
         stage="release_worker_execution",
         status="",
         summary=(
-            f"Recovered pending approval release fence for issue #{issue_number} after GitHub confirmed PR #{pr_status['pr_number']} was approved and merged."
+            f"Recovered pending approval release fence for issue #{issue_number} after GitHub confirmed PR #{pr_status['pr_number']} was approved"
+            f"{' and merged' if recovered_after_merge else ''}."
         ),
         payload={
             "transition_type": "release_approval_merge_recovery",
             "issue_number": issue_number,
             "pr_number": pr_status["pr_number"],
+            "merged": recovered_after_merge,
             "review_decision": pr_status.get("reviewDecision"),
             "merge_state_status": pr_status.get("mergeStateStatus"),
             "pr_url": pr_status.get("url"),
