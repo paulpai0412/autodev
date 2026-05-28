@@ -7800,6 +7800,114 @@ def test_reconcile_does_not_quarantine_stale_root_when_issue_worker_child_is_run
     assert issue["state"] == "running"
 
 
+def test_reconcile_does_not_quarantine_stale_root_when_pr_verifier_session_is_running(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "pr_verifier", "stage": "pr_verifier_execution", "status": "queued"}
+    cast(dict[str, str], ledger["artifacts"])["evidence_packet_ref"] = "docs/agents/evidence/issue-42-pr-77.yaml"
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="verifying",
+        command_id="cmd-verifying",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_session_id="ses-root-42",
+    )
+    orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:10:00+08:00",
+        runtime_context={"verifier_session_id": "ses-pr-verifier-42"},
+    )
+    connection = sqlite3.connect(tmp_path / ".opencode/runtime/control-plane.sqlite3")
+    try:
+        _ = connection.execute(
+            "UPDATE issues SET last_event_at = ? WHERE issue_number = ?",
+            ("2026-05-07T17:00:00+08:00", "42"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    class RunningVerifierOutcomeHostAdapter(FakeHostAdapter):
+        def read_session_outcome(self, runtime_session_id: str):
+            del runtime_session_id
+            return SessionOutcome(status="running", session_id="ses-pr-verifier-42")
+
+    with patch(
+        "scripts.orchestrator_supervisor._default_host_adapter",
+        return_value=RunningVerifierOutcomeHostAdapter(successful_host_adapter(session_id="ses-ignored").start_result),
+    ):
+        updated_ledger, decision, request = reconcile_ledger(
+            ledger,
+            artifact_base_dir=tmp_path,
+            updated_at="2026-05-07T17:16:00+08:00",
+        )
+
+    issue = read_issue(tmp_path, "42")
+
+    assert updated_ledger is not None
+    assert decision["action"] == "no_change"
+    assert decision["next_role"] == "pr_verifier"
+    assert decision["next_stage"] == "pr_verifier_execution"
+    assert request is None
+    assert issue is not None
+    assert issue["state"] == "verifying"
+
+
+def test_reconcile_quarantines_stale_root_when_pr_verifier_session_is_completed_without_evidence(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "pr_verifier", "stage": "pr_verifier_execution", "status": "queued"}
+    cast(dict[str, str], ledger["artifacts"])["evidence_packet_ref"] = "docs/agents/evidence/issue-42-pr-77.yaml"
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="verifying",
+        command_id="cmd-verifying",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_session_id="ses-root-42",
+    )
+    orchestrator_supervisor.sync_issue_runtime_context(
+        tmp_path,
+        issue_number="42",
+        updated_at="2026-05-07T17:10:00+08:00",
+        runtime_context={"verifier_session_id": "ses-pr-verifier-42"},
+    )
+    connection = sqlite3.connect(tmp_path / ".opencode/runtime/control-plane.sqlite3")
+    try:
+        _ = connection.execute(
+            "UPDATE issues SET last_event_at = ? WHERE issue_number = ?",
+            ("2026-05-07T17:00:00+08:00", "42"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    class CompletedVerifierOutcomeHostAdapter(FakeHostAdapter):
+        def read_session_outcome(self, runtime_session_id: str):
+            del runtime_session_id
+            return SessionOutcome(status="completed", session_id="ses-pr-verifier-42")
+
+    with patch(
+        "scripts.orchestrator_supervisor._default_host_adapter",
+        return_value=CompletedVerifierOutcomeHostAdapter(successful_host_adapter(session_id="ses-ignored").start_result),
+    ), patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+        updated_ledger, decision, request = reconcile_ledger(
+            ledger,
+            artifact_base_dir=tmp_path,
+            updated_at="2026-05-07T17:16:00+08:00",
+        )
+
+    issue = read_issue(tmp_path, "42")
+
+    assert updated_ledger is ledger
+    assert decision["action"] == "hold_quarantined_issue"
+    assert request is None
+    assert issue is not None
+    assert issue["state"] == "quarantined"
+
+
 def test_reconcile_quarantines_running_issue_when_root_event_goes_stale(tmp_path: Path):
     issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")

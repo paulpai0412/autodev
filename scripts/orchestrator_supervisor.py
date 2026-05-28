@@ -2220,6 +2220,8 @@ def _quarantine_stale_queued_subagent_with_stale_root(
     evidence_packet: dict[str, object] | None = None,
     release_result: dict[str, object] | None = None,
     issue_worker_child_session: dict[str, object] | None = None,
+    read_session_outcome: Callable[[str], object | None] | None = None,
+    verifier_session_id: str = "",
 ) -> bool:
     if current.get("status") != "queued":
         return False
@@ -2233,6 +2235,19 @@ def _quarantine_stale_queued_subagent_with_stale_root(
         child_session_status = str((issue_worker_child_session or {}).get("childSessionStatus") or "")
         if child_session_status in {"running", "queued", "unknown"}:
             return False
+    if current.get("role") == "pr_verifier":
+        active_verifier_session_id = verifier_session_id.strip()
+        if not active_verifier_session_id:
+            active_verifier_session_id = str(runtime_issue.get("current_session_id") or "").strip()
+        if active_verifier_session_id and read_session_outcome is not None:
+            outcome = read_session_outcome(active_verifier_session_id)
+            outcome_status = ""
+            if isinstance(outcome, dict):
+                outcome_status = str(outcome.get("status") or "")
+            else:
+                outcome_status = str(getattr(outcome, "status", "") or "")
+            if outcome_status in {"running", "queued", "unknown"}:
+                return False
     if current.get("role") == "pr_verifier" and bool((evidence_packet or {}).get("parse_ok")):
         return False
     if current.get("role") == "main_orchestrator" and current.get("stage") == "release_root_execution" and bool((release_result or {}).get("parse_ok")):
@@ -5189,6 +5204,8 @@ def reconcile_ledger(
             evidence_packet=_read_db_artifact_fact(base_dir=artifact_lookup_base_dir, issue_number=issue["number"], artifact_kind="evidence_packet"),
             release_result=_read_db_artifact_fact(base_dir=artifact_lookup_base_dir, issue_number=issue["number"], artifact_kind="release_result"),
             issue_worker_child_session=read_runtime_context(base_dir, issue["number"]).get("issue_worker_child_session", {}),
+            read_session_outcome=lambda runtime_session_id: _default_host_adapter().read_session_outcome(runtime_session_id),
+            verifier_session_id=str(read_runtime_context(base_dir, issue["number"]).get("verifier_session_id") or ""),
         ):
             runtime_issue = read_issue(base_dir, issue["number"])
 
