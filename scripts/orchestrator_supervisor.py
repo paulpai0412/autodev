@@ -1649,6 +1649,14 @@ def start_issue(
     _ = _promote_same_repo_probe_degraded_result(session_result)
     if session_result.get("status") == "success":
         root_session_id = str(session_result.get("rootSessionID") or "")
+        if not root_session_id:
+            session_result = {
+                **session_result,
+                "status": "error",
+                "error": "dispatch success missing rootSessionID",
+            }
+    if session_result.get("status") == "success":
+        root_session_id = str(session_result.get("rootSessionID") or "")
         recorded_at = str(session_result.get("recordedAt") or timestamp)
         _transition_issue_state_if_possible(
             base_dir=base_dir,
@@ -2752,6 +2760,7 @@ def _rebuild_issue_state_from_runtime_phase(
     issue_number: str,
     desired_state: str,
     updated_at: str,
+    running_session_id: str = "",
 ) -> None:
     sequences = {
         "running": ["ready", "claimed", "dispatching", "running"],
@@ -2773,6 +2782,11 @@ def _rebuild_issue_state_from_runtime_phase(
     for index in range(start_index + 1, len(sequence)):
         from_state = sequence[index - 1]
         to_state = sequence[index]
+        transition_session_id: str | None = None
+        if to_state == "running":
+            if not running_session_id:
+                return
+            transition_session_id = running_session_id
         _transition_issue_state_if_possible(
             base_dir=base_dir,
             issue_number=issue_number,
@@ -2781,6 +2795,7 @@ def _rebuild_issue_state_from_runtime_phase(
             updated_at=updated_at,
             reason=f"Rebuild control-plane state for issue #{issue_number} from runtime phase into {to_state}.",
             from_state=from_state,
+            current_session_id=transition_session_id,
         )
 
 
@@ -2801,8 +2816,6 @@ def _sync_runtime_phase_to_control_plane_state(
     runtime_issue = read_issue(base_dir, issue_number)
     current_state = str(runtime_issue.get("state") or "") if runtime_issue else ""
     current_session_id = str(runtime_issue.get("current_session_id") or "") if runtime_issue else ""
-    last_session_result = cast(JsonObject, ledger.get("lastSessionResult", {}))
-    session_result_root_session_id = str(last_session_result.get("rootSessionID") or "")
     if current_state in {"quarantined", "completed", "failed"}:
         return
     if current_state == desired_state:
@@ -2812,16 +2825,16 @@ def _sync_runtime_phase_to_control_plane_state(
         and current.get("status") == "queued"
         and current_state == "dispatching"
         and not current_session_id
-        and not session_result_root_session_id
     ):
         return
-    if desired_state == "running" and not current_session_id and not session_result_root_session_id:
+    if desired_state == "running" and not current_session_id:
         return
     _rebuild_issue_state_from_runtime_phase(
         base_dir=base_dir,
         issue_number=issue_number,
         desired_state=desired_state,
         updated_at=updated_at,
+        running_session_id=current_session_id,
     )
 
 

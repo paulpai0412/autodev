@@ -8802,6 +8802,38 @@ def test_reconcile_issue_worker_without_root_session_evidence_keeps_dispatching_
     assert issue["state"] == "dispatching"
 
 
+def test_sync_runtime_phase_to_running_without_issue_session_id_keeps_dispatching_even_with_last_session_result(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+    ledger["current"] = {"role": "issue_worker", "stage": "issue_worker_execution", "status": "queued"}
+    ledger["lastSessionResult"] = {
+        "status": "success",
+        "rootSessionID": "ses-root-from-last-session",
+        "recordedAt": "2026-05-07T17:00:30+08:00",
+    }
+    orchestrator_supervisor.upsert_issue_state(
+        tmp_path,
+        issue_number="42",
+        state="dispatching",
+        command_id="cmd-dispatching",
+        updated_at="2026-05-07T17:00:00+08:00",
+        current_session_id="",
+    )
+
+    orchestrator_supervisor._sync_runtime_phase_to_control_plane_state(
+        base_dir=tmp_path,
+        issue_number="42",
+        ledger=cast(dict[str, object], ledger),
+        current=cast(dict[str, str], ledger["current"]),
+        updated_at="2026-05-07T17:01:00+08:00",
+    )
+
+    issue = read_issue(tmp_path, "42")
+    assert issue is not None
+    assert issue["state"] == "dispatching"
+    assert issue["current_session_id"] == ""
+
+
 def test_reconcile_quarantines_stale_dispatching_issue_worker_without_root_session_evidence(tmp_path: Path):
     issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
     ledger = create_initial_ledger(issue_packet=issue_packet, updated_at="2026-05-07T17:00:00+08:00")
@@ -8825,6 +8857,40 @@ def test_reconcile_quarantines_stale_dispatching_issue_worker_without_root_sessi
     assert request is None
     assert issue is not None
     assert issue["state"] == "quarantined"
+
+
+def test_start_issue_requires_root_session_id_before_running_transition(tmp_path: Path):
+    issue_packet = parse_issue_packet_text(SAMPLE_ISSUE_PACKET, "docs/agents/issue-packets/issue-42.yaml")
+    orchestrator_supervisor._sync_issue_packet_to_db(tmp_path, issue_packet, updated_at="2026-05-07T17:00:00+08:00")
+
+    with patch(
+        "scripts.orchestrator_supervisor.dispatch_session_request",
+        return_value={
+            "status": "success",
+            "recordedAt": "2026-05-07T17:10:00+08:00",
+            "issueNumber": "42",
+            "branch": "agent/issue-42-demo",
+            "sourceSessionID": "workspace_reconcile",
+            "role": "main_orchestrator",
+            "stage": "orchestrator_bootstrap",
+            "reason": "orchestrator bootstrap continuation for issue #42",
+            "title": "Continue issue #42 on agent/issue-42-demo",
+            "rootSessionID": "",
+        },
+    ), patch("scripts.orchestrator_supervisor._sync_issue_progress_label", return_value=""):
+        result = orchestrator_supervisor.start_issue(
+            base_dir=tmp_path,
+            issue_number="42",
+            source_session_id="workspace_reconcile",
+            updated_at="2026-05-07T17:10:00+08:00",
+        )
+
+    issue = read_issue(tmp_path, "42")
+    assert result.get("status") == "error"
+    assert "missing rootSessionID" in str(result.get("error") or "")
+    assert issue is not None
+    assert issue["state"] == "ready"
+    assert issue["current_session_id"] == ""
 
 
 def test_reconcile_auto_recovers_quarantined_dispatching_orphan_to_ready(tmp_path: Path):
