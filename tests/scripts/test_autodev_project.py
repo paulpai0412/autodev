@@ -162,6 +162,166 @@ def fake_init_with_existing_project_link_run(args: list[str], **_kwargs: object)
     raise AssertionError(f"unexpected command: {args}")
 
 
+def fake_init_with_linked_repo_project_run(args: list[str], **_kwargs: object) -> CompletedProcess[str]:
+    status_options = [{"id": f"opt_state_{state}", "name": state} for state in autodev_project.AUTODEV_PROJECT_STATUS_STATES]
+    pr_options = [{"id": f"opt_pr_{state}", "name": state} for state in autodev_project.AUTODEV_PR_WORKFLOW_STATES]
+    if args[:3] == ["git", "rev-parse", "--is-inside-work-tree"]:
+        return completed(args, returncode=128, stderr="not a git repository")
+    if args[:4] == ["git", "rev-parse", "--verify", "HEAD"]:
+        return completed(args, returncode=128, stderr="fatal: Needed a single revision")
+    if args[:4] == ["git", "remote", "get-url", "origin"]:
+        return completed(args, returncode=2, stderr="no such remote")
+    if args[:3] == ["gh", "repo", "view"]:
+        return completed(args, returncode=1, stderr="not found")
+    if args[:3] == ["git", "init", "-b"]:
+        return completed(args, stdout="initialized")
+    if args[:3] == ["git", "remote", "add"]:
+        return completed(args)
+    if args[:3] == ["gh", "repo", "create"]:
+        return completed(args, stdout="created")
+    if args[:3] == ["gh", "label", "create"]:
+        return completed(args)
+    if args[:4] == ["gh", "project", "create", "--owner"]:
+        raise AssertionError(f"project create should not be called when repo already linked: {args}")
+    if args[:4] == ["gh", "project", "link", "9"]:
+        return completed(args)
+    if args[:4] == ["gh", "project", "field-list", "9"]:
+        return completed(
+            args,
+            stdout=json.dumps(
+                [
+                    {
+                        "id": "PVTF_state",
+                        "name": "Status",
+                        "options": status_options,
+                    },
+                    {"id": "PVTF_stage", "name": "Current Stage", "options": []},
+                    {
+                        "id": "PVTF_pr_workflow",
+                        "name": "PR Workflow",
+                        "options": pr_options,
+                    },
+                ]
+            ),
+        )
+    if args[:4] == ["gh", "project", "field-create", "9"]:
+        if "Status" in args:
+            return completed(args, stdout=json.dumps({"id": "PVTF_state"}))
+        if "Current Stage" in args:
+            return completed(args, stdout=json.dumps({"id": "PVTF_stage"}))
+        if "PR Workflow" in args:
+            return completed(args, stdout=json.dumps({"id": "PVTF_pr_workflow"}))
+    if args[:3] == ["gh", "api", "graphql"]:
+        raw = " ".join(args)
+        if "repository(owner:" in raw and "projectsV2" in raw:
+            return completed(
+                args,
+                stdout=json.dumps(
+                    {
+                        "data": {
+                            "repository": {
+                                "projectsV2": {
+                                    "nodes": [
+                                        {
+                                            "id": "PVT_project_linked_9",
+                                            "number": 9,
+                                            "title": "Existing Linked Project",
+                                            "owner": {"login": "paulpai0412"},
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                ),
+            )
+        return completed(args, stdout=json.dumps({"data": {"updateProjectV2Field": {"projectV2Field": {"id": "PVTF_state"}}}}))
+    raise AssertionError(f"unexpected command: {args}")
+
+
+def fake_init_with_multiple_linked_projects_run(args: list[str], **_kwargs: object) -> CompletedProcess[str]:
+    status_options = [{"id": f"opt_state_{state}", "name": state} for state in autodev_project.AUTODEV_PROJECT_STATUS_STATES]
+    pr_options = [{"id": f"opt_pr_{state}", "name": state} for state in autodev_project.AUTODEV_PR_WORKFLOW_STATES]
+    if args[:3] == ["git", "rev-parse", "--is-inside-work-tree"]:
+        return completed(args, returncode=128, stderr="not a git repository")
+    if args[:4] == ["git", "rev-parse", "--verify", "HEAD"]:
+        return completed(args, returncode=128, stderr="fatal: Needed a single revision")
+    if args[:4] == ["git", "remote", "get-url", "origin"]:
+        return completed(args, returncode=2, stderr="no such remote")
+    if args[:3] == ["gh", "repo", "view"]:
+        return completed(args, returncode=1, stderr="not found")
+    if args[:3] == ["git", "init", "-b"]:
+        return completed(args, stdout="initialized")
+    if args[:3] == ["git", "remote", "add"]:
+        return completed(args)
+    if args[:3] == ["gh", "repo", "create"]:
+        return completed(args, stdout="created")
+    if args[:3] == ["gh", "label", "create"]:
+        return completed(args)
+    if args[:4] == ["gh", "project", "create", "--owner"]:
+        raise AssertionError(f"project create should not be called when repo already linked: {args}")
+    if args[:4] == ["gh", "project", "link", "11"]:
+        return completed(args)
+    if args[:4] == ["gh", "project", "field-list", "11"]:
+        return completed(
+            args,
+            stdout=json.dumps(
+                [
+                    {
+                        "id": "PVTF_state",
+                        "name": "Status",
+                        "options": status_options,
+                    },
+                    {"id": "PVTF_stage", "name": "Current Stage", "options": []},
+                    {
+                        "id": "PVTF_pr_workflow",
+                        "name": "PR Workflow",
+                        "options": pr_options,
+                    },
+                ]
+            ),
+        )
+    if args[:4] == ["gh", "project", "field-create", "11"]:
+        if "Status" in args:
+            return completed(args, stdout=json.dumps({"id": "PVTF_state"}))
+        if "Current Stage" in args:
+            return completed(args, stdout=json.dumps({"id": "PVTF_stage"}))
+        if "PR Workflow" in args:
+            return completed(args, stdout=json.dumps({"id": "PVTF_pr_workflow"}))
+    if args[:3] == ["gh", "api", "graphql"]:
+        raw = " ".join(args)
+        if "repository(owner:" in raw and "projectsV2" in raw:
+            return completed(
+                args,
+                stdout=json.dumps(
+                    {
+                        "data": {
+                            "repository": {
+                                "projectsV2": {
+                                    "nodes": [
+                                        {
+                                            "id": "PVT_first",
+                                            "number": 10,
+                                            "title": "Another Linked Project",
+                                            "owner": {"login": "paulpai0412"},
+                                        },
+                                        {
+                                            "id": "PVT_target",
+                                            "number": 11,
+                                            "title": "Autodev Control Plane (paulpai0412/autodev)",
+                                            "owner": {"login": "paulpai0412"},
+                                        },
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                ),
+            )
+        return completed(args, stdout=json.dumps({"data": {"updateProjectV2Field": {"projectV2Field": {"id": "PVTF_state"}}}}))
+    raise AssertionError(f"unexpected command: {args}")
+
+
 def test_init_creates_project_contract_dirs_and_agents_managed_block(tmp_path: Path):
     write(tmp_path / "AGENTS.md", "# Project Agents\n\nKeep this project-specific guidance.\n")
 
@@ -288,6 +448,94 @@ def test_init_create_github_project_writes_monitoring_block(tmp_path: Path):
     assert 'state: "PVTF_state"' in config
     assert 'stage: "PVTF_stage"' in config
     assert 'pr_workflow: "PVTF_pr_workflow"' in config
+
+
+def test_init_reuses_linked_repo_project_without_creating_new_project(tmp_path: Path):
+    write(tmp_path / "AGENTS.md", "# Project Agents\n")
+
+    with patch("scripts.autodev_project.subprocess.run", side_effect=fake_init_with_linked_repo_project_run) as run:
+        exit_code = autodev_project.main(
+            [
+                "init",
+                "--project-root",
+                str(tmp_path),
+                "--github-repo",
+                "paulpai0412/autodev",
+            ]
+        )
+
+    assert exit_code == 0
+    commands = [call.args[0] for call in run.call_args_list]
+    assert [
+        "gh",
+        "project",
+        "link",
+        "9",
+        "--owner",
+        "paulpai0412",
+        "--repo",
+        "paulpai0412/autodev",
+    ] in commands
+    assert [
+        "gh",
+        "project",
+        "create",
+        "--owner",
+        "paulpai0412",
+        "--title",
+        "Autodev Control Plane (paulpai0412/autodev)",
+        "--format",
+        "json",
+    ] not in commands
+
+    config = read(tmp_path / ".autodev.yaml")
+    assert 'github_project_number: 9' in config
+    assert 'github_project_id: "PVT_project_linked_9"' in config
+    assert 'github_project_title: "Existing Linked Project"' in config
+
+
+def test_init_reuses_title_matched_project_when_multiple_linked_projects_exist(tmp_path: Path):
+    write(tmp_path / "AGENTS.md", "# Project Agents\n")
+
+    with patch("scripts.autodev_project.subprocess.run", side_effect=fake_init_with_multiple_linked_projects_run) as run:
+        exit_code = autodev_project.main(
+            [
+                "init",
+                "--project-root",
+                str(tmp_path),
+                "--github-repo",
+                "paulpai0412/autodev",
+            ]
+        )
+
+    assert exit_code == 0
+    commands = [call.args[0] for call in run.call_args_list]
+    assert [
+        "gh",
+        "project",
+        "link",
+        "11",
+        "--owner",
+        "paulpai0412",
+        "--repo",
+        "paulpai0412/autodev",
+    ] in commands
+    assert [
+        "gh",
+        "project",
+        "create",
+        "--owner",
+        "paulpai0412",
+        "--title",
+        "Autodev Control Plane (paulpai0412/autodev)",
+        "--format",
+        "json",
+    ] not in commands
+
+    config = read(tmp_path / ".autodev.yaml")
+    assert 'github_project_number: 11' in config
+    assert 'github_project_id: "PVT_target"' in config
+    assert 'github_project_title: "Autodev Control Plane (paulpai0412/autodev)"' in config
 
 
 def test_init_links_repo_to_existing_github_project_when_monitoring_exists(tmp_path: Path):

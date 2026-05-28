@@ -417,6 +417,11 @@ def _default_github_project_title(github_repo: str) -> str:
     return f"{DEFAULT_GITHUB_PROJECT_TITLE} ({github_repo})"
 
 
+def _github_repo_parts(github_repo: str) -> tuple[str, str]:
+    owner, _, repo_name = github_repo.partition("/")
+    return owner.strip(), repo_name.strip()
+
+
 def _validate_github_repo(github_repo: str) -> str:
     normalized = github_repo.strip()
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", normalized):
@@ -549,6 +554,82 @@ def _find_project_by_number(*, owner: str, project_number: int) -> tuple[int, st
         if candidate_id:
             return candidate_number, candidate_id
     return None
+
+
+def _find_linked_project_for_repo(
+    *,
+    github_repo: str,
+    preferred_title: str,
+) -> tuple[int, str, str, str] | None:
+    owner, repo_name = _github_repo_parts(github_repo)
+    if not owner or not repo_name:
+        return None
+
+    query = (
+        "query($owner:String!,$repo:String!){"
+        "repository(owner:$owner,name:$repo){"
+        "projectsV2(first:100){"
+        "nodes{id number title owner{login}}"
+        "}"
+        "}"
+        "}"
+    )
+    result = _run_command(
+        [
+            "gh",
+            "api",
+            "graphql",
+            "-f",
+            f"query={query}",
+            "-f",
+            f"owner={owner}",
+            "-f",
+            f"repo={repo_name}",
+        ],
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+
+    parsed = _parse_optional_json(cast(str, result.stdout or ""))
+    if not isinstance(parsed, dict):
+        return None
+    data = parsed.get("data")
+    if not isinstance(data, dict):
+        return None
+    repository = data.get("repository")
+    if not isinstance(repository, dict):
+        return None
+    projects_payload = repository.get("projectsV2")
+    if not isinstance(projects_payload, dict):
+        return None
+    nodes_payload = projects_payload.get("nodes")
+    if not isinstance(nodes_payload, list):
+        return None
+
+    projects: list[tuple[int, str, str, str]] = []
+    for node in nodes_payload:
+        if not isinstance(node, dict):
+            continue
+        number = _as_int(node.get("number"), 0)
+        project_id = str(node.get("id") or "").strip()
+        title = str(node.get("title") or "").strip()
+        owner_payload = node.get("owner")
+        owner_login = ""
+        if isinstance(owner_payload, dict):
+            owner_login = str(owner_payload.get("login") or "").strip()
+        if number > 0 and project_id:
+            projects.append((number, project_id, title, owner_login))
+
+    if not projects:
+        return None
+
+    normalized_preferred_title = preferred_title.strip()
+    if normalized_preferred_title:
+        for candidate in projects:
+            if candidate[2] == normalized_preferred_title:
+                return candidate
+    return projects[0]
 
 
 def _create_project(*, owner: str, title: str) -> tuple[int, str]:
@@ -1325,11 +1406,23 @@ def init_project(
         report.actions.append(f"ensure GitHub Project '{project_title}' for {project_owner}")
         if not dry_run and not check:
             try:
-                found = _find_project_by_title(owner=project_owner, title=project_title)
-                if found is None:
-                    project_number, project_id = _create_project(owner=project_owner, title=project_title)
+                linked_project = _find_linked_project_for_repo(
+                    github_repo=github_repo,
+                    preferred_title=project_title,
+                )
+                if linked_project is not None:
+                    project_number, project_id, linked_title, linked_owner = linked_project
+                    if linked_title:
+                        project_title = linked_title
+                    if linked_owner:
+                        project_owner = linked_owner
+                    report.actions.append(f"reuse linked GitHub Project #{project_number} for {github_repo}")
                 else:
-                    project_number, project_id = found
+                    found = _find_project_by_title(owner=project_owner, title=project_title)
+                    if found is None:
+                        project_number, project_id = _create_project(owner=project_owner, title=project_title)
+                    else:
+                        project_number, project_id = found
 
                 _ensure_project_linked(owner=project_owner, project_number=project_number, github_repo=github_repo)
 
